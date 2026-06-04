@@ -105,11 +105,13 @@ def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling
     file_path.write_text("alpha\n", encoding="utf-8")
     agent = build_agent(tmp_path, [])
 
-    agent.memory.set_file_summary("./sample.txt", "sample.txt: alpha")
+    agent.memory.set_file_summary("./sample.txt", "alpha")
     agent.memory.remember_file("./sample.txt")
     assert agent.memory.to_dict()["file_summaries"]["sample.txt"]["freshness"]
 
-    assert "sample.txt: alpha" in agent.memory.render_memory_text()
+    assert "file_summaries: available for sample.txt" in agent.memory.render_memory_text()
+    assert "sample.txt: alpha" not in agent.memory.render_memory_text()
+    assert "sample.txt: alpha" in agent.memory.retrieval_view("sample.txt")
     file_path.write_text("beta\n", encoding="utf-8")
 
     resumed = MiniAgent.from_session(
@@ -121,6 +123,7 @@ def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling
     )
 
     assert "sample.txt: alpha" not in resumed.memory_text()
+    assert "sample.txt: alpha" not in resumed.memory.retrieval_view("sample.txt")
     resumed.memory.invalidate_file_summary("sample.txt")
     assert "sample.txt" not in resumed.memory.to_dict()["file_summaries"]
 

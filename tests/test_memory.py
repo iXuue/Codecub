@@ -51,20 +51,44 @@ def test_file_summaries_use_canonical_paths_and_freshness(tmp_path):
     file_path.write_text("alpha\n", encoding="utf-8")
     memory = LayeredMemory(workspace_root=tmp_path)
 
-    memory.set_file_summary("./sample.txt", "sample.txt: alpha")
+    memory.set_file_summary("./sample.txt", "alpha")
     memory.remember_file("./sample.txt")
     snapshot = memory.to_dict()["file_summaries"]["sample.txt"]
 
-    assert snapshot["summary"] == "sample.txt: alpha"
+    assert snapshot["summary"] == "alpha"
     assert snapshot["freshness"]
 
-    assert "sample.txt: alpha" in memory.render_memory_text()
+    memory_text = memory.render_memory_text()
+    assert "file_summaries: available for sample.txt" in memory_text
+    assert "sample.txt: alpha" not in memory_text
     file_path.write_text("beta\n", encoding="utf-8")
-    assert "sample.txt: alpha" not in memory.render_memory_text()
+    assert "file_summaries: -" in memory.render_memory_text()
 
     memory.invalidate_file_summary("sample.txt")
 
     assert "sample.txt" not in memory.to_dict()["file_summaries"]
+
+
+def test_file_summaries_are_recalled_only_when_relevant(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("alpha\n", encoding="utf-8")
+    memory = LayeredMemory(workspace_root=tmp_path)
+
+    memory.set_file_summary("sample.txt", "alpha")
+    memory.remember_file("sample.txt")
+
+    related_by_path = memory.retrieval_view("what did sample.txt contain?", limit=4)
+    related_by_summary = memory.retrieval_view("where did we see alpha?", limit=4)
+    unrelated = memory.retrieval_view("how should I deploy?", limit=4)
+
+    assert "- sample.txt: alpha" in related_by_path
+    assert "- sample.txt: alpha" in related_by_summary
+    assert "sample.txt: alpha" not in unrelated
+
+    file_path.write_text("beta\n", encoding="utf-8")
+
+    stale = memory.retrieval_view("what did sample.txt contain?", limit=4)
+    assert "sample.txt: alpha" not in stale
 
 
 def test_process_notes_keep_kind_and_latest_duplicate_wins():

@@ -533,6 +533,30 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
         note_index = int(note.get("note_index", 0))
         ranked.append(((exact_tag_match, keyword_overlap, recency, note_index), note))
 
+    for path in state["working"]["recent_files"][:FILE_SUMMARY_LIMIT]:
+        summary = state["file_summaries"].get(path, {})
+        summary_text = str(summary.get("summary", "")).strip()
+        if not summary_text:
+            continue
+        current_freshness = file_freshness(path, workspace_root)
+        if summary.get("freshness") != current_freshness:
+            continue
+        note = {
+            "text": f"{path}: {summary_text}",
+            "tags": [path],
+            "source": path,
+            "created_at": str(summary.get("created_at", "")).strip() or now(),
+            "kind": "file_summary",
+        }
+        note_tags = {tag.lower() for tag in note["tags"]}
+        note_tokens = _tokenize(note["text"]) | _tokenize(note["source"]) | note_tags
+        exact_tag_match = int(bool(query_tokens & note_tags))
+        keyword_overlap = len(query_tokens & note_tokens)
+        if exact_tag_match == 0 and keyword_overlap == 0:
+            continue
+        recency = _parse_timestamp(note["created_at"])
+        ranked.append(((exact_tag_match, keyword_overlap, recency, -1), note))
+
     if workspace_root is not None:
         durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory")
         for note in durable_store.retrieval_candidates(query, limit=limit):
@@ -568,15 +592,14 @@ def render_memory_text(state, workspace_root=None):
         f"- recent_files: {', '.join(state['working']['recent_files']) or '-'}",
     ]
 
-    summaries = []
+    summary_paths = []
     for path in state["working"]["recent_files"][:FILE_SUMMARY_LIMIT]:
         summary = state["file_summaries"].get(path, {})
         current_freshness = file_freshness(path, workspace_root)
         if summary.get("summary", "") and summary.get("freshness") == current_freshness:
-            summaries.append(f"- {path}: {summary['summary']}")
-    if summaries:
-        lines.append("- file_summaries:")
-        lines.extend(f"  {line}" for line in summaries)
+            summary_paths.append(path)
+    if summary_paths:
+        lines.append(f"- file_summaries: available for {', '.join(summary_paths)}")
     else:
         lines.append("- file_summaries: -")
 

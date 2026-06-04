@@ -237,3 +237,24 @@ def test_context_manager_relevant_memory_can_mix_durable_notes(tmp_path):
     assert metadata["relevant_memory"]["selected_durable_count"] == 1
     assert metadata["relevant_memory"]["selected_sources"] == ["project-conventions"]
     assert metadata["relevant_memory"]["selected_kinds"] == ["durable"]
+
+
+def test_context_manager_recalls_file_summary_only_when_relevant(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("alpha\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+    agent.memory.set_file_summary("sample.txt", "alpha")
+    agent.memory.remember_file("sample.txt")
+
+    prompt, metadata = ContextManager(agent).build("What did sample.txt contain?")
+    relevant_section = prompt.split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
+
+    assert "- sample.txt: alpha" in relevant_section
+    assert metadata["relevant_memory"]["selected_sources"] == ["sample.txt"]
+    assert metadata["relevant_memory"]["selected_kinds"] == ["file_summary"]
+
+    unrelated_prompt, unrelated_metadata = ContextManager(agent).build("How should I deploy?")
+    unrelated_relevant = unrelated_prompt.split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
+
+    assert "sample.txt: alpha" not in unrelated_relevant
+    assert "file_summary" not in unrelated_metadata["relevant_memory"]["selected_kinds"]
