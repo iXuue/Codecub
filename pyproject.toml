@@ -3,20 +3,21 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pico"
+name = "codecub"
 version = "0.1.0"
-description = "Small local coding agent for Ollama and OpenAI-compatible models"
+description = "CodeCub local desktop-first coding agent backend"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-pico = "pico.cli:main"
+codecub = "codecub.cli:main"
 
 [dependency-groups]
 dev = [
+  "pyinstaller>=6.20.0",
   "pytest>=8.3.5",
   "ruff>=0.4.4",
 ]
 
 [tool.setuptools]
-packages = ["pico"]
+packages = ["codecub"]

@@ -1,12 +1,14 @@
 import hashlib
 import json
 import locale as locale_module
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import memory as memorylib
 from .models import FakeModelClient
@@ -25,6 +27,7 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MAX_NEW_TOKENS = 64
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+DEFAULT_LOCALE = "C.UTF-8"
 
 REQUIRED_BENCHMARK_KEYS = ("schema_version", "tasks")
 REQUIRED_TASK_KEYS = (
@@ -120,13 +123,49 @@ def _git_value(args, fallback="", cwd=None):
 
 def _current_locale():
     try:
-        return locale_module.setlocale(locale_module.LC_CTYPE)
+        locale_module.setlocale(locale_module.LC_CTYPE)
     except Exception:
-        return locale_module.getdefaultlocale()[0] or "C"
+        pass
+    return DEFAULT_LOCALE
 
 
 def _now_in_timezone(timezone_name):
-    return datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        tzinfo = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name != DEFAULT_TIMEZONE:
+            raise
+        tzinfo = timezone(timedelta(hours=8), name=DEFAULT_TIMEZONE)
+    return datetime.now(tzinfo).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _normalize_verifier_code(code):
+    return str(code).replace(".pico/", ".codecub/").replace(".pico\\", ".codecub\\")
+
+
+def _run_verifier(verifier, cwd):
+    verifier_text = str(verifier)
+    try:
+        parts = shlex.split(verifier_text)
+    except ValueError:
+        parts = []
+
+    if len(parts) >= 3 and parts[0] in {"python", "python3"} and parts[1] == "-c":
+        code = _normalize_verifier_code(parts[2])
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+
+    return subprocess.run(
+        verifier_text,
+        cwd=cwd,
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _artifact_path_for_task(task):
@@ -386,7 +425,7 @@ class BenchmarkEvaluator:
         self.benchmark_path = Path(benchmark_path)
         self.artifact_path = Path(artifact_path)
         self.workspace_root = Path(workspace_root) if workspace_root is not None else Path(
-            tempfile.mkdtemp(prefix="pico-benchmark-")
+            tempfile.mkdtemp(prefix="codecub-benchmark-")
         )
         self.model_name = model_name
         self.model_version = model_version
@@ -449,8 +488,8 @@ class BenchmarkEvaluator:
             fixture_copy_root,
             repo_root_override=fixture_copy_root,
         )
-        session_store = SessionStore(fixture_copy_root / ".pico" / "sessions")
-        run_store = RunStore(fixture_copy_root / ".pico" / "runs")
+        session_store = SessionStore(fixture_copy_root / ".codecub" / "sessions")
+        run_store = RunStore(fixture_copy_root / ".codecub" / "runs")
         if self.model_client_factory is not None:
             model_client = self.model_client_factory(task=task, workspace=workspace)
         else:
@@ -484,13 +523,7 @@ class BenchmarkEvaluator:
         expected_artifact_exists = artifact_file.exists()
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
-        verifier = subprocess.run(
-            task["verifier"],
-            cwd=fixture_copy_root,
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
+        verifier = _run_verifier(task["verifier"], cwd=fixture_copy_root)
 
         within_budget = task_state.tool_steps <= int(task["step_budget"])
         verifier_passed = verifier.returncode == 0

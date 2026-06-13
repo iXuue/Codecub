@@ -1,0 +1,25 @@
+{
+  "appId": "com.codecub.desktop",
+  "productName": "CodeCub",
+  "directories": {
+    "output": "release"
+  },
+  "npmRebuild": false,
+  "asarUnpack": [
+    "node_modules/node-pty/prebuilds/**/*"
+  ],
+  "files": [
+    "dist-electron/**/*",
+    "dist-renderer/**/*",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "resources/backend/codecub-agent.exe",
+      "to": "backend/codecub-agent.exe"
+    }
+  ],
+  "win": {
+    "target": ["dir"]
+  }
+}

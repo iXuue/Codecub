@@ -16,7 +16,7 @@ MAX_HISTORY = 12000
 # 这些文件最可能直接影响 agent 的行动方式。
 # 我们不会预加载整个仓库，只会先给模型一小份“导航包”。
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
-IGNORED_PATH_NAMES = {".git", ".pico", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+IGNORED_PATH_NAMES = {".git", ".pico", ".codecub", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
 
 
 def now():
@@ -61,11 +61,15 @@ class WorkspaceContext:
                     ["git", *args],
                     cwd=cwd,
                     capture_output=True,
-                    text=True,
                     check=True,
                     timeout=5,
                 )
-                return result.stdout.strip() or fallback
+                stdout = result.stdout
+                if isinstance(stdout, bytes):
+                    text = stdout.decode("utf-8", errors="replace")
+                else:
+                    text = str(stdout)
+                return text.strip() or fallback
             except Exception:
                 return fallback
 

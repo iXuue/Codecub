@@ -16,6 +16,26 @@ WORKING_FILE_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 12
 FILE_SUMMARY_LIMIT = 6
 
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by",
+    "can", "contain", "did", "do", "does", "for", "from", "how",
+    "i", "if", "in", "is", "it", "me", "of", "on", "or", "should",
+    "that", "the", "this", "to", "was", "what", "when", "where",
+    "which", "who", "why", "with", "we", "you",
+}
+RETRIEVAL_REASON_BASE_SCORES = {
+    "path_match": 120,
+    "source_match": 100,
+    "tag_match": 80,
+    "keyword_match": 10,
+}
+PER_KIND_RETRIEVAL_LIMITS = {
+    "file_summary": 1,
+    "durable": 1,
+    "episodic_process": 2,
+}
+EPISODIC_PROCESS_KINDS = {"episodic", "process"}
+
 DURABLE_TOPIC_DEFAULTS = {
     "project-conventions": {
         "title": "Project Conventions",
@@ -142,21 +162,17 @@ class DurableMemoryStore:
         return None
 
     def retrieval_candidates(self, query, limit=3):
-        query_tokens = _tokenize(query)
         ranked = []
         for topic in self.load_index():
             notes = self.load_topic_notes(topic["topic"])
             for note in notes:
-                note_tags = {tag.lower() for tag in note.get("tags", [])}
-                note_tokens = _tokenize(note.get("text", "")) | _tokenize(topic.get("title", "")) | note_tags
-                exact_tag_match = int(bool(query_tokens & note_tags))
-                keyword_overlap = len(query_tokens & note_tokens)
-                if exact_tag_match == 0 and keyword_overlap == 0:
+                note["tags"] = _dedupe_preserve_order([*note.get("tags", []), topic["topic"], topic.get("title", "")])
+                scored = score_memory_candidate(query, note)
+                if scored is None:
                     continue
-                recency = _parse_timestamp(note.get("created_at"))
-                ranked.append(((exact_tag_match, keyword_overlap, recency), note))
+                ranked.append((_candidate_sort_key(scored), scored))
         ranked.sort(key=lambda item: item[0], reverse=True)
-        return [note for _, note in ranked[:limit]]
+        return [candidate for _, candidate in ranked[:limit]]
 
     def _write_index(self, topics):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -281,6 +297,184 @@ def file_freshness(raw_path, workspace_root=None):
 
 def _tokenize(text):
     return {token.lower() for token in re.findall(r"[A-Za-z0-9_]+", str(text))}
+
+
+def meaningful_tokens(text):
+    return _tokenize(text) - STOPWORDS
+
+
+def candidate_kind_group(kind):
+    normalized = str(kind or "episodic").strip() or "episodic"
+    if normalized in EPISODIC_PROCESS_KINDS:
+        return "episodic_process"
+    return normalized
+
+
+def _candidate_sort_key(candidate):
+    return (
+        int(candidate.get("score", 0)),
+        _parse_timestamp(candidate.get("created_at")),
+        int(candidate.get("note_index", -1)),
+    )
+
+
+def score_memory_candidate(query, note):
+    query_text = str(query)
+    query_tokens = _tokenize(query_text)
+    meaningful_query_tokens = query_tokens - STOPWORDS
+    kind = str(note.get("kind", "episodic")).strip() or "episodic"
+    source = str(note.get("source", "")).strip()
+    tags = {str(tag).strip().lower() for tag in _ensure_list(note.get("tags", [])) if str(tag).strip()}
+    source_tokens = _tokenize(source)
+    text_tokens = meaningful_tokens(note.get("text", ""))
+    source_hit = bool(source and source.lower() in query_text.lower()) or bool(query_tokens & source_tokens)
+    tag_matches = sorted(query_tokens & tags)
+    keyword_matches = sorted(meaningful_query_tokens & text_tokens)
+
+    if kind == "file_summary" and source_hit:
+        reason = "path_match"
+        matched_terms = sorted(query_tokens & source_tokens) or [source]
+    elif source_hit:
+        reason = "source_match"
+        matched_terms = sorted(query_tokens & source_tokens) or [source]
+    elif tag_matches:
+        reason = "tag_match"
+        matched_terms = tag_matches
+    elif meaningful_query_tokens and keyword_matches:
+        reason = "keyword_match"
+        matched_terms = keyword_matches
+    else:
+        return None
+
+    scored = dict(note)
+    scored["reason"] = reason
+    scored["score"] = RETRIEVAL_REASON_BASE_SCORES[reason] + len(matched_terms)
+    scored["matched_terms"] = matched_terms
+    return scored
+
+
+def _debug_note_entry(note):
+    return {
+        "text": str(note.get("text", "")).strip(),
+        "kind": str(note.get("kind", "episodic")).strip() or "episodic",
+        "source": str(note.get("source", "")).strip(),
+    }
+
+
+def _is_better_candidate(candidate, existing, prefer_file_summary=False):
+    candidate_key = _candidate_sort_key(candidate)
+    existing_key = _candidate_sort_key(existing)
+    if candidate_key != existing_key:
+        return candidate_key > existing_key
+    if prefer_file_summary:
+        return candidate.get("kind") == "file_summary" and existing.get("kind") != "file_summary"
+    return False
+
+
+def _candidate_file_key(candidate, known_file_paths):
+    kind = str(candidate.get("kind", "episodic")).strip() or "episodic"
+    source = str(candidate.get("source", "")).strip()
+    if kind == "file_summary" and source:
+        return source
+    if kind not in EPISODIC_PROCESS_KINDS:
+        return None
+    if source in known_file_paths:
+        return source
+    for tag in _ensure_list(candidate.get("tags", [])):
+        tag = str(tag).strip()
+        if tag in known_file_paths:
+            return tag
+    return None
+
+
+def _dedupe_entry(candidate, reason, kept):
+    entry = _debug_note_entry(candidate)
+    entry["dedupe_reason"] = reason
+    entry["kept_text"] = str(kept.get("text", "")).strip()
+    return entry
+
+
+def _dedupe_retrieval_candidates_with_debug(candidates, known_file_paths):
+    deduped_entries = []
+    by_text = {}
+    for candidate in candidates:
+        text = str(candidate.get("text", "")).strip()
+        if not text:
+            continue
+        existing = by_text.get(text)
+        if existing is None:
+            by_text[text] = candidate
+        elif _is_better_candidate(candidate, existing):
+            deduped_entries.append(_dedupe_entry(existing, "duplicate_text", candidate))
+            by_text[text] = candidate
+        else:
+            deduped_entries.append(_dedupe_entry(candidate, "duplicate_text", existing))
+
+    by_identity = {}
+    for candidate in by_text.values():
+        key = (
+            str(candidate.get("kind", "episodic")).strip() or "episodic",
+            str(candidate.get("source", "")).strip(),
+            str(candidate.get("text", "")).strip(),
+        )
+        existing = by_identity.get(key)
+        if existing is None:
+            by_identity[key] = candidate
+        elif _is_better_candidate(candidate, existing):
+            deduped_entries.append(_dedupe_entry(existing, "duplicate_identity", candidate))
+            by_identity[key] = candidate
+        else:
+            deduped_entries.append(_dedupe_entry(candidate, "duplicate_identity", existing))
+
+    by_file = {}
+    result = []
+    for candidate in by_identity.values():
+        file_key = _candidate_file_key(candidate, known_file_paths)
+        if not file_key:
+            result.append(candidate)
+            continue
+        existing = by_file.get(file_key)
+        if existing is None:
+            by_file[file_key] = candidate
+            continue
+        if _is_better_candidate(candidate, existing, prefer_file_summary=True):
+            deduped_entries.append(_dedupe_entry(existing, "same_file_candidate", candidate))
+            by_file[file_key] = candidate
+        else:
+            deduped_entries.append(_dedupe_entry(candidate, "same_file_candidate", existing))
+
+    result.extend(by_file.values())
+    return result, deduped_entries
+
+
+def _dedupe_retrieval_candidates(candidates, known_file_paths):
+    kept, _ = _dedupe_retrieval_candidates_with_debug(candidates, known_file_paths)
+    return kept
+
+
+def _apply_per_kind_budgets_with_debug(candidates, limit):
+    selected = []
+    skipped = []
+    group_counts = {}
+    for candidate in sorted(candidates, key=_candidate_sort_key, reverse=True):
+        group = candidate_kind_group(candidate.get("kind", "episodic"))
+        cap = int(PER_KIND_RETRIEVAL_LIMITS.get(group, limit))
+        if group_counts.get(group, 0) >= cap:
+            entry = _debug_note_entry(candidate)
+            entry["budget_group"] = group
+            entry["budget_limit"] = cap
+            skipped.append(entry)
+            continue
+        selected.append(candidate)
+        group_counts[group] = group_counts.get(group, 0) + 1
+        if len(selected) >= limit:
+            break
+    return selected, skipped
+
+
+def _apply_per_kind_budgets(candidates, limit):
+    selected, _ = _apply_per_kind_budgets_with_debug(candidates, limit)
+    return selected
 
 
 def _parse_timestamp(value):
@@ -418,7 +612,7 @@ def normalize_memory_state(state, workspace_root=None):
     state["task"] = working["task_summary"]
     state["files"] = list(working["recent_files"])
     state["notes"] = [note["text"] for note in episodic_notes]
-    durable_root = Path(workspace_root) / ".pico" / "memory" if workspace_root is not None else None
+    durable_root = Path(workspace_root) / ".codecub" / "memory" if workspace_root is not None else None
     durable_store = DurableMemoryStore(durable_root) if durable_root is not None else None
     state["durable_topics"] = durable_store.topic_slugs() if durable_store is not None else []
     return state
@@ -467,6 +661,8 @@ def append_note(state, text, tags=(), source="", created_at=None, workspace_root
     state["episodic_notes"] = notes[-EPISODIC_NOTE_LIMIT:]
     state["notes"] = [item["text"] for item in state["episodic_notes"]]
     return state
+
+
 def set_file_summary(state, path, summary, workspace_root=None):
     state = normalize_memory_state(state, workspace_root)
     path = canonicalize_path(path, workspace_root).strip()
@@ -516,35 +712,136 @@ def summarize_read_result(result, limit=180):
     return clip(summary, limit)
 
 
-def retrieval_candidates(state, query, limit=3, workspace_root=None):
+def _collect_retrieval_debug_candidates(state, query, workspace_root=None):
     state = normalize_memory_state(state, workspace_root)
-    query_tokens = _tokenize(query)
-    ranked = []
+    scored = []
+    filtered = []
+
     for note in state["episodic_notes"]:
-        # 召回逻辑故意保持简单透明：先看 tag 精确命中，
-        # 再看关键词重叠，最后看新旧程度。这里不引入 embedding。
-        note_tags = {tag.lower() for tag in note.get("tags", [])}
-        note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
-        exact_tag_match = int(bool(query_tokens & note_tags))
-        keyword_overlap = len(query_tokens & note_tokens)
-        if exact_tag_match == 0 and keyword_overlap == 0:
+        candidate = score_memory_candidate(query, note)
+        if candidate is None:
+            entry = _debug_note_entry(note)
+            entry["filter_reason"] = "no_match"
+            filtered.append(entry)
             continue
-        recency = _parse_timestamp(note.get("created_at"))
-        note_index = int(note.get("note_index", 0))
-        ranked.append(((exact_tag_match, keyword_overlap, recency, note_index), note))
+        scored.append(candidate)
+
+    for path in state["working"]["recent_files"][:FILE_SUMMARY_LIMIT]:
+        summary = state["file_summaries"].get(path, {})
+        summary_text = str(summary.get("summary", "")).strip()
+        note = {
+            "text": f"{path}: {summary_text}",
+            "tags": [path],
+            "source": path,
+            "created_at": str(summary.get("created_at", "")).strip() or now(),
+            "kind": "file_summary",
+        }
+        if not summary_text:
+            entry = _debug_note_entry(note)
+            entry["filter_reason"] = "empty_summary"
+            filtered.append(entry)
+            continue
+        current_freshness = file_freshness(path, workspace_root)
+        if summary.get("freshness") != current_freshness:
+            entry = _debug_note_entry(note)
+            entry["filter_reason"] = "stale_file_summary"
+            filtered.append(entry)
+            continue
+        candidate = score_memory_candidate(query, note)
+        if candidate is None:
+            entry = _debug_note_entry(note)
+            entry["filter_reason"] = "no_match"
+            filtered.append(entry)
+            continue
+        scored.append(candidate)
 
     if workspace_root is not None:
-        durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory")
-        for note in durable_store.retrieval_candidates(query, limit=limit):
-            note_tags = {tag.lower() for tag in note.get("tags", [])}
-            note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
-            exact_tag_match = int(bool(query_tokens & note_tags))
-            keyword_overlap = len(query_tokens & note_tokens)
-            recency = _parse_timestamp(note.get("created_at"))
-            ranked.append(((exact_tag_match, keyword_overlap, recency, -1), note))
+        durable_store = DurableMemoryStore(Path(workspace_root) / ".codecub" / "memory")
+        for note in durable_store.retrieval_candidates(query, limit=9999):
+            scored.append(note)
 
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return [note for _, note in ranked[:limit]]
+    return state, scored, filtered
+
+
+def retrieval_debug(state, query, limit=3, workspace_root=None):
+    state, scored, filtered = _collect_retrieval_debug_candidates(state, query, workspace_root)
+    deduped, deduped_entries = _dedupe_retrieval_candidates_with_debug(scored, set(state["file_summaries"]))
+    selected, skipped_by_budget = _apply_per_kind_budgets_with_debug(deduped, int(limit))
+    return {
+        "query": str(query),
+        "limit": int(limit),
+        "query_tokens": sorted(_tokenize(query)),
+        "meaningful_query_tokens": sorted(meaningful_tokens(query)),
+        "selected": selected,
+        "filtered": filtered,
+        "deduped": deduped_entries,
+        "skipped_by_budget": skipped_by_budget,
+        "durable_filtered_visible": False,
+    }
+
+
+def retrieval_candidates(state, query, limit=3, workspace_root=None):
+    debug = retrieval_debug(state, query, limit=limit, workspace_root=workspace_root)
+    return debug["selected"]
+
+
+def _render_debug_list(lines, items, render_item):
+    if not items:
+        lines.append("- none")
+        return
+    for index, item in enumerate(items, start=1):
+        render_item(lines, index, item)
+
+
+def retrieval_debug_view(state, query, limit=3, workspace_root=None):
+    debug = retrieval_debug(state, query, limit=limit, workspace_root=workspace_root)
+    lines = [
+        "Relevant memory debug:",
+        f"query: {debug['query']}",
+        f"limit: {debug['limit']}",
+        f"tokens: {', '.join(debug['meaningful_query_tokens']) or '-'}",
+        "",
+        "Selected:",
+    ]
+
+    def render_selected(output, index, item):
+        output.append(f"{index}. {item['text']}")
+        output.append(f"   kind: {item.get('kind', 'episodic')}")
+        output.append(f"   source: {item.get('source', '') or '-'}")
+        output.append(f"   reason: {item.get('reason', '-')}")
+        output.append(f"   score: {int(item.get('score', 0))}")
+        output.append(f"   matched_terms: {', '.join(item.get('matched_terms', [])) or '-'}")
+
+    _render_debug_list(lines, debug["selected"], render_selected)
+    lines.extend(["", "Filtered:"])
+
+    def render_filtered(output, _index, item):
+        output.append(f"- {item['text']}")
+        output.append(f"  kind: {item.get('kind', 'episodic')}")
+        output.append(f"  reason: {item.get('filter_reason', '-')}")
+
+    _render_debug_list(lines, debug["filtered"], render_filtered)
+    if not debug.get("durable_filtered_visible", True):
+        lines.append("- durable filtered candidates are not visible in v1")
+    lines.extend(["", "Deduped:"])
+
+    def render_deduped(output, _index, item):
+        output.append(f"- {item['text']}")
+        output.append(f"  kind: {item.get('kind', 'episodic')}")
+        output.append(f"  reason: {item.get('dedupe_reason', '-')}")
+        output.append(f"  kept_text: {item.get('kept_text', '-')}")
+
+    _render_debug_list(lines, debug["deduped"], render_deduped)
+    lines.extend(["", "Skipped by budget:"])
+
+    def render_skipped(output, _index, item):
+        output.append(f"- {item['text']}")
+        output.append(f"  kind: {item.get('kind', 'episodic')}")
+        output.append(f"  group: {item.get('budget_group', '-')}")
+        output.append(f"  limit: {item.get('budget_limit', '-')}")
+
+    _render_debug_list(lines, debug["skipped_by_budget"], render_skipped)
+    return "\n".join(lines)
 
 
 def retrieval_view(state, query, limit=3, workspace_root=None):
@@ -568,15 +865,14 @@ def render_memory_text(state, workspace_root=None):
         f"- recent_files: {', '.join(state['working']['recent_files']) or '-'}",
     ]
 
-    summaries = []
+    summary_paths = []
     for path in state["working"]["recent_files"][:FILE_SUMMARY_LIMIT]:
         summary = state["file_summaries"].get(path, {})
         current_freshness = file_freshness(path, workspace_root)
         if summary.get("summary", "") and summary.get("freshness") == current_freshness:
-            summaries.append(f"- {path}: {summary['summary']}")
-    if summaries:
-        lines.append("- file_summaries:")
-        lines.extend(f"  {line}" for line in summaries)
+            summary_paths.append(path)
+    if summary_paths:
+        lines.append(f"- file_summaries: available for {', '.join(summary_paths)}")
     else:
         lines.append("- file_summaries: -")
 
@@ -600,7 +896,7 @@ class LayeredMemory:
     def __init__(self, state=None, workspace_root=None):
         self.workspace_root = workspace_root
         self.state = normalize_memory_state(state, workspace_root)
-        self.durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory") if workspace_root is not None else None
+        self.durable_store = DurableMemoryStore(Path(workspace_root) / ".codecub" / "memory") if workspace_root is not None else None
 
     def to_dict(self):
         self.state = normalize_memory_state(self.state, self.workspace_root)
@@ -646,6 +942,12 @@ class LayeredMemory:
 
     def retrieval_view(self, query, limit=3):
         return retrieval_view(self.state, query, limit=limit, workspace_root=self.workspace_root)
+
+    def retrieval_debug(self, query, limit=3):
+        return retrieval_debug(self.state, query, limit=limit, workspace_root=self.workspace_root)
+
+    def retrieval_debug_view(self, query, limit=3):
+        return retrieval_debug_view(self.state, query, limit=limit, workspace_root=self.workspace_root)
 
     def render_memory_text(self):
         return render_memory_text(self.state, self.workspace_root)

@@ -11,6 +11,7 @@ import shutil
 import sys
 import textwrap
 
+from .app_runner import run_app_mode
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import Pico, SessionStore
 from .workspace import WorkspaceContext, middle
@@ -31,17 +32,18 @@ WELCOME_ART = (
     "       /   ^   \\\\",
     "      /|       |\\\\",
 )
-WELCOME_NAME = "pico"
+WELCOME_NAME = "CodeCub"
 WELCOME_SUBTITLE = "local coding agent"
-WELCOME_STATUS = "calm shell, ready for work"
+WELCOME_STATUS = "ready for repo work"
 HELP_DETAILS = textwrap.dedent(
     """\
     Commands:
-    /help    Show this help message.
-    /memory  Show the agent's distilled working memory.
-    /session Show the path to the saved session file.
-    /reset   Clear the current session history and memory.
-    /exit    Exit the agent.
+    /help                  Show this help message.
+    /memory                Show the agent's distilled working memory.
+    /memory recall <query> Explain relevant memory recall for a query.
+    /session               Show the path to the saved session file.
+    /reset                 Clear the current session history and memory.
+    /exit                  Exit the agent.
     """
 ).strip()
 
@@ -53,7 +55,7 @@ DEFAULT_OPENAI_BASE_URL = "https://www.right.codes/codex/v1"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
-SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
+SECRET_ENV_NAMES_VAR = "CODECUB_SECRET_ENV_NAMES"
 
 
 def _effective_model(args, provider):
@@ -204,7 +206,7 @@ def build_agent(args):
     # 还是创建一个新的 Pico 实例。
     configured_secret_names = _configured_secret_names(args)
     workspace = WorkspaceContext.build(args.cwd)
-    store = SessionStore(workspace.repo_root + "/.pico/sessions")
+    store = SessionStore(workspace.repo_root + "/.codecub/sessions")
     model = _build_model_client(args)
     session_id = args.resume
     if session_id == "latest":
@@ -234,7 +236,7 @@ def build_agent(args):
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Minimal coding agent for Ollama, OpenAI-compatible, or Anthropic-compatible models.",
+        description="CodeCub local coding agent backend for Ollama, OpenAI-compatible, or Anthropic-compatible models.",
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
@@ -261,11 +263,25 @@ def build_arg_parser():
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument(
+        "--app-mode",
+        action="store_true",
+        help="Run machine-readable JSONL app mode for the desktop shell.",
+    )
+    parser.add_argument(
+        "--json-events",
+        dest="app_mode",
+        action="store_true",
+        help="Alias for --app-mode.",
+    )
     return parser
 
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+    if getattr(args, "app_mode", False):
+        return run_app_mode(args)
+
     agent = build_agent(args)
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
@@ -288,7 +304,7 @@ def main(argv=None):
         # 交互模式：每次读取一条用户输入，交给同一个 agent，
         # 因此 session history 和 working memory 会跨轮延续。
         try:
-            user_input = input("\npico> ").strip()
+            user_input = input("\ncodecub> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("")
             return 0
@@ -299,6 +315,13 @@ def main(argv=None):
             return 0
         if user_input == "/help":
             print(HELP_DETAILS)
+            continue
+        if user_input == "/memory recall" or user_input.startswith("/memory recall "):
+            query = user_input[len("/memory recall"):].strip()
+            if not query:
+                print("usage: /memory recall <query>")
+                continue
+            print(agent.memory_recall_debug_text(query))
             continue
         if user_input == "/memory":
             print(agent.memory_text())

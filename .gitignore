@@ -7,6 +7,7 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+.uv-cache/
 uv.lock
 
 # Packaging
@@ -20,6 +21,13 @@ dist/
 .coverage
 htmlcov/
 
+# Desktop app local dependencies and build output
+desktop/node_modules/
+desktop/dist-electron/
+desktop/dist-renderer/
+desktop/release/
+desktop/resources/backend/
+
 # Temporary files
 .mini-coding-agent
 *.tmp
@@ -32,6 +40,11 @@ htmlcov/
 tmp/
 .worktrees/
 .pico/
+.codecub/sessions/
+.codecub/runs/
+.codecub/memory/
+.codecub/cache/
+.codecub/logs/
 artifacts/
 readme_intro_locked/
 
@@ -43,3 +56,4 @@ docs/
 
 # Packaging metadata
 pico.egg-info/
+codecub.egg-info/
