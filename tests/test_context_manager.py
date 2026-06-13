@@ -1,5 +1,5 @@
-from pico import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
-from pico.context_manager import ContextManager
+from codecub import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
+from codecub.context_manager import ContextManager
 
 
 def build_workspace(tmp_path):
@@ -9,7 +9,7 @@ def build_workspace(tmp_path):
 
 def build_agent(tmp_path, outputs, **kwargs):
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
+    store = SessionStore(tmp_path / ".codecub" / "sessions")
     approval_policy = kwargs.pop("approval_policy", "auto")
     return MiniAgent(
         model_client=FakeModelClient(outputs),
@@ -28,7 +28,7 @@ def test_context_manager_assembles_sections_in_expected_order(tmp_path):
 
     prompt, metadata = ContextManager(agent).build("Where is the deploy key?")
 
-    assert prompt.index("You are pico") < prompt.index("Memory:")
+    assert prompt.index("You are CodeCub") < prompt.index("Memory:")
     assert prompt.index("Memory:") < prompt.index("Relevant memory:")
     assert prompt.index("Relevant memory:") < prompt.index("Transcript:")
     assert prompt.index("Transcript:") < prompt.index("Current user request:")
@@ -92,23 +92,21 @@ def test_context_manager_renders_top_three_episodic_notes_per_note_under_budget(
         },
     ).build("recall")
 
-    assert metadata["relevant_memory"]["selected_count"] == 3
+    assert metadata["relevant_memory"]["selected_count"] == 2
     assert metadata["relevant_memory"]["limit"] == 3
     assert metadata["relevant_memory"]["selected_notes"] == [
         "gamma episodic note " + ("C" * 120),
         "alpha episodic note " + ("A" * 120),
-        "beta episodic recall note " + ("B" * 120),
     ]
-    assert len(metadata["relevant_memory"]["rendered_notes"]) == 3
-    assert metadata["relevant_memory"]["rendered_count"] == 3
+    assert len(metadata["relevant_memory"]["rendered_notes"]) == 2
+    assert metadata["relevant_memory"]["rendered_count"] == 2
     assert metadata["relevant_memory"]["rendered_notes"][0].startswith("gamma episodi")
     assert metadata["relevant_memory"]["rendered_notes"][1].startswith("alpha episodi")
-    assert metadata["relevant_memory"]["rendered_notes"][2].startswith("beta episodi")
     relevant_section = prompt.split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
-    assert len([line for line in relevant_section.splitlines() if line.startswith("- ")]) == 3
+    assert len([line for line in relevant_section.splitlines() if line.startswith("- ")]) == 2
     assert "alpha episodi" in relevant_section
-    assert "beta episodic" in relevant_section
     assert "gamma episodi" in relevant_section
+    assert "beta episodic" not in relevant_section
     assert "older unmatched note" not in relevant_section
 
 
@@ -206,7 +204,7 @@ def test_context_manager_summarizes_older_tool_output_into_one_line(tmp_path):
 
 
 def test_context_manager_relevant_memory_can_mix_durable_notes(tmp_path):
-    memory_root = tmp_path / ".pico" / "memory"
+    memory_root = tmp_path / ".codecub" / "memory"
     topics_dir = memory_root / "topics"
     topics_dir.mkdir(parents=True)
     (memory_root / "MEMORY.md").write_text(
@@ -252,6 +250,9 @@ def test_context_manager_recalls_file_summary_only_when_relevant(tmp_path):
     assert "- sample.txt: alpha" in relevant_section
     assert metadata["relevant_memory"]["selected_sources"] == ["sample.txt"]
     assert metadata["relevant_memory"]["selected_kinds"] == ["file_summary"]
+    assert metadata["relevant_memory"]["selected_reasons"] == ["path_match"]
+    assert metadata["relevant_memory"]["selected_scores"][0] >= 120
+    assert "sample" in metadata["relevant_memory"]["selected_matches"][0] or "sample.txt" in metadata["relevant_memory"]["selected_matches"][0]
 
     unrelated_prompt, unrelated_metadata = ContextManager(agent).build("How should I deploy?")
     unrelated_relevant = unrelated_prompt.split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]

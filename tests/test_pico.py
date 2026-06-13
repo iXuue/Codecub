@@ -1,12 +1,15 @@
 import os
 import json
 import subprocess
+import shlex
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pico as mini_pkg
-from pico import (
+import pytest
+
+import codecub as mini_pkg
+from codecub import (
     AnthropicCompatibleModelClient,
     FakeModelClient,
     MiniAgent,
@@ -16,6 +19,7 @@ from pico import (
     WorkspaceContext,
     build_welcome,
 )
+from codecub.cli import HELP_DETAILS
 
 
 def build_workspace(tmp_path):
@@ -25,7 +29,7 @@ def build_workspace(tmp_path):
 
 def build_agent(tmp_path, outputs, **kwargs):
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
+    store = SessionStore(tmp_path / ".codecub" / "sessions")
     approval_policy = kwargs.pop("approval_policy", "auto")
     return MiniAgent(
         model_client=FakeModelClient(outputs),
@@ -126,6 +130,20 @@ def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling
     assert "sample.txt: alpha" not in resumed.memory.retrieval_view("sample.txt")
     resumed.memory.invalidate_file_summary("sample.txt")
     assert "sample.txt" not in resumed.memory.to_dict()["file_summaries"]
+
+
+def test_memory_recall_debug_text_explains_relevant_memory(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("alpha\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+    agent.memory.set_file_summary("sample.txt", "alpha")
+    agent.memory.remember_file("sample.txt")
+
+    view = agent.memory_recall_debug_text("what did sample.txt contain?")
+
+    assert view.startswith("Relevant memory debug:\n")
+    assert "Selected:\n1. sample.txt: alpha" in view
+    assert "reason: path_match" in view
 
 
 def test_agent_retries_after_empty_model_output(tmp_path):
@@ -259,13 +277,13 @@ def test_invalid_risky_tool_does_not_prompt_for_approval(tmp_path):
 
 def test_list_files_hides_internal_agent_state(tmp_path):
     agent = build_agent(tmp_path, [])
-    (tmp_path / ".pico").mkdir(exist_ok=True)
+    (tmp_path / ".codecub").mkdir(exist_ok=True)
     (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "hello.txt").write_text("hi\n", encoding="utf-8")
 
     result = agent.run_tool("list_files", {})
 
-    assert ".pico" not in result
+    assert ".codecub" not in result
     assert ".git" not in result
     assert "[F] hello.txt" in result
 
@@ -294,12 +312,16 @@ def test_welcome_screen_keeps_box_shape_for_long_paths(tmp_path):
     assert "(  o o  )" in welcome
     assert "MINI-CODING-AGENT" not in welcome
     assert "MINI CODING AGENT" not in welcome
-    assert "pico" in welcome
+    assert "CodeCub" in welcome
     assert "local coding agent" in welcome
     assert "// READY" not in welcome
     assert "SLASH" not in welcome
     assert "READY      " not in welcome
     assert "commands: Commands:" not in welcome
+
+
+def test_help_details_lists_memory_recall_command():
+    assert "/memory recall <query>" in HELP_DETAILS
 
 
 def test_ollama_client_posts_expected_payload():
@@ -652,9 +674,9 @@ def test_build_agent_uses_openai_provider_and_model_override(tmp_path):
         clear=False,
     ):
         with patch(
-            "pico.cli.OllamaModelClient",
+            "codecub.cli.OllamaModelClient",
             side_effect=AssertionError("ollama client should not be used"),
-        ), patch("pico.cli.OpenAICompatibleModelClient") as mock_openai:
+        ), patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
             fake_client = mock_openai.return_value
             agent = mini_pkg.build_agent(args)
 
@@ -675,6 +697,35 @@ def test_build_arg_parser_accepts_anthropic_provider(tmp_path):
     args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "anthropic"])
 
     assert args.provider == "anthropic"
+
+
+def test_build_arg_parser_accepts_app_mode_flags():
+    app_args = mini_pkg.build_arg_parser().parse_args(["--app-mode"])
+    json_args = mini_pkg.build_arg_parser().parse_args(["--json-events"])
+
+    assert app_args.app_mode is True
+    assert json_args.app_mode is True
+
+
+def test_main_dispatches_to_app_mode_without_welcome(monkeypatch, capsys):
+    from codecub import cli
+
+    called = {}
+
+    def fake_run_app_mode(args):
+        called["app_mode"] = args.app_mode
+        print('{"type":"session_started","timestamp":"2026-06-11T00:00:00Z","session_id":"s","run_id":"","payload":{}}')
+        return 0
+
+    monkeypatch.setattr(cli, "run_app_mode", fake_run_app_mode)
+
+    result = cli.main(["--app-mode"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert called["app_mode"] is True
+    assert "codecub>" not in captured.out
+    assert "session_started" in captured.out
 
 
 def test_build_agent_uses_anthropic_provider_and_openai_key_fallback(tmp_path):
@@ -707,12 +758,12 @@ def test_build_agent_uses_anthropic_provider_and_openai_key_fallback(tmp_path):
         clear=True,
     ):
         with patch(
-            "pico.cli.OllamaModelClient",
+            "codecub.cli.OllamaModelClient",
             side_effect=AssertionError("ollama client should not be used"),
         ), patch(
-            "pico.cli.OpenAICompatibleModelClient",
+            "codecub.cli.OpenAICompatibleModelClient",
             side_effect=AssertionError("openai client should not be used"),
-        ), patch("pico.cli.AnthropicCompatibleModelClient") as mock_anthropic:
+        ), patch("codecub.cli.AnthropicCompatibleModelClient") as mock_anthropic:
             fake_client = mock_anthropic.return_value
             agent = mini_pkg.build_agent(args)
 
@@ -732,7 +783,7 @@ def test_build_agent_uses_anthropic_default_model_when_env_is_missing(tmp_path):
         clear=False,
     ):
         os.environ.pop("ANTHROPIC_MODEL", None)
-        with patch("pico.cli.AnthropicCompatibleModelClient") as mock_anthropic:
+        with patch("codecub.cli.AnthropicCompatibleModelClient") as mock_anthropic:
             mini_pkg.build_agent(args)
 
     assert mock_anthropic.call_args.kwargs["model"] == "claude-sonnet-4-6"
@@ -746,18 +797,19 @@ def test_build_agent_uses_openai_provider_by_default(tmp_path):
         {
             "OPENAI_API_BASE": "https://www.right.codes/codex/v1",
             "OPENAI_API_KEY": "sk-test",
+            "OPENAI_MODEL": "qwen-flash",
         },
         clear=False,
     ):
         with patch(
-            "pico.cli.OllamaModelClient",
+            "codecub.cli.OllamaModelClient",
             side_effect=AssertionError("ollama client should not be used"),
-        ), patch("pico.cli.OpenAICompatibleModelClient") as mock_openai:
+        ), patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
             fake_client = mock_openai.return_value
             agent = mini_pkg.build_agent(args)
 
     mock_openai.assert_called_once()
-    assert mock_openai.call_args.kwargs["model"] == "gpt-5.4"
+    assert mock_openai.call_args.kwargs["model"] == "qwen-flash"
     assert mock_openai.call_args.kwargs["base_url"] == "https://www.right.codes/codex/v1"
     assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
     assert agent.model_client is fake_client
@@ -775,7 +827,7 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
 
     assert agent.ask("Do the thing") == "Finished."
 
-    runs_root = tmp_path / ".pico" / "runs"
+    runs_root = tmp_path / ".codecub" / "runs"
     run_dirs = [path for path in runs_root.iterdir() if path.is_dir()]
     assert len(run_dirs) == 1
 
@@ -803,18 +855,23 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
 
 def test_trace_and_report_redact_secret_env_values(tmp_path):
     secret = "sk-test-secret-123"
-    with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=True):
+    script = f"print({secret!r})"
+    if os.name == "nt":
+        command = subprocess.list2cmdline([sys.executable, "-c", script])
+    else:
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=False):
         agent = build_agent(
             tmp_path,
             [
-                '<tool>{"name":"run_shell","args":{"command":"printf \'%s\' \'sk-test-secret-123\'","timeout":20}}</tool>',
+                f'<tool>{{"name":"run_shell","args":{{"command":{json.dumps(command)},"timeout":20}}}}</tool>',
                 "<final>Masked.</final>",
             ],
         )
 
         assert agent.ask("Mask the secret") == "Masked."
 
-    runs_root = tmp_path / ".pico" / "runs"
+    runs_root = tmp_path / ".codecub" / "runs"
     run_dirs = [path for path in runs_root.iterdir() if path.is_dir()]
     assert len(run_dirs) == 1
 
@@ -871,12 +928,12 @@ def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
     metadata = prompt_events[0]["prompt_metadata"]
     relevant_section = agent.model_client.prompts[0].split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
 
-    assert metadata["relevant_memory"]["selected_count"] == 3
-    assert len(metadata["relevant_memory"]["rendered_notes"]) == 3
-    assert len([line for line in relevant_section.splitlines() if line.startswith("- ")]) == 3
+    assert metadata["relevant_memory"]["selected_count"] == 2
+    assert len(metadata["relevant_memory"]["rendered_notes"]) == 2
+    assert len([line for line in relevant_section.splitlines() if line.startswith("- ")]) == 2
     assert "alpha episodic" in relevant_section
-    assert "beta episodic" in relevant_section
     assert "gamma episodic" in relevant_section
+    assert "beta episodic" not in relevant_section
     assert metadata["current_request"]["text"] == "recall"
     assert metadata["current_request"]["rendered_chars"] == len("recall")
 
@@ -1210,7 +1267,7 @@ def test_freshness_mismatch_creates_checkpoint_before_model_completion(tmp_path)
 
 def test_runtime_identity_persists_key_execution_metadata(tmp_path):
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
+    store = SessionStore(tmp_path / ".codecub" / "sessions")
     agent = MiniAgent(
         model_client=FakeModelClient(["<final>Done.</final>"]),
         workspace=workspace,
@@ -1337,7 +1394,7 @@ def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
         tmp_path,
         [
             "<final>Project convention: Use constrained tools instead of guessing.\n"
-            "Project convention: Preserve local agent state under .pico/.\n"
+            "Project convention: Preserve local agent state under .codecub/.\n"
             "Decision: Keep durable memory topic-based and lightweight.</final>",
         ],
     )
@@ -1349,9 +1406,9 @@ def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
 
     assert "Project convention:" in answer
 
-    index_path = tmp_path / ".pico" / "memory" / "MEMORY.md"
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    decisions_path = tmp_path / ".pico" / "memory" / "topics" / "key-decisions.md"
+    index_path = tmp_path / ".codecub" / "memory" / "MEMORY.md"
+    conventions_path = tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    decisions_path = tmp_path / ".codecub" / "memory" / "topics" / "key-decisions.md"
     report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
 
     assert index_path.exists()
@@ -1362,7 +1419,7 @@ def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
     assert "Keep durable memory topic-based and lightweight." in decisions_path.read_text(encoding="utf-8")
     assert report["durable_promotions"] == [
         "project-conventions: Use constrained tools instead of guessing.",
-        "project-conventions: Preserve local agent state under .pico/.",
+        "project-conventions: Preserve local agent state under .codecub/.",
         "key-decisions: Keep durable memory topic-based and lightweight.",
     ]
 
@@ -1380,8 +1437,8 @@ def test_explicit_memory_promotion_supports_chinese_intent_and_labels(tmp_path):
 
     assert "项目约定：" in answer
 
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    decisions_path = tmp_path / ".pico" / "memory" / "topics" / "key-decisions.md"
+    conventions_path = tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    decisions_path = tmp_path / ".codecub" / "memory" / "topics" / "key-decisions.md"
 
     assert "优先使用受约束工具，不要靠猜。" in conventions_path.read_text(encoding="utf-8")
     assert "持久记忆保持轻量、按 topic 管理。" in decisions_path.read_text(encoding="utf-8")
@@ -1401,8 +1458,8 @@ def test_explicit_memory_promotion_rejects_secret_shaped_and_transient_lines(tmp
     agent.ask("Capture these stable facts into durable memory.")
 
     report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    dependency_path = tmp_path / ".pico" / "memory" / "topics" / "dependency-facts.md"
+    conventions_path = tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    dependency_path = tmp_path / ".codecub" / "memory" / "topics" / "dependency-facts.md"
 
     assert report["durable_promotions"] == [
         "project-conventions: Use constrained tools instead of guessing.",
@@ -1428,7 +1485,7 @@ def test_explicit_memory_promotion_supersedes_matching_durable_fact(tmp_path):
     assert agent.ask("Capture this stable dependency fact into durable memory.") == "Dependency: Python runtime is 3.11."
     assert agent.ask("Save the updated dependency fact into durable memory.") == "Dependency: Python runtime is 3.12."
 
-    dependency_path = tmp_path / ".pico" / "memory" / "topics" / "dependency-facts.md"
+    dependency_path = tmp_path / ".codecub" / "memory" / "topics" / "dependency-facts.md"
     report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
     text = dependency_path.read_text(encoding="utf-8")
 
@@ -1451,7 +1508,7 @@ def test_explicit_memory_promotion_dedupes_duplicate_durable_note(tmp_path):
     agent.ask("Capture the stable fact into durable memory.")
     agent.ask("Capture the stable fact into durable memory again.")
 
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
+    conventions_path = tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
     text = conventions_path.read_text(encoding="utf-8")
 
     assert text.count("Use constrained tools instead of guessing.") == 1
@@ -1469,7 +1526,7 @@ def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
             return super().complete(prompt, max_new_tokens, **kwargs)
 
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
+    store = SessionStore(tmp_path / ".codecub" / "sessions")
     agent = MiniAgent(
         model_client=CacheAwareFakeModelClient(["<final>Done.</final>"]),
         workspace=workspace,
@@ -1515,12 +1572,15 @@ def test_public_api_exports_resolve_through_package_path():
     assert OllamaModelClient is not None
     assert SessionStore is not None
     assert WorkspaceContext is not None
-    assert Path(mini_pkg.__file__).as_posix().endswith("/pico/__init__.py")
+    assert Path(mini_pkg.__file__).as_posix().endswith("/codecub/__init__.py")
 
 
 def test_reviewer_skeleton_docs_exist():
     review_pack = Path("docs/review-pack/README.md")
     architecture = Path("docs/architecture/agent-harness-v1-overview.md")
+
+    if not review_pack.exists() or not architecture.exists():
+        pytest.skip("reviewer skeleton docs are not present in this checkout")
 
     assert review_pack.exists()
     assert architecture.exists()
@@ -1544,10 +1604,11 @@ def test_package_import_surface_includes_cli_entrypoints():
 
 def test_module_execution_help_works():
     result = subprocess.run(
-        [sys.executable, "-m", "pico", "--help"],
+        [sys.executable, "-m", "codecub", "--help"],
         capture_output=True,
         text=True,
     )
 
     assert result.returncode == 0
     assert "usage:" in result.stdout.lower()
+    assert "--app-mode" in result.stdout

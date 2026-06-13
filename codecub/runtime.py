@@ -101,6 +101,8 @@ class Pico:
         shell_env_allowlist=None,
         secret_env_names=None,
         feature_flags=None,
+        approval_handler=None,
+        event_handler=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -114,10 +116,12 @@ class Pico:
         self.read_only = read_only
         self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
+        self.approval_handler = approval_handler
+        self.event_handler = event_handler
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
-        self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
+        self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".codecub" / "runs")
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -341,7 +345,7 @@ class Pico:
         # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
         text = textwrap.dedent(
             f"""\
-            You are pico, a small local coding agent working inside a local repository.
+            You are CodeCub, a local coding agent working inside a local repository.
 
             Rules:
             - Use tools instead of guessing about the workspace.
@@ -407,6 +411,9 @@ class Pico:
 
     def memory_text(self):
         return self.memory.render_memory_text()
+
+    def memory_recall_debug_text(self, query):
+        return self.memory.retrieval_debug_view(query)
 
     def history_text(self):
         history = self.session["history"]
@@ -518,6 +525,10 @@ class Pico:
         env["PWD"] = str(self.root)
         if "PATH" not in env and os.environ.get("PATH"):
             env["PATH"] = os.environ["PATH"]
+        if os.name == "nt":
+            system_root = os.environ.get("SystemRoot", r"C:\Windows")
+            env.setdefault("SystemRoot", system_root)
+            env.setdefault("ComSpec", os.environ.get("ComSpec", str(Path(system_root) / "System32" / "cmd.exe")))
         return env
 
     def prompt_metadata(self, user_message, prompt):
@@ -814,6 +825,7 @@ class Pico:
                     "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
                 },
             )
+            # 说明已有检查点的关键文件部分过期（内容变了）
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
                 self.run_store.write_task_state(task_state)
@@ -825,6 +837,7 @@ class Pico:
                         "trigger": "freshness_mismatch",
                     },
                 )
+            # 说明运行环境/工作区指纹不一致（如 cwd、模型、工具签名等变化）
             elif prompt_metadata.get("resume_status") == CHECKPOINT_WORKSPACE_MISMATCH_STATUS:
                 self.emit_trace(
                     task_state,
@@ -843,6 +856,7 @@ class Pico:
                         "trigger": "workspace_mismatch",
                     },
                 )
+            # 当 prompt 预算被削减（上下文压缩）时，也会创建检查点
             if prompt_metadata.get("budget_reductions"):
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="context_reduction")
                 self.run_store.write_task_state(task_state)
@@ -911,17 +925,16 @@ class Pico:
                     }
                 )
                 self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "tool_executed",
-                    {
-                        "name": name,
-                        "args": args,
-                        "result": clip(result, 500),
-                        "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
-                        **dict(self._last_tool_result_metadata or {}),
-                    },
-                )
+                tool_event_payload = {
+                    "name": name,
+                    "args": args,
+                    "result": clip(result, 500),
+                    "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                    **dict(self._last_tool_result_metadata or {}),
+                }
+                self.emit_trace(task_state, "tool_executed", tool_event_payload)
+                if self.event_handler is not None:
+                    self.event_handler("tool_executed", dict(tool_event_payload), self, task_state)
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
@@ -940,8 +953,10 @@ class Pico:
                 continue
 
             final = (payload or raw).strip()
+
             self.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
+            # 长期记忆
             self.promote_durable_memory(user_message, final)
             checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
             self.run_store.write_task_state(task_state)
@@ -1202,6 +1217,8 @@ class Pico:
             return True
         if self.approval_policy == "never":
             return False
+        if self.approval_policy == "ask" and self.approval_handler is not None:
+            return bool(self.approval_handler(name, args, self))
         try:
             answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
         except EOFError:

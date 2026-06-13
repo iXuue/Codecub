@@ -1,11 +1,15 @@
 import json
 from pathlib import Path
 from collections import Counter
+from zoneinfo import ZoneInfoNotFoundError
 
 import pytest
 
-from pico.evaluator import (
+from codecub import evaluator as evaluator_module
+from codecub.evaluator import (
     BenchmarkEvaluator,
+    _run_verifier,
+    _now_in_timezone,
     load_benchmark,
     run_harness_regression_v2,
     run_fixed_benchmark,
@@ -50,6 +54,27 @@ def test_load_benchmark_rejects_missing_required_task_fields(tmp_path):
 
     with pytest.raises(ValueError, match="required"):
         load_benchmark(benchmark_path)
+
+
+def test_now_in_timezone_falls_back_to_utc8_when_tzdata_is_missing(monkeypatch):
+    def missing_zoneinfo(_timezone_name):
+        raise ZoneInfoNotFoundError("missing")
+
+    monkeypatch.setattr(evaluator_module, "ZoneInfo", missing_zoneinfo)
+
+    captured_at = _now_in_timezone("Asia/Shanghai")
+
+    assert captured_at.endswith("+0800")
+
+
+def test_python_verifier_uses_current_interpreter_and_codecub_paths(tmp_path):
+    (tmp_path / ".codecub" / "runs").mkdir(parents=True)
+
+    verifier = 'python3 -c "from pathlib import Path; assert Path(\'.pico/runs\').exists()"'
+    result = _run_verifier(verifier, cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert result.stderr == ""
 
 
 def test_run_fixed_benchmark_uses_fresh_fixture_copy_and_fresh_run_directory(tmp_path):

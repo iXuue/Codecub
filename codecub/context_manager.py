@@ -484,6 +484,9 @@ class ContextManager:
                 "selected_notes": [note["text"] for note in selected_notes],
                 "selected_sources": [str(note.get("source", "")).strip() for note in selected_notes],
                 "selected_kinds": [str(note.get("kind", "episodic")).strip() or "episodic" for note in selected_notes],
+                "selected_reasons": [str(note.get("reason", "")).strip() for note in selected_notes],
+                "selected_scores": [int(note.get("score", 0)) for note in selected_notes],
+                "selected_matches": [list(note.get("matched_terms", [])) for note in selected_notes],
                 "selected_durable_count": sum(
                     1 for note in selected_notes if (str(note.get("kind", "episodic")).strip() or "episodic") == "durable"
                 ),
