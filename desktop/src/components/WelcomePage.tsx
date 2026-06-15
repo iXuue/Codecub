@@ -6,10 +6,11 @@ type WelcomePageProps = {
   t: (key: I18nKey) => string;
   recentProjects: RecentProject[];
   onOpenProject: () => void;
+  onOpenRecentProject: (projectPath: string) => void;
   onSettings: () => void;
 };
 
-export function WelcomePage({ t, recentProjects, onOpenProject, onSettings }: WelcomePageProps) {
+export function WelcomePage({ t, recentProjects, onOpenProject, onOpenRecentProject, onSettings }: WelcomePageProps) {
   return (
     <div className="app-shell">
       <Toolbar t={t} onSettings={onSettings} />
@@ -28,10 +29,10 @@ export function WelcomePage({ t, recentProjects, onOpenProject, onSettings }: We
           ) : (
             <div className="recent-list">
               {recentProjects.map((project) => (
-                <div className="recent-item" key={project.path}>
+                <button className="recent-item" key={project.path} type="button" onClick={() => onOpenRecentProject(project.path)}>
                   <div className="recent-name">{project.name}</div>
                   <div className="recent-path">{project.path}</div>
-                </div>
+                </button>
               ))}
             </div>
           )}

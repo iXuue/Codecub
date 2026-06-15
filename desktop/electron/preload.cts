@@ -7,6 +7,7 @@ import type {
   OpenProjectResult,
   RecentProject,
   SaveProviderSettingsRequest,
+  TerminalErrorEvent,
   TerminalExitEvent,
   TerminalResizeRequest,
   TerminalStartRequest,
@@ -40,6 +41,11 @@ const api = {
     const listener = (_event: Electron.IpcRendererEvent, event: TerminalExitEvent) => callback(event);
     ipcRenderer.on("terminal:exit", listener);
     return () => ipcRenderer.off("terminal:exit", listener);
+  },
+  onTerminalError: (callback: (event: TerminalErrorEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, event: TerminalErrorEvent) => callback(event);
+    ipcRenderer.on("terminal:error", listener);
+    return () => ipcRenderer.off("terminal:error", listener);
   },
   onBackendEvent: (callback: (line: string) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, line: string) => callback(line);

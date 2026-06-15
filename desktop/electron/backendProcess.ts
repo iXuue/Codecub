@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { BackendCommand } from "./ipcTypes.js";
 import type { BackendLaunchConfig } from "./backendLaunchConfig.js";
@@ -11,6 +11,62 @@ export type BackendProcessEvents = {
   exit: [code: number | null];
   error: [message: string];
 };
+
+export type BackendCommandResolution = {
+  command: string;
+  args: string[];
+};
+
+export function resolveBackendCommand(
+  launchConfig: BackendLaunchConfig,
+  options: {
+    resourcesPath?: string;
+    packaged?: boolean;
+    env?: NodeJS.ProcessEnv;
+    exists?: (path: string) => boolean;
+  } = {},
+): BackendCommandResolution {
+  const resourcesPath = options.resourcesPath ?? process.resourcesPath;
+  const packaged = options.packaged ?? process.defaultApp !== true;
+  const env = options.env ?? process.env;
+  const exists = options.exists ?? existsSync;
+  const bundledBackend = join(resourcesPath, "backend", "codecub-agent.exe");
+
+  if (packaged) {
+    if (!exists(bundledBackend)) {
+      throw new Error(
+        [
+          "Bundled CodeCub backend executable is missing.",
+          `Expected: ${bundledBackend}`,
+          `resourcesPath: ${resourcesPath}`,
+          "Rebuild the Windows package and verify release/win-unpacked/resources/backend/codecub-agent.exe exists.",
+        ].join("\n"),
+      );
+    }
+    return { command: bundledBackend, args: launchConfig.args };
+  }
+
+  if (env.CODECUB_BACKEND_COMMAND) {
+    return { command: env.CODECUB_BACKEND_COMMAND, args: ["-m", "codecub", ...launchConfig.args] };
+  }
+
+  return { command: "uv", args: ["run", "python", "-m", "codecub", ...launchConfig.args] };
+}
+
+export function resolveBackendCwd(repoRoot: string, fallback = process.resourcesPath): string {
+  if (repoRoot.includes(".asar")) {
+    return fallback;
+  }
+
+  try {
+    if (statSync(repoRoot).isDirectory()) {
+      return repoRoot;
+    }
+  } catch {
+    // Fall through to the packaged resources directory.
+  }
+  return fallback;
+}
 
 export class BackendProcess extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -35,17 +91,11 @@ export class BackendProcess extends EventEmitter {
 
   start(launchConfig: BackendLaunchConfig): void {
     this.stop();
-    const bundledBackend = join(process.resourcesPath, "backend", "codecub-agent.exe");
-    const hasBundledBackend = existsSync(bundledBackend);
-    const command = hasBundledBackend ? bundledBackend : process.env.CODECUB_BACKEND_COMMAND || "uv";
-    const args = hasBundledBackend
-      ? launchConfig.args
-      : process.env.CODECUB_BACKEND_COMMAND
-        ? ["-m", "codecub", ...launchConfig.args]
-        : ["run", "python", "-m", "codecub", ...launchConfig.args];
+    const { command, args } = resolveBackendCommand(launchConfig);
+    const cwd = resolveBackendCwd(this.repoRoot);
 
     this.child = spawn(command, args, {
-      cwd: this.repoRoot,
+      cwd,
       env: launchConfig.env,
       shell: false,
     });

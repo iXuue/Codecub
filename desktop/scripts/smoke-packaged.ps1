@@ -11,6 +11,7 @@ if (-not (Test-Path $exe)) {
 if (-not (Test-Path $backend)) {
   throw "Missing bundled backend: $backend"
 }
+Write-Output "packaged_backend=$backend"
 
 $process = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 8

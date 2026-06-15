@@ -52,6 +52,7 @@ app.whenReady().then(() => {
   backend.on("exit", (code) => mainWindow?.webContents.send("backend:error", `Backend exited: ${code ?? "unknown"}`));
   terminals.on("data", (terminalId, data) => mainWindow?.webContents.send("terminal:data", terminalId, data));
   terminals.on("exit", (terminalId, exitCode) => mainWindow?.webContents.send("terminal:exit", { terminalId, exitCode }));
+  terminals.on("error", (terminalId, message) => mainWindow?.webContents.send("terminal:error", { terminalId, message }));
 });
 
 app.on("window-all-closed", () => {

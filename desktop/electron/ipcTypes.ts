@@ -72,6 +72,11 @@ export type TerminalExitEvent = {
   exitCode: number | null;
 };
 
+export type TerminalErrorEvent = {
+  terminalId: string;
+  message: string;
+};
+
 export type GitStatus = {
   branch: string;
   dirty: boolean;

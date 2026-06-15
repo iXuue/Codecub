@@ -156,9 +156,21 @@ textarea {
 }
 
 .recent-item {
+  display: grid;
+  gap: 4px;
+  width: 100%;
   border: 1px solid #e2e6ec;
   border-radius: 7px;
   padding: 10px;
+  background: #ffffff;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.recent-item:hover {
+  border-color: #b8c2ce;
+  background: #f8fafc;
 }
 
 .recent-name {
@@ -370,8 +382,24 @@ textarea {
   padding: 8px;
 }
 
+.terminal-mount {
+  min-height: 0;
+  height: 100%;
+}
+
 .terminal-surface .empty-state {
   color: #9aa4b2;
+}
+
+.terminal-error {
+  margin-bottom: 8px;
+  border: 1px solid #7f2f37;
+  border-radius: 7px;
+  padding: 8px 10px;
+  color: #ffdfe3;
+  background: #32181d;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .message-list {

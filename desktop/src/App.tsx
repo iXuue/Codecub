@@ -52,11 +52,31 @@ export function App() {
     if (result.canceled) {
       return;
     }
-    setProjectPath(result.projectPath);
+    await enterProject(result.projectPath);
+  }
+
+  async function enterProject(nextProjectPath: string) {
+    setProjectPath(nextProjectPath);
     setBackendError("");
-    await window.codecub.startBackend(result.projectPath, approvalPolicy);
-    setRecentProjects(await window.codecub.loadRecentProjects());
+    setEvents([]);
+    setChatState(createInitialChatState());
+    setApprovalState(createInitialApprovalState());
     setView("session");
+    try {
+      await window.codecub.startBackend(nextProjectPath, approvalPolicy);
+      setRecentProjects(await window.codecub.loadRecentProjects());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setBackendError(message);
+      setRecentProjects(await window.codecub.loadRecentProjects());
+    }
+  }
+
+  async function openRecentProject(nextProjectPath: string) {
+    if (!nextProjectPath) {
+      return;
+    }
+    await enterProject(nextProjectPath);
   }
 
   async function sendMessage(message: string) {
@@ -126,6 +146,7 @@ export function App() {
       t={translate}
       recentProjects={recentProjects}
       onOpenProject={openProject}
+      onOpenRecentProject={openRecentProject}
       onSettings={() => setView("settings")}
     />
   );

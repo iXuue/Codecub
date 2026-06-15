@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import type { IPty } from "node-pty";
 import { spawn } from "node-pty";
 import type { TerminalResizeRequest, TerminalStartRequest, TerminalWriteRequest } from "./ipcTypes.js";
@@ -6,6 +7,7 @@ import type { TerminalResizeRequest, TerminalStartRequest, TerminalWriteRequest 
 export type TerminalEvents = {
   data: [terminalId: string, data: string];
   exit: [terminalId: string, exitCode: number | null];
+  error: [terminalId: string, message: string];
 };
 
 export function chooseTerminalShell(
@@ -38,20 +40,28 @@ export class TerminalManager extends EventEmitter {
 
   start(request: TerminalStartRequest): void {
     this.close(request.terminalId);
-    const shell = chooseTerminalShell();
-    const pty = spawn(shell.file, shell.args, {
-      name: "xterm-256color",
-      cols: Math.max(20, request.cols),
-      rows: Math.max(5, request.rows),
-      cwd: request.cwd,
-      env: process.env,
-    });
-    this.sessions.set(request.terminalId, pty);
-    pty.onData((data) => this.emit("data", request.terminalId, data));
-    pty.onExit((event) => {
-      this.sessions.delete(request.terminalId);
-      this.emit("exit", request.terminalId, event.exitCode ?? null);
-    });
+    try {
+      if (!existsSync(request.cwd)) {
+        throw new Error(`Terminal cwd does not exist: ${request.cwd}`);
+      }
+      const shell = chooseTerminalShell();
+      const pty = spawn(shell.file, shell.args, {
+        name: "xterm-256color",
+        cols: Math.max(20, request.cols),
+        rows: Math.max(5, request.rows),
+        cwd: request.cwd,
+        env: process.env,
+      });
+      this.sessions.set(request.terminalId, pty);
+      pty.onData((data) => this.emit("data", request.terminalId, data));
+      pty.onExit((event) => {
+        this.sessions.delete(request.terminalId);
+        this.emit("exit", request.terminalId, event.exitCode ?? null);
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit("error", request.terminalId, message);
+    }
   }
 
   write(request: TerminalWriteRequest): void {

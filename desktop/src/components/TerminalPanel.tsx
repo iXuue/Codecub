@@ -13,6 +13,7 @@ export function TerminalPanel({ t, projectPath }: TerminalPanelProps) {
   const terminalRef = useRef<XTermInstance | null>(null);
   const terminalIdRef = useRef(`terminal-${crypto.randomUUID()}`);
   const [running, setRunning] = useState(false);
+  const [terminalError, setTerminalError] = useState("");
 
   useEffect(() => {
     const removeData = window.codecub.onTerminalData((terminalId, data) => {
@@ -25,9 +26,19 @@ export function TerminalPanel({ t, projectPath }: TerminalPanelProps) {
         setRunning(false);
       }
     });
+    const removeError = window.codecub.onTerminalError((event) => {
+      if (event.terminalId === terminalIdRef.current) {
+        setRunning(false);
+        setTerminalError(event.message);
+        terminalRef.current?.dispose();
+        terminalRef.current = null;
+        containerRef.current?.replaceChildren();
+      }
+    });
     return () => {
       removeData();
       removeExit();
+      removeError();
       void window.codecub.closeTerminal(terminalIdRef.current);
       terminalRef.current?.dispose();
       terminalRef.current = null;
@@ -38,6 +49,7 @@ export function TerminalPanel({ t, projectPath }: TerminalPanelProps) {
     if (!containerRef.current || running) {
       return;
     }
+    setTerminalError("");
     await import("@xterm/xterm/css/xterm.css");
     const { Terminal } = await import("@xterm/xterm");
     containerRef.current.replaceChildren();
@@ -45,13 +57,21 @@ export function TerminalPanel({ t, projectPath }: TerminalPanelProps) {
     terminal.open(containerRef.current);
     terminal.onData((data) => window.codecub.writeTerminal({ terminalId: terminalIdRef.current, data }));
     terminalRef.current = terminal;
-    await window.codecub.startTerminal({
-      terminalId: terminalIdRef.current,
-      cwd: projectPath,
-      cols: 100,
-      rows: 24,
-    });
-    setRunning(true);
+    try {
+      await window.codecub.startTerminal({
+        terminalId: terminalIdRef.current,
+        cwd: projectPath,
+        cols: 100,
+        rows: 24,
+      });
+      setRunning(true);
+    } catch (error) {
+      setTerminalError(error instanceof Error ? error.message : String(error));
+      terminalRef.current?.dispose();
+      terminalRef.current = null;
+      containerRef.current?.replaceChildren();
+      setRunning(false);
+    }
   }
 
   async function closeTerminal() {
@@ -69,8 +89,10 @@ export function TerminalPanel({ t, projectPath }: TerminalPanelProps) {
           {running ? t("closeTerminal") : t("startTerminal")}
         </button>
       </div>
-      <div className="terminal-surface" ref={containerRef}>
+      <div className="terminal-surface">
+        {terminalError ? <div className="terminal-error">{terminalError}</div> : null}
         {!running ? <div className="empty-state compact">{t("terminalNotStarted")}</div> : null}
+        <div className="terminal-mount" ref={containerRef} />
       </div>
     </section>
   );
