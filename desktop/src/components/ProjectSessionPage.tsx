@@ -2,11 +2,14 @@ import type { I18nKey } from "../i18n";
 import type { BackendEvent } from "../state/backendEvents";
 import type { ApprovalState } from "../state/approvalState";
 import type { ChatState } from "../state/chatState";
+import type { ProjectExtensions, ProjectSessionSummary } from "../../electron/ipcTypes";
 import { ApprovalDialog } from "./ApprovalDialog";
 import { ChatView } from "./ChatView";
 import { DiffPreviewPanel } from "./DiffPreviewPanel";
+import { ExtensionsPanel } from "./ExtensionsPanel";
 import { GitStatusBadge } from "./GitStatusBadge";
 import { LegacyImportPrompt } from "./LegacyImportPrompt";
+import { ProjectHistoryPanel } from "./ProjectHistoryPanel";
 import { RunLogSidebar } from "./RunLogSidebar";
 import { TerminalPanel } from "./TerminalPanel";
 import { Toolbar } from "./Toolbar";
@@ -17,12 +20,21 @@ type ProjectSessionPageProps = {
   events: BackendEvent[];
   chatState: ChatState;
   approvalState: ApprovalState;
+  projectSessions: ProjectSessionSummary[];
+  sessionError: string;
+  extensions: ProjectExtensions;
+  extensionError: string;
   backendError: string;
   onSend: (message: string) => void;
   onStop: () => void;
   onApprove: (approvalId: string, runId: string) => void;
   onReject: (approvalId: string, runId: string) => void;
   onImportLegacy: () => void;
+  onRefreshSessions: () => void;
+  onResumeSession: (sessionId: string) => void;
+  onRefreshExtensions: () => void;
+  onInstallSkill: () => void;
+  onInstallPlugin: () => void;
   onSettings: () => void;
 };
 
@@ -32,12 +44,21 @@ export function ProjectSessionPage({
   events,
   chatState,
   approvalState,
+  projectSessions,
+  sessionError,
+  extensions,
+  extensionError,
   backendError,
   onSend,
   onStop,
   onApprove,
   onReject,
   onImportLegacy,
+  onRefreshSessions,
+  onResumeSession,
+  onRefreshExtensions,
+  onInstallSkill,
+  onInstallPlugin,
   onSettings,
 }: ProjectSessionPageProps) {
   return (
@@ -58,6 +79,21 @@ export function ProjectSessionPage({
           <TerminalPanel t={t} projectPath={projectPath} />
         </main>
         <aside className="workspace-side">
+          <ProjectHistoryPanel
+            t={t}
+            sessions={projectSessions}
+            error={sessionError}
+            onRefresh={onRefreshSessions}
+            onResume={onResumeSession}
+          />
+          <ExtensionsPanel
+            t={t}
+            extensions={extensions}
+            error={extensionError}
+            onRefresh={onRefreshExtensions}
+            onInstallSkill={onInstallSkill}
+            onInstallPlugin={onInstallPlugin}
+          />
           <DiffPreviewPanel t={t} events={events} />
           <RunLogSidebar t={t} events={events} />
         </aside>

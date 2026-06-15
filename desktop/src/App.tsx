@@ -5,9 +5,9 @@ import { WelcomePage } from "./components/WelcomePage";
 import { t, type Locale } from "./i18n";
 import { parseBackendEventLine, type BackendEvent } from "./state/backendEvents";
 import { applyApprovalEvent, createInitialApprovalState, markApprovalResolving } from "./state/approvalState";
-import { applyBackendEvent, createInitialChatState } from "./state/chatState";
+import { applyBackendEvent, createChatStateFromSession, createInitialChatState } from "./state/chatState";
 import type { RecentProject } from "./state/sessionIndex";
-import type { AppSettings } from "../electron/ipcTypes";
+import type { AppSettings, ProjectExtensions, ProjectSessionSummary } from "../electron/ipcTypes";
 
 type View = "welcome" | "session" | "settings";
 type ApprovalPolicy = "ask" | "auto" | "never";
@@ -19,6 +19,10 @@ export function App() {
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("ask");
   const [providerSettings, setProviderSettings] = useState<AppSettings["provider"] | null>(null);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
+  const [projectSessions, setProjectSessions] = useState<ProjectSessionSummary[]>([]);
+  const [sessionError, setSessionError] = useState("");
+  const [extensions, setExtensions] = useState<ProjectExtensions>({ skills: [], plugins: [] });
+  const [extensionError, setExtensionError] = useState("");
   const [events, setEvents] = useState<BackendEvent[]>([]);
   const [chatState, setChatState] = useState(createInitialChatState());
   const [approvalState, setApprovalState] = useState(createInitialApprovalState());
@@ -55,21 +59,58 @@ export function App() {
     await enterProject(result.projectPath);
   }
 
-  async function enterProject(nextProjectPath: string) {
+  async function refreshProjectSessions(targetProjectPath = projectPath) {
+    if (!targetProjectPath) {
+      return;
+    }
+    try {
+      setProjectSessions(await window.codecub.listProjectSessions(targetProjectPath));
+      setSessionError("");
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function refreshProjectExtensions(targetProjectPath = projectPath) {
+    if (!targetProjectPath) {
+      return;
+    }
+    try {
+      setExtensions(await window.codecub.listProjectExtensions(targetProjectPath));
+      setExtensionError("");
+    } catch (error) {
+      setExtensionError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function enterProject(nextProjectPath: string, resumeSessionId = "") {
     setProjectPath(nextProjectPath);
     setBackendError("");
+    setSessionError("");
+    setExtensionError("");
     setEvents([]);
-    setChatState(createInitialChatState());
+    if (resumeSessionId) {
+      try {
+        setChatState(createChatStateFromSession(await window.codecub.loadProjectSession(nextProjectPath, resumeSessionId)));
+      } catch (error) {
+        setChatState(createInitialChatState());
+        setSessionError(error instanceof Error ? error.message : String(error));
+      }
+    } else {
+      setChatState(createInitialChatState());
+    }
     setApprovalState(createInitialApprovalState());
     setView("session");
     try {
-      await window.codecub.startBackend(nextProjectPath, approvalPolicy);
+      await window.codecub.startBackend(nextProjectPath, approvalPolicy, resumeSessionId);
       setRecentProjects(await window.codecub.loadRecentProjects());
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setBackendError(message);
       setRecentProjects(await window.codecub.loadRecentProjects());
     }
+    await refreshProjectSessions(nextProjectPath);
+    await refreshProjectExtensions(nextProjectPath);
   }
 
   async function openRecentProject(nextProjectPath: string) {
@@ -77,6 +118,13 @@ export function App() {
       return;
     }
     await enterProject(nextProjectPath);
+  }
+
+  async function resumeSession(sessionId: string) {
+    if (!projectPath) {
+      return;
+    }
+    await enterProject(projectPath, sessionId);
   }
 
   async function sendMessage(message: string) {
@@ -107,6 +155,32 @@ export function App() {
     await window.codecub.sendBackendCommand({ type: "import_legacy_pico" });
   }
 
+  async function installSkill() {
+    if (!projectPath) {
+      return;
+    }
+    const result = await window.codecub.installProjectSkill(projectPath);
+    if (!result.canceled && result.error) {
+      setExtensionError(result.error);
+    } else if (!result.canceled) {
+      setExtensionError("");
+    }
+    await refreshProjectExtensions(projectPath);
+  }
+
+  async function installPlugin() {
+    if (!projectPath) {
+      return;
+    }
+    const result = await window.codecub.installProjectPlugin(projectPath);
+    if (!result.canceled && result.error) {
+      setExtensionError(result.error);
+    } else if (!result.canceled) {
+      setExtensionError("");
+    }
+    await refreshProjectExtensions(projectPath);
+  }
+
   if (view === "settings") {
     return (
       <SettingsPage
@@ -130,12 +204,21 @@ export function App() {
         events={events}
         chatState={chatState}
         approvalState={approvalState}
+        projectSessions={projectSessions}
+        sessionError={sessionError}
+        extensions={extensions}
+        extensionError={extensionError}
         backendError={backendError}
         onSend={sendMessage}
         onStop={stopRun}
         onApprove={approveOperation}
         onReject={rejectOperation}
         onImportLegacy={importLegacyPico}
+        onRefreshSessions={() => refreshProjectSessions()}
+        onResumeSession={resumeSession}
+        onRefreshExtensions={() => refreshProjectExtensions()}
+        onInstallSkill={installSkill}
+        onInstallPlugin={installPlugin}
         onSettings={() => setView("settings")}
       />
     );

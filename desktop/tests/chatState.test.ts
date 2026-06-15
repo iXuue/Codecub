@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyBackendEvent, createInitialChatState } from "../src/state/chatState";
+import { applyBackendEvent, createChatStateFromSession, createInitialChatState } from "../src/state/chatState";
 
 describe("applyBackendEvent", () => {
   it("records user and assistant messages from backend events", () => {
@@ -86,5 +86,20 @@ describe("applyBackendEvent", () => {
     expect(state.runStatus?.phase).toBe("model_streaming");
     expect(state.runStatus?.label).toBe("Receiving model response");
     expect(state.runStatus?.elapsedMs).toBe(1200);
+  });
+
+  it("creates chat state from loaded project session messages", () => {
+    const state = createChatStateFromSession({
+      id: "s1",
+      messages: [
+        { role: "user", content: "resume this", createdAt: "2026-06-15T00:00:00Z" },
+        { role: "assistant", content: "loaded", createdAt: "2026-06-15T00:00:01Z" },
+      ],
+    });
+
+    expect(state.isRunning).toBe(false);
+    expect(state.messages).toHaveLength(2);
+    expect(state.messages[0]).toMatchObject({ id: "s1:history:0", role: "user", content: "resume this" });
+    expect(state.messages[1]).toMatchObject({ id: "s1:history:1", role: "assistant", content: "loaded" });
   });
 });

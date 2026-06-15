@@ -1,4 +1,5 @@
 import type { BackendEvent } from "./backendEvents";
+import type { ProjectSessionDetail } from "../../electron/ipcTypes";
 
 export type ChatRole = "user" | "assistant" | "system";
 
@@ -30,6 +31,21 @@ export type ChatState = {
 export function createInitialChatState(): ChatState {
   return {
     messages: [],
+    activeRunId: "",
+    isRunning: false,
+    runStatus: null,
+  };
+}
+
+export function createChatStateFromSession(detail: ProjectSessionDetail): ChatState {
+  return {
+    messages: detail.messages.map((message, index) => ({
+      id: `${detail.id}:history:${index}`,
+      role: message.role,
+      content: message.content,
+      runId: "",
+      createdAt: message.createdAt,
+    })),
     activeRunId: "",
     isRunning: false,
     runStatus: null,

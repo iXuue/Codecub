@@ -31,6 +31,11 @@ function installCodecubMock(overrides: Partial<Window["codecub"]> = {}) {
         lastUsedAt: "2026-06-15T00:00:00Z",
       },
     ]),
+    listProjectSessions: vi.fn(async () => []),
+    loadProjectSession: vi.fn(async () => ({ id: "s1", messages: [] })),
+    listProjectExtensions: vi.fn(async () => ({ skills: [], plugins: [] })),
+    installProjectSkill: vi.fn(async () => ({ canceled: false })),
+    installProjectPlugin: vi.fn(async () => ({ canceled: false })),
     loadGitStatus: vi.fn(async () => ({ branch: "main", dirty: false, changedCount: 0, ahead: 0, behind: 0, files: [] })),
     startTerminal: vi.fn(),
     writeTerminal: vi.fn(),
@@ -56,8 +61,37 @@ describe("App recent project flow", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /repo/i }));
 
-    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenCalledWith("D:/repo", "ask"));
+    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenCalledWith("D:/repo", "ask", ""));
     await waitFor(() => expect(screen.getAllByText("D:/repo").length).toBeGreaterThan(0));
     expect(await screen.findByText(/Bundled CodeCub backend executable is missing/)).toBeTruthy();
+  });
+
+  it("loads a selected project session and starts backend with resume id", async () => {
+    installCodecubMock({
+      listProjectSessions: vi.fn(async () => [
+        {
+          id: "s1",
+          createdAt: "2026-06-15T00:00:00Z",
+          updatedAt: "2026-06-15T00:00:01Z",
+          messageCount: 2,
+          preview: "previous answer",
+        },
+      ]),
+      loadProjectSession: vi.fn(async () => ({
+        id: "s1",
+        messages: [
+          { role: "user" as const, content: "previous task", createdAt: "2026-06-15T00:00:00Z" },
+          { role: "assistant" as const, content: "previous answer", createdAt: "2026-06-15T00:00:01Z" },
+        ],
+      })),
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /repo/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /previous answer/i }));
+
+    await waitFor(() => expect(window.codecub.loadProjectSession).toHaveBeenCalledWith("D:/repo", "s1"));
+    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenLastCalledWith("D:/repo", "ask", "s1"));
+    expect(await screen.findByText("previous task")).toBeTruthy();
   });
 });
