@@ -39,6 +39,8 @@ P0 must include:
 - CodeCub-owned minimal session index.
 - Recent projects plus manual folder selection.
 - Provider-native streaming assistant text for the OpenAI-compatible provider path used by Qwen testing, plus real-time run status.
+- Project-scoped chat history that can list and resume previous `.codecub/sessions` records from the desktop app.
+- Project-scoped local plugin and skill installation from user-selected local folders.
 - Stop/cancel current run.
 - Hybrid storage: global appData plus project-level `.codecub/`.
 - Legacy `.pico/` detection and import.
@@ -52,6 +54,7 @@ P1 includes:
 - Multi-project workspace.
 - Local HTTP/WebSocket backend service.
 - Fuller session and project management.
+- Plugin marketplace, remote plugin discovery, extension updates, and extension runtime execution.
 - Git diff and commit assistance.
 - Richer pet personality states.
 - Provider-native streaming parity for Ollama and Anthropic-compatible providers.
@@ -170,6 +173,48 @@ P0.5 also includes:
 - Windows packaging smoke test.
 - Security and failure recovery tests.
 
+### P0.8 Project Chat History, Plugins, And Skills
+
+Project chat history must be visible from inside the selected project session page.
+
+The desktop app must read existing project session files from:
+
+```text
+<project>/.codecub/sessions/*.json
+```
+
+For each session, the UI must show at least:
+
+- Session id.
+- Created time when available.
+- Last used or file modified time.
+- Message count.
+- Last user or assistant message preview when available.
+
+Clicking a chat history item must resume that session through the existing backend `--resume <session_id>` flow. The UI should load the saved user and assistant messages before or during resume so that reopening a project does not look like a blank new chat.
+
+Session history must remain project-scoped. The desktop app must not scan arbitrary disks for sessions, must not merge sessions across projects, and must not write chat history outside the selected project's `.codecub/` directory.
+
+P0.8 also adds a local project-level extension manager for plugins and skills.
+
+The extension manager must:
+
+- List installed skills from `<project>/.codecub/skills`.
+- List installed plugins from `<project>/.codecub/plugins`.
+- Install a skill by asking the user to choose a local folder that contains `SKILL.md`.
+- Install a plugin by asking the user to choose a local folder that contains `plugin.json`.
+- Copy the selected folder into the selected project's `.codecub/skills/<id>` or `.codecub/plugins/<id>` directory.
+- Reject an install with a clear error if the selected folder is missing its manifest or the destination id already exists.
+
+The extension manager must not:
+
+- Download extensions from a remote marketplace.
+- Execute plugin code as part of installation.
+- Write outside the selected project `.codecub/` directory.
+- Overwrite an existing installed extension in P0.8.
+
+The minimum UI surface is a project-side panel or equivalent project-scoped view showing installed skills/plugins, install actions, and install errors.
+
 ## 5. Page And Panel Requirements
 
 P0 must include these pages or panels:
@@ -180,6 +225,8 @@ P0 must include these pages or panels:
 - Approval dialog.
 - Diff preview panel.
 - Interactive terminal panel.
+- Project chat history panel.
+- Project plugin and skill manager panel.
 - `.pico` import prompt.
 - Error and crash notification surface.
 
@@ -204,6 +251,8 @@ Shows:
 - Current session state.
 - Main chat area.
 - Run log sidebar.
+- Project chat history entry point.
+- Project plugin and skill manager entry point.
 - Input area with Send and Stop.
 
 ### Settings Page
@@ -339,6 +388,52 @@ P0 acceptance must verify:
 - The active run status changes for at least model request/model streaming and tool or approval phases when those phases occur.
 - Hidden model reasoning is not displayed in the UI, trace, run log, or persisted session data.
 
+## 7.1 Project Chat History Requirements
+
+Project chat history is a desktop UI over the existing project `.codecub/sessions` storage.
+
+The app must support:
+
+- Listing sessions for the currently selected project.
+- Showing a compact summary for each session.
+- Loading persisted user and assistant messages for a selected session.
+- Starting the backend with `--resume <session_id>` when a listed session is selected.
+- Refreshing the list after starting a new backend session or after backend startup fails.
+
+The app must tolerate malformed or partially written session files. A bad session file must not prevent other sessions from being listed; it may appear as a skipped record or produce a non-fatal UI error.
+
+The app must not display tool-only internal history as normal chat bubbles. User-visible chat restore should include user and assistant messages only.
+
+## 7.2 Plugin And Skill Installation Requirements
+
+P0.8 plugins and skills are local project assets, not a marketplace feature.
+
+An installed skill is a directory under:
+
+```text
+<project>/.codecub/skills/<skill_id>
+```
+
+The source directory must contain `SKILL.md`.
+
+An installed plugin is a directory under:
+
+```text
+<project>/.codecub/plugins/<plugin_id>
+```
+
+The source directory must contain `plugin.json`.
+
+The installer must use the selected folder name as the initial id, normalized to a filesystem-safe id. If the normalized id is empty or the destination already exists, installation must fail with a clear error. P0.8 does not require rename, uninstall, update, remote registry, dependency resolution, or plugin runtime activation.
+
+Extension listing must show at least:
+
+- Id.
+- Type: skill or plugin.
+- Display name when available from the manifest.
+- Source path if recorded.
+- Installed time when available.
+
 ## 8. Storage Requirements
 
 Global appData stores:
@@ -380,6 +475,8 @@ The minimal session index must include:
 - Last used time.
 - Provider and model.
 - Last message or summary.
+
+Project chat history reads durable session data from project `.codecub/sessions`. The global session index may cache lightweight summaries later, but P0.8 must not require that cache to be correct before a user can resume a project session.
 
 Project directory stores:
 
@@ -496,6 +593,8 @@ P0 acceptance must cover:
 - Electron event parsing.
 - React chat UI.
 - React run log sidebar.
+- React project chat history list and resume flow.
+- React project plugin and skill manager.
 - React approval dialog.
 - React settings page.
 - React model API settings save/update/clear flow.
@@ -508,6 +607,8 @@ P0 acceptance must cover:
 - E2E approve file write flow.
 - E2E stop current task flow.
 - E2E resume session flow.
+- E2E local skill install flow.
+- E2E local plugin install flow.
 - E2E view logs flow.
 - Windows package install/start smoke test.
 - Packaged app calls embedded backend.
@@ -558,6 +659,9 @@ P0 does not include:
 - Cloud sync.
 - Account system.
 - Plugin marketplace.
+- Remote plugin or skill download.
+- Plugin runtime execution.
+- Extension overwrite/update/uninstall.
 - Full MCP bridge.
 - Full rewrite of the agent reasoning core.
 - Public release license audit.
