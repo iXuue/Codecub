@@ -27,6 +27,16 @@ class FakeModelClient:
             raise RuntimeError("fake model ran out of outputs")
         return self.outputs.pop(0)
 
+    def stream_complete(self, prompt, max_new_tokens, on_delta, **kwargs):
+        text = self.complete(prompt, max_new_tokens, **kwargs)
+        chunks = getattr(self, "stream_chunks", None)
+        if chunks is None:
+            on_delta(text)
+            return text
+        for chunk in chunks:
+            on_delta(chunk)
+        return "".join(chunks)
+
 
 class OllamaModelClient:
     def __init__(self, model, host, temperature, top_p, timeout):
@@ -161,6 +171,51 @@ def _extract_openai_text_from_sse(body_text):
     if isinstance(last_response, dict):
         return _extract_openai_text(last_response)
     return ""
+
+
+def _decode_sse_event(line):
+    line = str(line).strip()
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+
+def iter_openai_text_deltas_from_sse(lines):
+    for line in lines:
+        event = _decode_sse_event(line)
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type", "")
+        if event_type == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str) and delta:
+                yield delta
+            continue
+        choices = event.get("choices")
+        if isinstance(choices, list) and choices:
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta", {})
+            content = delta.get("content") if isinstance(delta, dict) else None
+            if isinstance(content, str) and content:
+                yield content
+
+
+def _extract_response_object_from_sse_line(line):
+    event = _decode_sse_event(line)
+    if not isinstance(event, dict):
+        return {}
+    response = event.get("response")
+    if isinstance(response, dict):
+        return response
+    return {}
 
 
 def _extract_openai_response_from_sse(body_text):
@@ -342,6 +397,95 @@ class OpenAICompatibleModelClient:
             **_extract_usage_cache_details(data),
         }
         return _extract_openai_text(data)
+
+    def stream_complete(self, prompt, max_new_tokens, on_delta, prompt_cache_key=None, prompt_cache_retention=None):
+        self.last_completion_metadata = {}
+        payload = {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": prompt,
+                        }
+                    ],
+                }
+            ],
+            "max_output_tokens": max_new_tokens,
+            "stream": True,
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if self.supports_prompt_cache and prompt_cache_key:
+            payload["prompt_cache_key"] = prompt_cache_key
+        if self.supports_prompt_cache and prompt_cache_retention:
+            payload["prompt_cache_retention"] = prompt_cache_retention
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        attempts = 3
+        body_lines = []
+        text_parts = []
+        response_data = {}
+        for attempt in range(attempts):
+            request = urllib.request.Request(
+                self.base_url + "/responses",
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    for raw_line in response:
+                        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+                        body_lines.append(line)
+                        parsed_response = _extract_response_object_from_sse_line(line)
+                        if parsed_response:
+                            response_data = parsed_response
+                        for delta in iter_openai_text_deltas_from_sse([line]):
+                            text_parts.append(delta)
+                            on_delta(delta)
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, RemoteDisconnected) as exc:
+                if attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    "Could not reach the OpenAI-compatible backend.\n"
+                    f"Base URL: {self.base_url}\n"
+                    f"Model: {self.model}"
+                ) from exc
+
+        if not text_parts:
+            text, response_from_sse = _extract_openai_response_from_sse("".join(body_lines))
+            if response_from_sse:
+                response_data = response_from_sse
+            if text:
+                text_parts.append(text)
+                on_delta(text)
+
+        if response_data:
+            self.last_completion_metadata = {
+                "prompt_cache_supported": self.supports_prompt_cache,
+                "prompt_cache_key": prompt_cache_key,
+                "prompt_cache_retention": prompt_cache_retention,
+                **_extract_usage_cache_details(response_data),
+            }
+
+        text = "".join(text_parts)
+        if text:
+            return text
+        raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
 
 
 def _extract_anthropic_text(data):
