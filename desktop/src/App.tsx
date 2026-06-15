@@ -7,6 +7,7 @@ import { parseBackendEventLine, type BackendEvent } from "./state/backendEvents"
 import { applyApprovalEvent, createInitialApprovalState, markApprovalResolving } from "./state/approvalState";
 import { applyBackendEvent, createInitialChatState } from "./state/chatState";
 import type { RecentProject } from "./state/sessionIndex";
+import type { AppSettings } from "../electron/ipcTypes";
 
 type View = "welcome" | "session" | "settings";
 type ApprovalPolicy = "ask" | "auto" | "never";
@@ -16,6 +17,7 @@ export function App() {
   const [view, setView] = useState<View>("welcome");
   const [projectPath, setProjectPath] = useState("");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("ask");
+  const [providerSettings, setProviderSettings] = useState<AppSettings["provider"] | null>(null);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
   const [events, setEvents] = useState<BackendEvent[]>([]);
   const [chatState, setChatState] = useState(createInitialChatState());
@@ -28,6 +30,7 @@ export function App() {
     window.codecub.loadSettings().then((settings) => {
       setLocale(settings.language);
       setApprovalPolicy(settings.approvalPolicy);
+      setProviderSettings(settings.provider);
     });
     const removeEventListener = window.codecub.onBackendEvent((line) => {
       const event = parseBackendEventLine(line);
@@ -91,6 +94,8 @@ export function App() {
         setLocale={setLocale}
         approvalPolicy={approvalPolicy}
         setApprovalPolicy={setApprovalPolicy}
+        providerSettings={providerSettings}
+        setProviderSettings={setProviderSettings}
         t={translate}
         onBack={() => setView(projectPath ? "session" : "welcome")}
       />
