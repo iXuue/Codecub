@@ -1,4 +1,5 @@
 import { mkdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { installProjectExtension, listProjectExtensions } from "../electron/projectExtensions";
@@ -15,7 +16,7 @@ async function createPlugin(path: string, name = "Local Plugin") {
 
 describe("projectExtensions", () => {
   it("lists installed skills and plugins", async ({ task }) => {
-    const projectPath = join(process.cwd(), ".tmp", task.id, "project");
+    const projectPath = join(process.cwd(), ".tmp", task.id, randomUUID(), "project");
     await createSkill(join(projectPath, ".codecub", "skills", "my-skill"), "My Skill");
     await createPlugin(join(projectPath, ".codecub", "plugins", "my-plugin"), "My Plugin");
 
@@ -26,7 +27,7 @@ describe("projectExtensions", () => {
   });
 
   it("installs a local skill folder into the project", async ({ task }) => {
-    const root = join(process.cwd(), ".tmp", task.id);
+    const root = join(process.cwd(), ".tmp", task.id, randomUUID());
     const projectPath = join(root, "project");
     const sourcePath = join(root, "My Skill");
     await createSkill(sourcePath, "Copied Skill");
@@ -40,7 +41,7 @@ describe("projectExtensions", () => {
   });
 
   it("fails when a plugin source is missing plugin.json", async ({ task }) => {
-    const root = join(process.cwd(), ".tmp", task.id);
+    const root = join(process.cwd(), ".tmp", task.id, randomUUID());
     const projectPath = join(root, "project");
     const sourcePath = join(root, "Missing Plugin");
     await mkdir(sourcePath, { recursive: true });
@@ -51,7 +52,7 @@ describe("projectExtensions", () => {
   });
 
   it("fails rather than overwriting an installed extension", async ({ task }) => {
-    const root = join(process.cwd(), ".tmp", task.id);
+    const root = join(process.cwd(), ".tmp", task.id, randomUUID());
     const projectPath = join(root, "project");
     const sourcePath = join(root, "Existing Skill");
     await createSkill(sourcePath);
