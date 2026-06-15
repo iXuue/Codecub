@@ -1,7 +1,8 @@
 # CodeCub P0 Requirements
 
 Date: 2026-06-11
-Status: Draft v0.1
+Last updated: 2026-06-15
+Status: Draft v0.2
 Scope: P0 desktop app requirements
 
 ## 1. Requirement Maintenance Rule
@@ -32,6 +33,7 @@ P0 must include:
 - Main chat interface plus run log sidebar.
 - Chinese as the default UI language, with bilingual i18n architecture.
 - OpenAI-compatible, Anthropic-compatible, and Ollama providers.
+- Frontend-configurable model provider settings, including API credentials stored only through OS-backed secure storage.
 - Default approval policy set to `ask`.
 - Minimal diff preview.
 - CodeCub-owned minimal session index.
@@ -210,10 +212,23 @@ Supports:
 - Model name.
 - Base URL or Ollama host.
 - API key source.
+- API key entry, update, clear, and masked status display.
+- Optional provider connection test before or after saving.
 - Approval policy.
 - UI language.
 
 P0 default language is Chinese.
+
+Model API settings must be editable from the frontend settings page. The minimum supported fields are:
+
+- Provider type: OpenAI-compatible, Anthropic-compatible, or Ollama.
+- Model name.
+- Base URL for OpenAI-compatible and Anthropic-compatible providers, or host URL for Ollama.
+- API key for providers that require credentials.
+
+The frontend must never display a full saved API key after it has been submitted. A saved credential may be shown only as a masked status such as "saved", "not configured", or a short non-sensitive suffix if the storage layer can provide it safely.
+
+Saving model API settings must not require users to manually edit environment variables for the normal desktop flow. Environment variables may remain supported as a fallback or migration path, but they are no longer the only acceptable P0 path for using a real provider from the desktop app.
 
 ### Approval Dialog
 
@@ -302,7 +317,26 @@ Global appData stores:
 - UI preferences.
 - Provider configuration.
 
-API keys, tokens, and other secrets must not be saved as plain text in appData. P0 implementation must either use an OS-backed secure storage mechanism or require the secret to be supplied through environment variables or another explicit user-approved mechanism.
+API keys, tokens, and other secrets must not be saved as plain text in appData. P0 implementation must use an OS-backed secure storage mechanism for API keys entered through the desktop settings page. Environment variables may be used only as a fallback or compatibility path, not as the only normal desktop configuration path.
+
+Provider configuration saved in appData may include only non-secret fields and secret metadata:
+
+- Provider type.
+- Model name.
+- Base URL or host URL.
+- Whether a credential exists.
+- The secure-storage service/account identifier needed to retrieve the credential.
+- Optional non-sensitive display metadata, such as a masked suffix, if available.
+
+Provider configuration saved in appData must not include:
+
+- Full API keys.
+- Access tokens.
+- Refresh tokens.
+- Passwords.
+- Secret-shaped values copied from environment variables.
+
+Clearing a provider credential from the frontend must remove the corresponding OS-backed secure-storage entry and update appData metadata so the UI no longer reports the credential as configured.
 
 The minimal session index must include:
 
@@ -375,6 +409,14 @@ Secret examples:
 - Passwords.
 - Secret-shaped environment values.
 
+Frontend model API configuration must preserve this safety boundary:
+
+- API key input fields must use password-style rendering by default.
+- Saved API keys must not be readable back into the renderer as plaintext.
+- IPC responses must not return full secret values to the renderer.
+- Backend launch code may pass a retrieved credential to the backend process environment or stdin only at run time.
+- Logs and debug payloads must redact provider credentials and credential-like keys.
+
 The interactive terminal is user-controlled. It does not bypass the agent approval model because it is not an agent tool call.
 
 Stop/cancel must attempt to terminate:
@@ -423,6 +465,8 @@ P0 acceptance must cover:
 - React run log sidebar.
 - React approval dialog.
 - React settings page.
+- React model API settings save/update/clear flow.
+- OS-backed secure credential persistence for API keys entered through the frontend.
 - React diff preview.
 - React terminal panel.
 - E2E open project flow.
@@ -437,6 +481,7 @@ P0 acceptance must cover:
 - Packaged app exits and cleans up child processes.
 - Path escape rejection.
 - Sensitive information redaction.
+- Verification that API keys are not persisted in appData, project `.codecub/`, traces, reports, run logs, or renderer-visible settings responses.
 - Risky operation approval.
 - Model failure recovery.
 - Backend crash recovery.
