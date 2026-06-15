@@ -41,6 +41,46 @@ export type RecentProject = {
   lastUsedAt: string;
 };
 
+export type ProjectSessionSummary = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+  preview: string;
+};
+
+export type ProjectSessionMessage = {
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+};
+
+export type ProjectSessionDetail = {
+  id: string;
+  messages: ProjectSessionMessage[];
+};
+
+export type ExtensionKind = "skill" | "plugin";
+
+export type ProjectExtension = {
+  id: string;
+  kind: ExtensionKind;
+  name: string;
+  path: string;
+  installedAt: string;
+};
+
+export type ProjectExtensions = {
+  skills: ProjectExtension[];
+  plugins: ProjectExtension[];
+};
+
+export type InstallProjectExtensionResult = {
+  canceled: boolean;
+  extension?: ProjectExtension;
+  error?: string;
+};
+
 export type BackendCommand =
   | { type: "send_message"; message: string; run_id?: string }
   | { type: "approve_operation"; run_id?: string; approval_id: string }
