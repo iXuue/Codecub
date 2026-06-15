@@ -63,6 +63,56 @@ class PromptPrefix:
     built_at: str
 
 
+class FinalAnswerDeltaFilter:
+    start_tag = "<final>"
+    end_tag = "</final>"
+
+    def __init__(self, on_text):
+        self.on_text = on_text
+        self.buffer = ""
+        self.in_final = False
+        self.closed = False
+
+    def feed(self, chunk):
+        if self.closed or not chunk:
+            return
+        self.buffer += str(chunk)
+
+        if not self.in_final:
+            start = self.buffer.find(self.start_tag)
+            tool_start = self.buffer.find("<tool")
+            if tool_start != -1 and (start == -1 or tool_start < start):
+                self.buffer = self.buffer[-(len(self.start_tag) - 1):]
+                return
+            if start == -1:
+                self.buffer = self.buffer[-(len(self.start_tag) - 1):]
+                return
+            self.buffer = self.buffer[start + len(self.start_tag):]
+            self.in_final = True
+
+        while self.in_final and self.buffer:
+            end = self.buffer.find(self.end_tag)
+            if end >= 0:
+                if end > 0:
+                    self.on_text(self.buffer[:end])
+                self.buffer = self.buffer[end + len(self.end_tag):]
+                self.closed = True
+                return
+
+            safe_length = self._safe_emit_length()
+            if safe_length <= 0:
+                return
+            self.on_text(self.buffer[:safe_length])
+            self.buffer = self.buffer[safe_length:]
+
+    def _safe_emit_length(self):
+        max_tail = min(len(self.end_tag) - 1, len(self.buffer))
+        for tail_length in range(max_tail, 0, -1):
+            if self.end_tag.startswith(self.buffer[-tail_length:]):
+                return len(self.buffer) - tail_length
+        return len(self.buffer)
+
+
 class SessionStore:
     def __init__(self, root):
         self.root = Path(root)
@@ -575,6 +625,24 @@ class Pico:
         self.run_store.append_trace(task_state, payload)
         return payload
 
+    def emit_app_event(self, event_name, task_state, payload=None):
+        if self.event_handler is not None:
+            self.event_handler(event_name, dict(payload or {}), self, task_state)
+
+    def emit_run_status(self, task_state, phase, label, detail="", started_at="", run_started_at=None):
+        elapsed_ms = int((time.monotonic() - run_started_at) * 1000) if run_started_at is not None else 0
+        self.emit_app_event(
+            "run_status",
+            task_state,
+            {
+                "phase": phase,
+                "label": label,
+                "detail": detail,
+                "started_at": started_at,
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+
     def capture_workspace_snapshot(self):
         snapshot = {}
         for path in self.root.rglob("*"):
@@ -785,6 +853,7 @@ class Pico:
         这里就是最关键的入口。
         """
         run_started_at = time.monotonic()
+        run_started_wall = now()
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
@@ -792,6 +861,13 @@ class Pico:
         task_state.resume_status = self.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         self.current_task_state = task_state
         self.current_run_dir = self.run_store.start_run(task_state)
+        self.emit_run_status(
+            task_state,
+            "building_context",
+            "Building context",
+            started_at=run_started_wall,
+            run_started_at=run_started_at,
+        )
         self.emit_trace(
             task_state,
             "run_started",
@@ -815,6 +891,13 @@ class Pico:
             attempts += 1
             task_state.record_attempt()
             self.run_store.write_task_state(task_state)
+            self.emit_run_status(
+                task_state,
+                "building_context",
+                "Building context",
+                started_at=run_started_wall,
+                run_started_at=run_started_at,
+            )
             prompt_started_at = time.monotonic()
             prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
             self.emit_trace(
@@ -877,6 +960,14 @@ class Pico:
                     "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
                 },
             )
+            self.emit_run_status(
+                task_state,
+                "model_request",
+                "Requesting model response",
+                detail=str(getattr(self.model_client, "model", "")),
+                started_at=run_started_wall,
+                run_started_at=run_started_at,
+            )
             prompt_cache_key = None
             prompt_cache_retention = None
             if getattr(self.model_client, "supports_prompt_cache", False):
@@ -884,12 +975,32 @@ class Pico:
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
             model_started_at = time.monotonic()
-            raw = self.model_client.complete(
-                prompt,
-                self.max_new_tokens,
-                prompt_cache_key=prompt_cache_key,
-                prompt_cache_retention=prompt_cache_retention,
+            self.emit_run_status(
+                task_state,
+                "model_streaming",
+                "Receiving model response",
+                detail=str(getattr(self.model_client, "model", "")),
+                started_at=run_started_wall,
+                run_started_at=run_started_at,
             )
+            stream_filter = FinalAnswerDeltaFilter(
+                lambda text: self.emit_app_event("assistant_delta", task_state, {"text": text})
+            )
+            if hasattr(self.model_client, "stream_complete"):
+                raw = self.model_client.stream_complete(
+                    prompt,
+                    self.max_new_tokens,
+                    on_delta=stream_filter.feed,
+                    prompt_cache_key=prompt_cache_key,
+                    prompt_cache_retention=prompt_cache_retention,
+                )
+            else:
+                raw = self.model_client.complete(
+                    prompt,
+                    self.max_new_tokens,
+                    prompt_cache_key=prompt_cache_key,
+                    prompt_cache_retention=prompt_cache_retention,
+                )
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
             if completion_metadata:
                 # 把后端返回的 usage/cache 统计并回 prompt_metadata，
@@ -914,6 +1025,14 @@ class Pico:
                 args = payload.get("args", {})
                 task_state.record_tool(name)
                 tool_started_at = time.monotonic()
+                self.emit_run_status(
+                    task_state,
+                    "tool_running",
+                    f"Executing tool: {name}",
+                    detail=name,
+                    started_at=run_started_wall,
+                    run_started_at=run_started_at,
+                )
                 result = self.run_tool(name, args)
                 self.record(
                     {
@@ -953,6 +1072,13 @@ class Pico:
                 continue
 
             final = (payload or raw).strip()
+            self.emit_run_status(
+                task_state,
+                "finalizing",
+                "Finalizing response",
+                started_at=run_started_wall,
+                run_started_at=run_started_at,
+            )
 
             self.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
@@ -977,6 +1103,13 @@ class Pico:
                     "final_answer": final,
                     "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
                 },
+            )
+            self.emit_run_status(
+                task_state,
+                "completed",
+                "Completed",
+                started_at=run_started_wall,
+                run_started_at=run_started_at,
             )
             self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
             return final
@@ -1008,6 +1141,14 @@ class Pico:
                 "final_answer": final,
                 "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
             },
+        )
+        self.emit_run_status(
+            task_state,
+            "failed",
+            "Failed",
+            detail=task_state.stop_reason,
+            started_at=run_started_wall,
+            run_started_at=run_started_at,
         )
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
         return final
