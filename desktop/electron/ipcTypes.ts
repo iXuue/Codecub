@@ -1,6 +1,32 @@
+export type ModelProvider = "openai" | "anthropic" | "ollama";
+
+export type CredentialStatus = {
+  configured: boolean;
+  source: "secure-store" | "environment" | "none";
+  displayHint: string;
+};
+
+export type ProviderSettings = {
+  provider: ModelProvider;
+  model: string;
+  baseUrl: string;
+  host: string;
+  credential: CredentialStatus;
+};
+
+export type SaveProviderSettingsRequest = {
+  provider: ModelProvider;
+  model: string;
+  baseUrl: string;
+  host: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+};
+
 export type AppSettings = {
   language: "zh-CN" | "en-US";
   approvalPolicy: "ask" | "auto" | "never";
+  provider: ProviderSettings;
 };
 
 export type OpenProjectResult = {
