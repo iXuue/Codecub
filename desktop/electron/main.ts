@@ -1,4 +1,4 @@
-import { BrowserWindow, app, dialog, ipcMain } from "electron";
+import { BrowserWindow, Menu, app, dialog, ipcMain } from "electron";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BackendProcess } from "./backendProcess.js";
@@ -14,6 +14,7 @@ const backend = new BackendProcess(join(__dirname, ".."));
 const terminals = new TerminalManager();
 
 function createWindow(): void {
+  Menu.setApplicationMenu(null);
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
@@ -21,7 +22,7 @@ function createWindow(): void {
     minHeight: 640,
     title: "CodeCub",
     webPreferences: {
-      preload: join(__dirname, "preload.js"),
+      preload: join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
     },

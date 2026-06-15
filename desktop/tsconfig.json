@@ -17,5 +17,5 @@
     "jsx": "react-jsx",
     "types": ["vitest/globals", "@testing-library/jest-dom"]
   },
-  "include": ["src", "tests", "electron/preload.ts"]
+  "include": ["src", "tests", "electron/preload.cts"]
 }
