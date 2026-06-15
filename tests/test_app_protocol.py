@@ -45,6 +45,22 @@ def test_make_event_accepts_approval_diff_and_import_event_types():
     assert imported["type"] == "legacy_import_completed"
 
 
+def test_make_event_accepts_run_status():
+    event = make_event(
+        "run_status",
+        session_id="session-1",
+        run_id="run-1",
+        payload={
+            "phase": "model_streaming",
+            "label": "Receiving model response",
+            "elapsed_ms": 42,
+        },
+    )
+
+    assert event["type"] == "run_status"
+    assert event["payload"]["phase"] == "model_streaming"
+
+
 def test_make_event_rejects_unknown_event_type():
     with pytest.raises(ValueError, match="unknown event type"):
         make_event("unknown_event")

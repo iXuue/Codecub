@@ -14,6 +14,7 @@ SUPPORTED_EVENT_TYPES = {
     "session_started",
     "session_closed",
     "user_message_received",
+    "run_status",
     "assistant_delta",
     "assistant_message",
     "run_completed",
