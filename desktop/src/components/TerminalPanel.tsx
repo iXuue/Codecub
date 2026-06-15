@@ -1,7 +1,7 @@
-import { Terminal } from "@xterm/xterm";
-import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef, useState } from "react";
 import type { I18nKey } from "../i18n";
+
+type XTermInstance = import("@xterm/xterm").Terminal;
 
 type TerminalPanelProps = {
   t: (key: I18nKey) => string;
@@ -10,7 +10,7 @@ type TerminalPanelProps = {
 
 export function TerminalPanel({ t, projectPath }: TerminalPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const terminalRef = useRef<Terminal | null>(null);
+  const terminalRef = useRef<XTermInstance | null>(null);
   const terminalIdRef = useRef(`terminal-${crypto.randomUUID()}`);
   const [running, setRunning] = useState(false);
 
@@ -38,6 +38,8 @@ export function TerminalPanel({ t, projectPath }: TerminalPanelProps) {
     if (!containerRef.current || running) {
       return;
     }
+    await import("@xterm/xterm/css/xterm.css");
+    const { Terminal } = await import("@xterm/xterm");
     containerRef.current.replaceChildren();
     const terminal = new Terminal({ cols: 100, rows: 24, cursorBlink: true });
     terminal.open(containerRef.current);

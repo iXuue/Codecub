@@ -46,3 +46,12 @@
 - `npm audit` 当前报告 8 个漏洞：6 high、2 critical。未执行 `npm audit fix --force`，因为它可能引入破坏性升级，需要单独安全修复计划。
 - `node-pty` 在本机缺少 Visual Studio C++ Build Tools 时不能 rebuild。当前 Windows 打包配置使用 `npmRebuild: false` 并 unpack `node-pty` 预编译二进制；已通过 packaged smoke。
 - `@xterm/xterm` 进入前端主 bundle 后触发 Vite 542KB chunk warning。P0 可接受，P1 可考虑动态导入终端面板。
+## P0.6 Release Hardening Status
+
+- Dependency audit: completed with `npm audit --audit-level=high`; result: `found 0 vulnerabilities`.
+- Windows installer: completed with `npm run package:win`; generated `desktop/release/CodeCub-0.1.0-x64.exe`.
+- Packaged smoke: completed with `desktop/scripts/smoke-packaged.ps1`; result: `packaged_alive_after_8s=True`.
+- Terminal bundle: lazy-loaded through dynamic import; initial renderer JS is about 211.67 kB and xterm is split into a separate chunk.
+- Icon status: generated local CodeCub pet icon from `desktop/scripts/generate-codecub-icon.ps1`; packaged through `desktop/build/icon.ico`.
+- Electron runtime source: local project cache at `desktop/.electron-cache/electron-v39.8.10/electron-v39.8.10-win32-x64.zip`.
+- Remaining release risks are recorded in `.codecub/plan/2026-06-13-codecub-p0-6-release-hardening-plan.md`.

@@ -27,7 +27,7 @@ Each stage must finish with tests and a written status note before the next stag
 
 This master plan is not an execution-level coding plan for the whole P0 scope. Before implementing any P0 stage, create the corresponding stage plan listed in Task 1, review it against the requirements, and get explicit user approval. A stage may not begin implementation directly from this master plan.
 
-Current stage status as of 2026-06-13 12:16 Asia/Shanghai:
+Current stage status as of 2026-06-15 15:24 Asia/Shanghai:
 
 - P0.1 backend app protocol: completed and verified in `.codecub/plan/2026-06-11-codecub-p0-1-backend-app-protocol-plan.md`.
 - P0.2 package migration: completed and verified in `.codecub/plan/2026-06-11-codecub-p0-2-package-migration-plan.md`.
@@ -35,6 +35,7 @@ Current stage status as of 2026-06-13 12:16 Asia/Shanghai:
 - P0.3 remaining validation gap: no full visual/browser screenshot validation was completed because no Browser control tool was available in that turn.
 - P0.4 approval, logs, diff, safety, and storage: completed and verified in `.codecub/plan/2026-06-11-codecub-p0-4-approval-diff-storage-safety-plan.md`.
 - P0.5 terminal, Git status, packaging, and near-release acceptance: completed and verified in `.codecub/plan/2026-06-11-codecub-p0-5-packaging-terminal-acceptance-plan.md`.
+- P0.6 release hardening: completed and verified in `.codecub/plan/2026-06-13-codecub-p0-6-release-hardening-plan.md`.
 - P0 acceptance checklist: recorded in `.codecub/plan/2026-06-11-codecub-p0-acceptance-checklist.md`.
 
 Stage plans must replace any illustrative or comment-only test sketches in this master plan with complete test code, exact files, exact commands, and expected failure/pass output. If the stage plan changes a P0 requirement or narrows scope, update the requirements document in the same change set.
