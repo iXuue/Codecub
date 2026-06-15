@@ -38,7 +38,7 @@ P0 must include:
 - Minimal diff preview.
 - CodeCub-owned minimal session index.
 - Recent projects plus manual folder selection.
-- Streaming assistant text and real-time run status.
+- Provider-native streaming assistant text for the OpenAI-compatible provider path used by Qwen testing, plus real-time run status.
 - Stop/cancel current run.
 - Hybrid storage: global appData plus project-level `.codecub/`.
 - Legacy `.pico/` detection and import.
@@ -54,7 +54,8 @@ P1 includes:
 - Fuller session and project management.
 - Git diff and commit assistance.
 - Richer pet personality states.
-- Provider-native streaming and finer-grained cancellation/recovery.
+- Provider-native streaming parity for Ollama and Anthropic-compatible providers.
+- Finer-grained cancellation/recovery.
 - macOS and Linux packaging.
 
 ## 4. P0 Sub-Milestones
@@ -79,6 +80,7 @@ Minimum event types:
 
 - `session_started`
 - `user_message_received`
+- `run_status`
 - `assistant_delta`
 - `assistant_message`
 - `tool_started`
@@ -300,11 +302,42 @@ Error events must distinguish:
 
 ## 7. Streaming Requirements
 
-The UI must support streaming assistant text through delta/token-like events.
+P0 streaming target is a Codex-like app experience: the assistant answer must appear progressively, and the UI must show how long the run has been active and what the agent is currently doing.
 
-The protocol must be streaming-first. If a provider does not support native streaming yet, the backend may split a completed response into `assistant_delta` events as a compatibility path. The UI and event contract must not degrade into only showing a final response.
+P0 must implement true provider-native streaming for the OpenAI-compatible provider path used by Qwen testing. The backend must request a streaming response from the provider when supported, read text chunks incrementally, and emit `assistant_delta` events while the provider response is still in progress. It is not sufficient for this P0 feature to wait for the full answer and then emit one whole-answer delta.
 
-P0 acceptance must verify the UI streaming display path.
+The frontend must render `assistant_delta` incrementally in the active assistant message. The final `assistant_message` event remains the durable complete message used for final state, history, and run completion. The frontend must avoid duplicating final text when both delta and final events are received.
+
+Providers that are not part of the P0 native-streaming target may keep the compatibility behavior temporarily: they may emit one or more `assistant_delta` events after receiving a completed response. This fallback must not change the frontend contract.
+
+The app must not expose hidden chain-of-thought or private reasoning. "Thinking" UI means observable process status only, such as:
+
+- Building context.
+- Requesting model response.
+- Receiving model response.
+- Executing a named tool.
+- Waiting for user approval.
+- Applying or summarizing file changes.
+- Completed, canceled, or failed.
+
+The backend should emit a `run_status` event whenever the observable state changes. A `run_status` payload should include:
+
+- `phase`: stable machine-readable status such as `building_context`, `model_request`, `model_streaming`, `tool_running`, `waiting_approval`, `finalizing`, `completed`, `failed`, or `canceled`.
+- `label`: short user-facing status text.
+- `detail`: optional safe detail, such as tool name, path summary, or provider name.
+- `started_at`: run start timestamp when available.
+- `elapsed_ms`: elapsed run time when available.
+
+The frontend must show a visible status area for the active run. It must include elapsed time, update while the run is active, and display the latest safe status label. The status must remain understandable even when no assistant text has arrived yet.
+
+P0 acceptance must verify:
+
+- OpenAI-compatible/Qwen streaming emits multiple `assistant_delta` events before the final `assistant_message` for a non-trivial response.
+- The chat view displays partial assistant text before final completion.
+- Final text is not duplicated after `assistant_message`.
+- The active run status area shows elapsed time while running.
+- The active run status changes for at least model request/model streaming and tool or approval phases when those phases occur.
+- Hidden model reasoning is not displayed in the UI, trace, run log, or persisted session data.
 
 ## 8. Storage Requirements
 
