@@ -71,13 +71,15 @@ export function App() {
     }
   }
 
-  async function refreshProjectExtensions(targetProjectPath = projectPath) {
+  async function refreshProjectExtensions(targetProjectPath = projectPath, clearError = true) {
     if (!targetProjectPath) {
       return;
     }
     try {
       setExtensions(await window.codecub.listProjectExtensions(targetProjectPath));
-      setExtensionError("");
+      if (clearError) {
+        setExtensionError("");
+      }
     } catch (error) {
       setExtensionError(error instanceof Error ? error.message : String(error));
     }
@@ -162,6 +164,8 @@ export function App() {
     const result = await window.codecub.installProjectSkill(projectPath);
     if (!result.canceled && result.error) {
       setExtensionError(result.error);
+      await refreshProjectExtensions(projectPath, false);
+      return;
     } else if (!result.canceled) {
       setExtensionError("");
     }
@@ -175,6 +179,8 @@ export function App() {
     const result = await window.codecub.installProjectPlugin(projectPath);
     if (!result.canceled && result.error) {
       setExtensionError(result.error);
+      await refreshProjectExtensions(projectPath, false);
+      return;
     } else if (!result.canceled) {
       setExtensionError("");
     }

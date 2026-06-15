@@ -94,4 +94,16 @@ describe("App recent project flow", () => {
     await waitFor(() => expect(window.codecub.startBackend).toHaveBeenLastCalledWith("D:/repo", "ask", "s1"));
     expect(await screen.findByText("previous task")).toBeTruthy();
   });
+
+  it("keeps extension install errors visible after refreshing the extension list", async () => {
+    installCodecubMock({
+      installProjectSkill: vi.fn(async () => ({ canceled: false, error: "SKILL.md is missing" })),
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /repo/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "Install Skill" }));
+
+    expect(await screen.findByText("SKILL.md is missing")).toBeTruthy();
+  });
 });
