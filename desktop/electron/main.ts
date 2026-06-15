@@ -6,6 +6,8 @@ import { BackendProcess } from "./backendProcess.js";
 import { loadSettings, saveSettings } from "./appConfig.js";
 import { apiKeyStatus, clearApiKey, readApiKey, saveApiKey } from "./credentialStore.js";
 import { readGitStatus } from "./gitStatus.js";
+import { installProjectExtension, listProjectExtensions } from "./projectExtensions.js";
+import { listProjectSessions, loadProjectSession } from "./projectSessions.js";
 import { loadRecentProjects, rememberProject } from "./projectStore.js";
 import { TerminalManager } from "./terminal.js";
 import type {
@@ -78,13 +80,16 @@ ipcMain.handle("project:open", async () => {
   return { canceled: false, projectPath: result.filePaths[0] };
 });
 
-ipcMain.handle("backend:start", async (_event, projectPath: string, approvalPolicy: "ask" | "auto" | "never" = "ask") => {
-  const settings = await loadSettings();
-  const effectiveSettings = { ...settings, approvalPolicy };
-  const apiKey = await readApiKey(effectiveSettings.provider.provider);
-  backend.start(buildBackendLaunchConfig(projectPath, effectiveSettings, apiKey));
-  await rememberProject(projectPath);
-});
+ipcMain.handle(
+  "backend:start",
+  async (_event, projectPath: string, approvalPolicy: "ask" | "auto" | "never" = "ask", resumeSessionId = "") => {
+    const settings = await loadSettings();
+    const effectiveSettings = { ...settings, approvalPolicy };
+    const apiKey = await readApiKey(effectiveSettings.provider.provider);
+    backend.start(buildBackendLaunchConfig(projectPath, effectiveSettings, apiKey, process.env, resumeSessionId));
+    await rememberProject(projectPath);
+  },
+);
 
 ipcMain.handle("backend:send", async (_event, command: BackendCommand) => {
   backend.send(command);
@@ -111,6 +116,34 @@ ipcMain.handle("terminal:close", async (_event, terminalId: string) => {
 });
 
 ipcMain.handle("git:status", async (_event, projectPath: string) => readGitStatus(projectPath));
+
+ipcMain.handle("sessions:list", async (_event, projectPath: string) => listProjectSessions(projectPath));
+
+ipcMain.handle("sessions:load", async (_event, projectPath: string, sessionId: string) =>
+  loadProjectSession(projectPath, sessionId),
+);
+
+ipcMain.handle("extensions:list", async (_event, projectPath: string) => listProjectExtensions(projectPath));
+
+ipcMain.handle("extensions:install-skill", async (_event, projectPath: string) => {
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory"] })
+    : await dialog.showOpenDialog({ properties: ["openDirectory"] });
+  if (result.canceled || !result.filePaths[0]) {
+    return { canceled: true };
+  }
+  return installProjectExtension(projectPath, result.filePaths[0], "skill");
+});
+
+ipcMain.handle("extensions:install-plugin", async (_event, projectPath: string) => {
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory"] })
+    : await dialog.showOpenDialog({ properties: ["openDirectory"] });
+  if (result.canceled || !result.filePaths[0]) {
+    return { canceled: true };
+  }
+  return installProjectExtension(projectPath, result.filePaths[0], "plugin");
+});
 
 ipcMain.handle("settings:load", async () => {
   const settings = await loadSettings();

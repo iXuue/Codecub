@@ -3,8 +3,12 @@ import type {
   AppSettings,
   BackendCommand,
   GitStatus,
+  InstallProjectExtensionResult,
   ModelProvider,
   OpenProjectResult,
+  ProjectExtensions,
+  ProjectSessionDetail,
+  ProjectSessionSummary,
   RecentProject,
   SaveProviderSettingsRequest,
   TerminalErrorEvent,
@@ -16,8 +20,8 @@ import type {
 
 const api = {
   openProject: (): Promise<OpenProjectResult> => ipcRenderer.invoke("project:open"),
-  startBackend: (projectPath: string, approvalPolicy: AppSettings["approvalPolicy"]): Promise<void> =>
-    ipcRenderer.invoke("backend:start", projectPath, approvalPolicy),
+  startBackend: (projectPath: string, approvalPolicy: AppSettings["approvalPolicy"], resumeSessionId = ""): Promise<void> =>
+    ipcRenderer.invoke("backend:start", projectPath, approvalPolicy, resumeSessionId),
   sendBackendCommand: (command: BackendCommand): Promise<void> => ipcRenderer.invoke("backend:send", command),
   stopBackend: (): Promise<void> => ipcRenderer.invoke("backend:stop"),
   loadSettings: (): Promise<AppSettings> => ipcRenderer.invoke("settings:load"),
@@ -27,6 +31,16 @@ const api = {
   clearProviderCredential: (provider: ModelProvider): Promise<AppSettings> =>
     ipcRenderer.invoke("settings:provider-clear-credential", provider),
   loadRecentProjects: (): Promise<RecentProject[]> => ipcRenderer.invoke("projects:recent"),
+  listProjectSessions: (projectPath: string): Promise<ProjectSessionSummary[]> =>
+    ipcRenderer.invoke("sessions:list", projectPath),
+  loadProjectSession: (projectPath: string, sessionId: string): Promise<ProjectSessionDetail> =>
+    ipcRenderer.invoke("sessions:load", projectPath, sessionId),
+  listProjectExtensions: (projectPath: string): Promise<ProjectExtensions> =>
+    ipcRenderer.invoke("extensions:list", projectPath),
+  installProjectSkill: (projectPath: string): Promise<InstallProjectExtensionResult> =>
+    ipcRenderer.invoke("extensions:install-skill", projectPath),
+  installProjectPlugin: (projectPath: string): Promise<InstallProjectExtensionResult> =>
+    ipcRenderer.invoke("extensions:install-plugin", projectPath),
   loadGitStatus: (projectPath: string): Promise<GitStatus> => ipcRenderer.invoke("git:status", projectPath),
   startTerminal: (request: TerminalStartRequest): Promise<void> => ipcRenderer.invoke("terminal:start", request),
   writeTerminal: (request: TerminalWriteRequest): Promise<void> => ipcRenderer.invoke("terminal:write", request),
