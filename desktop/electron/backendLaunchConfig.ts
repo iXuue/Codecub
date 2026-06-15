@@ -10,10 +10,15 @@ export function buildBackendLaunchConfig(
   settings: AppSettings,
   apiKey: string,
   baseEnv: NodeJS.ProcessEnv = process.env,
+  resumeSessionId = "",
 ): BackendLaunchConfig {
   const args = ["--app-mode", "--cwd", projectPath, "--approval", settings.approvalPolicy];
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   const provider = settings.provider.provider;
+
+  if (resumeSessionId.trim()) {
+    args.push("--resume", resumeSessionId.trim());
+  }
 
   args.push("--provider", provider);
   if (settings.provider.model.trim()) {

@@ -50,4 +50,10 @@ describe("backend launch config", () => {
     expect(config.env.OPENAI_API_KEY).toBeUndefined();
     expect(config.env.ANTHROPIC_API_KEY).toBeUndefined();
   });
+
+  it("passes resume session id when requested", () => {
+    const config = buildBackendLaunchConfig("D:/repo", settings("openai"), "", {}, "session-123");
+    expect(config.args).toContain("--resume");
+    expect(config.args).toContain("session-123");
+  });
 });
