@@ -3,8 +3,10 @@ import type {
   AppSettings,
   BackendCommand,
   GitStatus,
+  ModelProvider,
   OpenProjectResult,
   RecentProject,
+  SaveProviderSettingsRequest,
   TerminalExitEvent,
   TerminalResizeRequest,
   TerminalStartRequest,
@@ -19,6 +21,10 @@ const api = {
   stopBackend: (): Promise<void> => ipcRenderer.invoke("backend:stop"),
   loadSettings: (): Promise<AppSettings> => ipcRenderer.invoke("settings:load"),
   saveSettings: (settings: AppSettings): Promise<AppSettings> => ipcRenderer.invoke("settings:save", settings),
+  saveProviderSettings: (request: SaveProviderSettingsRequest): Promise<AppSettings> =>
+    ipcRenderer.invoke("settings:provider-save", request),
+  clearProviderCredential: (provider: ModelProvider): Promise<AppSettings> =>
+    ipcRenderer.invoke("settings:provider-clear-credential", provider),
   loadRecentProjects: (): Promise<RecentProject[]> => ipcRenderer.invoke("projects:recent"),
   loadGitStatus: (projectPath: string): Promise<GitStatus> => ipcRenderer.invoke("git:status", projectPath),
   startTerminal: (request: TerminalStartRequest): Promise<void> => ipcRenderer.invoke("terminal:start", request),

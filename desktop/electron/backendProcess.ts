@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { BackendCommand } from "./ipcTypes.js";
+import type { BackendLaunchConfig } from "./backendLaunchConfig.js";
 
 export type BackendProcessEvents = {
   event: [line: string];
@@ -32,20 +33,20 @@ export class BackendProcess extends EventEmitter {
     return super.emit(eventName, ...args);
   }
 
-  start(projectPath: string, approvalPolicy: "ask" | "auto" | "never" = "ask"): void {
+  start(launchConfig: BackendLaunchConfig): void {
     this.stop();
     const bundledBackend = join(process.resourcesPath, "backend", "codecub-agent.exe");
     const hasBundledBackend = existsSync(bundledBackend);
     const command = hasBundledBackend ? bundledBackend : process.env.CODECUB_BACKEND_COMMAND || "uv";
     const args = hasBundledBackend
-      ? ["--app-mode", "--cwd", projectPath, "--approval", approvalPolicy]
+      ? launchConfig.args
       : process.env.CODECUB_BACKEND_COMMAND
-      ? ["-m", "codecub", "--app-mode", "--cwd", projectPath, "--approval", approvalPolicy]
-      : ["run", "python", "-m", "codecub", "--app-mode", "--cwd", projectPath, "--approval", approvalPolicy];
+        ? ["-m", "codecub", ...launchConfig.args]
+        : ["run", "python", "-m", "codecub", ...launchConfig.args];
 
     this.child = spawn(command, args, {
       cwd: this.repoRoot,
-      env: process.env,
+      env: launchConfig.env,
       shell: false,
     });
 

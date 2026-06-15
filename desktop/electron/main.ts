@@ -1,12 +1,21 @@
 import { BrowserWindow, Menu, app, dialog, ipcMain } from "electron";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildBackendLaunchConfig } from "./backendLaunchConfig.js";
 import { BackendProcess } from "./backendProcess.js";
 import { loadSettings, saveSettings } from "./appConfig.js";
+import { apiKeyStatus, clearApiKey, readApiKey, saveApiKey } from "./credentialStore.js";
 import { readGitStatus } from "./gitStatus.js";
 import { loadRecentProjects, rememberProject } from "./projectStore.js";
 import { TerminalManager } from "./terminal.js";
-import type { BackendCommand, TerminalResizeRequest, TerminalStartRequest, TerminalWriteRequest } from "./ipcTypes.js";
+import type {
+  BackendCommand,
+  ModelProvider,
+  SaveProviderSettingsRequest,
+  TerminalResizeRequest,
+  TerminalStartRequest,
+  TerminalWriteRequest,
+} from "./ipcTypes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | null = null;
@@ -69,7 +78,10 @@ ipcMain.handle("project:open", async () => {
 });
 
 ipcMain.handle("backend:start", async (_event, projectPath: string, approvalPolicy: "ask" | "auto" | "never" = "ask") => {
-  backend.start(projectPath, approvalPolicy);
+  const settings = await loadSettings();
+  const effectiveSettings = { ...settings, approvalPolicy };
+  const apiKey = await readApiKey(effectiveSettings.provider.provider);
+  backend.start(buildBackendLaunchConfig(projectPath, effectiveSettings, apiKey));
   await rememberProject(projectPath);
 });
 
@@ -99,6 +111,46 @@ ipcMain.handle("terminal:close", async (_event, terminalId: string) => {
 
 ipcMain.handle("git:status", async (_event, projectPath: string) => readGitStatus(projectPath));
 
-ipcMain.handle("settings:load", async () => loadSettings());
+ipcMain.handle("settings:load", async () => {
+  const settings = await loadSettings();
+  const credential = await apiKeyStatus(settings.provider.provider);
+  return saveSettings({
+    ...settings,
+    provider: { ...settings.provider, credential },
+  });
+});
 ipcMain.handle("settings:save", async (_event, settings) => saveSettings(settings));
+ipcMain.handle("settings:provider-save", async (_event, request: SaveProviderSettingsRequest) => {
+  const current = await loadSettings();
+  let credential = current.provider.credential;
+  if (request.clearApiKey) {
+    credential = await clearApiKey(request.provider);
+  } else if (request.apiKey && request.apiKey.trim()) {
+    credential = await saveApiKey(request.provider, request.apiKey);
+  } else {
+    credential = await apiKeyStatus(request.provider);
+  }
+  return saveSettings({
+    ...current,
+    provider: {
+      provider: request.provider,
+      model: request.model,
+      baseUrl: request.baseUrl,
+      host: request.host,
+      credential,
+    },
+  });
+});
+ipcMain.handle("settings:provider-clear-credential", async (_event, provider: ModelProvider) => {
+  const current = await loadSettings();
+  const credential = await clearApiKey(provider);
+  return saveSettings({
+    ...current,
+    provider: {
+      ...current.provider,
+      provider,
+      credential,
+    },
+  });
+});
 ipcMain.handle("projects:recent", async () => loadRecentProjects());
