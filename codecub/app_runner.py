@@ -72,6 +72,7 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
     approval_counter = itertools.count(1)
     active_run = {"run_id": "", "thread": None, "cancel_requested": False}
     canceled_run_ids = set()
+    delta_seen_by_run = set()
 
     def emit(event_type, run_id="", payload=None):
         with output_lock:
@@ -94,6 +95,15 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
         request = ApprovalRequest(approval_id, run_id, name, approval_args)
         with pending_lock:
             pending_approvals[approval_id] = request
+        emit(
+            "run_status",
+            run_id=run_id,
+            payload={
+                "phase": "waiting_approval",
+                "label": "Waiting for approval",
+                "detail": name,
+            },
+        )
         emit(
             "approval_requested",
             run_id=run_id,
@@ -124,9 +134,18 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
         return request.approved
 
     def event_handler(event_name, payload, runtime, task_state):
+        run_id = active_run.get("run_id", "") or getattr(task_state, "run_id", "")
+        if event_name == "assistant_delta":
+            text = str(payload.get("text", ""))
+            if text:
+                delta_seen_by_run.add(run_id)
+                emit("assistant_delta", run_id=run_id, payload={"text": text})
+            return
+        if event_name == "run_status":
+            emit("run_status", run_id=run_id, payload=dict(payload or {}))
+            return
         if event_name != "tool_executed":
             return
-        run_id = getattr(task_state, "run_id", "") or active_run.get("run_id", "")
         tool_payload = _tool_result_payload(payload)
         emit("tool_result", run_id=run_id, payload=tool_payload)
         if tool_payload["workspace_changed"] or tool_payload["diff_summary"]:
@@ -174,6 +193,11 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 "message": str(exc),
                 **_run_artifact_payload(agent),
             }
+            emit(
+                "run_status",
+                run_id=run_id,
+                payload={"phase": "failed", "label": "Failed", "detail": str(exc)},
+            )
             emit("run_failed", run_id=run_id, payload=payload)
             return
         finally:
@@ -182,8 +206,10 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
         if run_id in canceled_run_ids or active_run.get("cancel_requested"):
             return
 
-        emit("assistant_delta", run_id=run_id, payload={"text": answer})
+        if run_id not in delta_seen_by_run:
+            emit("assistant_delta", run_id=run_id, payload={"text": answer})
         emit("assistant_message", run_id=run_id, payload={"text": answer})
+        emit("run_status", run_id=run_id, payload={"phase": "completed", "label": "Completed"})
         emit("run_completed", run_id=run_id, payload={"final": answer, **_run_artifact_payload(agent)})
         if active_run.get("run_id") == run_id:
             active_run["run_id"] = ""
@@ -253,6 +279,7 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 canceled_run_ids.add(run_id)
             active_run["cancel_requested"] = True
             reject_pending_for_run(run_id, "user_requested")
+            emit("run_status", run_id=run_id, payload={"phase": "canceled", "label": "Canceled"})
             emit("run_canceled", run_id=run_id, payload={"reason": "user_requested", **_run_artifact_payload(agent)})
             continue
 
@@ -289,6 +316,7 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 continue
             run_id = command.get("run_id") or _new_run_id()
             message = command["message"]
+            delta_seen_by_run.discard(run_id)
             active_run["run_id"] = run_id
             active_run["cancel_requested"] = False
             emit("user_message_received", run_id=run_id, payload={"message": message})

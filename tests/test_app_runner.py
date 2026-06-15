@@ -85,7 +85,8 @@ def test_app_runner_emits_session_user_assistant_and_completion_events(tmp_path)
     )
 
     events = parse_jsonl(stdout.getvalue())
-    event_types = [event["type"] for event in events]
+    primary_events = [event for event in events if event["type"] != "run_status"]
+    event_types = [event["type"] for event in primary_events]
 
     assert exit_code == 0
     assert event_types == [
@@ -96,11 +97,59 @@ def test_app_runner_emits_session_user_assistant_and_completion_events(tmp_path)
         "run_completed",
         "session_closed",
     ]
-    assert events[0]["session_id"]
-    assert events[1]["payload"]["message"] == "say hello"
-    assert events[2]["payload"]["text"] == "Hello from app mode."
-    assert events[3]["payload"]["text"] == "Hello from app mode."
-    assert events[4]["payload"]["final"] == "Hello from app mode."
+    assert primary_events[0]["session_id"]
+    assert primary_events[1]["payload"]["message"] == "say hello"
+    assert primary_events[2]["payload"]["text"] == "Hello from app mode."
+    assert primary_events[3]["payload"]["text"] == "Hello from app mode."
+    assert primary_events[4]["payload"]["final"] == "Hello from app mode."
+
+
+def test_app_runner_emits_streamed_deltas_before_final_message(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    stdin = io.StringIO('{"type":"send_message","message":"say hello"}\n{"type":"close"}\n')
+    stdout = io.StringIO()
+
+    def build(args):
+        workspace = WorkspaceContext.build(args.cwd)
+        client = FakeModelClient(["<final>Hello streamed answer.</final>"])
+        client.stream_chunks = ["<final>Hello ", "streamed ", "answer.</final>"]
+        return Pico(
+            model_client=client,
+            workspace=workspace,
+            session_store=SessionStore(Path(args.cwd) / ".codecub" / "sessions"),
+            approval_policy=args.approval,
+            max_steps=args.max_steps,
+            max_new_tokens=args.max_new_tokens,
+        )
+
+    run_app_mode(make_args(tmp_path), stdin=stdin, stdout=stdout, agent_factory=build)
+    events = parse_jsonl(stdout.getvalue())
+
+    delta_events = [event for event in events if event["type"] == "assistant_delta"]
+    final_index = next(index for index, event in enumerate(events) if event["type"] == "assistant_message")
+    assert [event["payload"]["text"] for event in delta_events] == ["Hello ", "streamed ", "answer."]
+    assert all(events.index(event) < final_index for event in delta_events)
+    assert any(event["type"] == "run_status" and event["payload"]["phase"] == "model_streaming" for event in events)
+
+
+def test_app_runner_emits_single_compatibility_delta_when_runtime_did_not_stream(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    stdin = io.StringIO('{"type":"send_message","message":"say hello"}\n{"type":"close"}\n')
+    stdout = io.StringIO()
+
+    exit_code = run_app_mode(
+        make_args(tmp_path),
+        stdin=stdin,
+        stdout=stdout,
+        agent_factory=fake_agent_factory(["<final>Hello from compatibility.</final>"]),
+    )
+
+    events = parse_jsonl(stdout.getvalue())
+    deltas = [event for event in events if event["type"] == "assistant_delta"]
+
+    assert exit_code == 0
+    assert len(deltas) == 1
+    assert deltas[0]["payload"]["text"] == "Hello from compatibility."
 
 
 def test_app_runner_emits_run_failed_for_model_error(tmp_path):
