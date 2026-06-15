@@ -26,4 +26,65 @@ describe("applyBackendEvent", () => {
     expect(state.messages[1].role).toBe("assistant");
     expect(state.messages[1].content).toContain("CodeCub");
   });
+
+  it("appends assistant deltas into one active message and replaces it on final", () => {
+    let state = createInitialChatState();
+
+    state = applyBackendEvent(state, {
+      type: "user_message_received",
+      timestamp: "2026-06-15T00:00:00Z",
+      session_id: "s1",
+      run_id: "r1",
+      payload: { message: "hello" },
+    });
+    state = applyBackendEvent(state, {
+      type: "assistant_delta",
+      timestamp: "2026-06-15T00:00:01Z",
+      session_id: "s1",
+      run_id: "r1",
+      payload: { text: "Hel" },
+    });
+    state = applyBackendEvent(state, {
+      type: "assistant_delta",
+      timestamp: "2026-06-15T00:00:02Z",
+      session_id: "s1",
+      run_id: "r1",
+      payload: { text: "lo" },
+    });
+
+    expect(state.messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+    expect(state.messages[1].content).toBe("Hello");
+
+    state = applyBackendEvent(state, {
+      type: "assistant_message",
+      timestamp: "2026-06-15T00:00:03Z",
+      session_id: "s1",
+      run_id: "r1",
+      payload: { text: "Hello" },
+    });
+
+    expect(state.messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+    expect(state.messages[1].content).toBe("Hello");
+  });
+
+  it("stores the latest active run status", () => {
+    let state = createInitialChatState();
+
+    state = applyBackendEvent(state, {
+      type: "run_status",
+      timestamp: "2026-06-15T00:00:01Z",
+      session_id: "s1",
+      run_id: "r1",
+      payload: {
+        phase: "model_streaming",
+        label: "Receiving model response",
+        detail: "qwen-flash",
+        elapsed_ms: 1200,
+      },
+    });
+
+    expect(state.runStatus?.phase).toBe("model_streaming");
+    expect(state.runStatus?.label).toBe("Receiving model response");
+    expect(state.runStatus?.elapsedMs).toBe(1200);
+  });
 });
