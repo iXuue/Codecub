@@ -352,9 +352,42 @@ textarea {
 }
 
 .chat-view {
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
+}
+
+.run-status-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid #e2e6ec;
+  padding: 8px 12px;
+  color: #475569;
+  background: #f8fafc;
+  font-size: 12px;
+}
+
+.run-status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #2563eb;
+}
+
+.run-status-label {
+  font-weight: 700;
+}
+
+.run-status-detail,
+.run-status-elapsed {
+  color: #64748b;
+}
+
+.run-status-elapsed {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
 }
 
 .terminal-panel {
@@ -403,6 +436,8 @@ textarea {
 }
 
 .message-list {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
   padding: 16px;
 }

@@ -29,6 +29,7 @@ export const zhCN = {
   backendNotStarted: "后端尚未启动",
   project: "项目",
   status: "状态",
+  activeRunStatus: "运行状态",
   ready: "就绪",
   running: "运行中",
   emptyChat: "选择项目后开始对话",

@@ -29,6 +29,7 @@ export const enUS = {
   backendNotStarted: "Backend has not started",
   project: "Project",
   status: "Status",
+  activeRunStatus: "Run status",
   ready: "Ready",
   running: "Running",
   emptyChat: "Open a project to start",
