@@ -56,6 +56,22 @@ class ApprovalAwareStdin:
         return line
 
 
+class NonStreamingFakeModelClient:
+    supports_prompt_cache = False
+
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.prompts = []
+        self.last_completion_metadata = {}
+
+    def complete(self, prompt, max_new_tokens, **kwargs):
+        del max_new_tokens, kwargs
+        self.prompts.append(prompt)
+        if not self.outputs:
+            raise RuntimeError("fake model ran out of outputs")
+        return self.outputs.pop(0)
+
+
 def fake_agent_factory(outputs):
     def build(args):
         workspace = WorkspaceContext.build(args.cwd)
@@ -132,16 +148,27 @@ def test_app_runner_emits_streamed_deltas_before_final_message(tmp_path):
     assert any(event["type"] == "run_status" and event["payload"]["phase"] == "model_streaming" for event in events)
 
 
-def test_app_runner_emits_single_compatibility_delta_when_runtime_did_not_stream(tmp_path):
+def test_app_runner_emits_single_compatibility_delta_for_non_streaming_client(tmp_path):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     stdin = io.StringIO('{"type":"send_message","message":"say hello"}\n{"type":"close"}\n')
     stdout = io.StringIO()
+
+    def build(args):
+        workspace = WorkspaceContext.build(args.cwd)
+        return Pico(
+            model_client=NonStreamingFakeModelClient(["<final>Hello from compatibility.</final>"]),
+            workspace=workspace,
+            session_store=SessionStore(Path(args.cwd) / ".codecub" / "sessions"),
+            approval_policy=args.approval,
+            max_steps=args.max_steps,
+            max_new_tokens=args.max_new_tokens,
+        )
 
     exit_code = run_app_mode(
         make_args(tmp_path),
         stdin=stdin,
         stdout=stdout,
-        agent_factory=fake_agent_factory(["<final>Hello from compatibility.</final>"]),
+        agent_factory=build,
     )
 
     events = parse_jsonl(stdout.getvalue())
