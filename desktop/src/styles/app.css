@@ -1,7 +1,34 @@
 :root {
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  color: #1d2329;
-  background: #f6f7f9;
+  --font-ui: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-code: "JetBrains Mono", Consolas, "SFMono-Regular", monospace;
+  --color-bg: #F6F8FA;
+  --color-surface: #FFFFFF;
+  --color-surface-subtle: #EEF2F5;
+  --color-text: #17202A;
+  --color-muted: #64717F;
+  --color-border: #D9E0E7;
+  --color-brand: #2F6F73;
+  --color-accent: #D6A84F;
+  --color-danger: #B42318;
+  --color-success: #1F7A4D;
+  --color-warning: #9A5A00;
+  --color-code-surface: #111820;
+  --color-glass-surface: rgba(255, 255, 255, 0.72);
+  --color-glass-border: rgba(217, 224, 231, 0.72);
+  --blur-glass: blur(14px);
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --motion-slow: 240ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --radius-panel: 8px;
+  --radius-control: 7px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  font-family: var(--font-ui);
+  color: var(--color-text);
+  background: var(--color-bg);
 }
 
 * {
@@ -25,7 +52,7 @@ textarea {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  background: #f6f7f9;
+  background: var(--color-bg);
 }
 
 .toolbar {
@@ -34,8 +61,9 @@ textarea {
   align-items: center;
   justify-content: space-between;
   padding: 0 16px;
-  border-bottom: 1px solid #d9dee5;
-  background: #ffffff;
+  border-bottom: 1px solid var(--color-glass-border);
+  background: var(--color-glass-surface);
+  backdrop-filter: var(--blur-glass);
 }
 
 .brand {
@@ -86,7 +114,7 @@ textarea {
 .button {
   height: 34px;
   border: 1px solid #c9d0d9;
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   padding: 0 12px;
   font-size: 13px;
   font-weight: 650;
@@ -99,14 +127,14 @@ textarea {
 }
 
 .button.primary {
-  border-color: #222831;
-  background: #222831;
+  border-color: var(--color-brand);
+  background: var(--color-brand);
   color: #ffffff;
 }
 
 .button.secondary {
-  background: #ffffff;
-  color: #222831;
+  background: var(--color-surface);
+  color: var(--color-text);
 }
 
 .button.mini {
@@ -140,9 +168,9 @@ textarea {
 
 .recent-panel,
 .settings-page {
-  border: 1px solid #d9dee5;
-  border-radius: 8px;
-  background: #ffffff;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface);
 }
 
 .recent-panel {
@@ -189,7 +217,7 @@ textarea {
 .recent-path,
 .empty-state,
 .event-meta {
-  color: #68717d;
+  color: var(--color-muted);
   font-size: 12px;
 }
 
@@ -402,8 +430,8 @@ textarea {
   display: grid;
   grid-template-rows: 42px minmax(0, 1fr);
   min-height: 0;
-  border-top: 1px solid #d9dee5;
-  background: #101419;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-code-surface);
 }
 
 .terminal-header {
@@ -473,7 +501,7 @@ textarea {
 }
 
 .message-content {
-  color: #1d2329;
+  color: var(--color-text);
   font-size: 14px;
   line-height: 1.55;
   white-space: pre-wrap;
@@ -509,8 +537,9 @@ textarea {
   display: grid;
   grid-template-rows: auto auto auto minmax(0, 1fr);
   min-height: 0;
-  border-left: 1px solid #d9dee5;
-  background: #ffffff;
+  border-left: 1px solid var(--color-glass-border);
+  background: var(--color-glass-surface);
+  backdrop-filter: var(--blur-glass);
 }
 
 .side-panel {
@@ -518,9 +547,9 @@ textarea {
   gap: 8px;
   max-height: 220px;
   overflow: auto;
-  border-bottom: 1px solid #d9dee5;
+  border-bottom: 1px solid var(--color-border);
   padding: 12px;
-  background: #ffffff;
+  background: var(--color-surface);
 }
 
 .side-panel-header {
@@ -752,4 +781,15 @@ textarea {
 .credential-row strong {
   overflow-wrap: anywhere;
   color: #1d2329;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 1ms !important;
+  }
 }
