@@ -1,7 +1,7 @@
 # CodeCub P0 Requirements
 
 Date: 2026-06-11
-Last updated: 2026-06-15
+Last updated: 2026-06-16
 Status: Draft v0.2
 Scope: P0 desktop app requirements
 
@@ -41,6 +41,7 @@ P0 must include:
 - Provider-native streaming assistant text for the OpenAI-compatible provider path used by Qwen testing, plus real-time run status.
 - Project-scoped chat history that can list and resume previous `.codecub/sessions` records from the desktop app.
 - Project-scoped local plugin and skill installation from user-selected local folders.
+- P0.9 UI polish pass: three-column desktop workbench, unified visual tokens, clearer chat hierarchy, CodeCub status chip, and run trail.
 - Stop/cancel current run.
 - Hybrid storage: global appData plus project-level `.codecub/`.
 - Legacy `.pico/` detection and import.
@@ -215,6 +216,102 @@ The extension manager must not:
 
 The minimum UI surface is a project-side panel or equivalent project-scoped view showing installed skills/plugins, install actions, and install errors.
 
+### P0.9 Desktop UI Polish
+
+P0.9 improves the desktop interface aesthetics and information architecture without changing the agent core behavior, backend event contract, model provider behavior, storage format, or packaging requirements.
+
+The design direction is `Quiet Cub Workbench`: a professional desktop code agent interface with restrained CodeCub pet identity. The product should read primarily as a serious developer tool, not as a decorative toy app.
+
+The project session screen must move toward a three-column workbench:
+
+```text
+Left: project context, chat history, plugins, skills
+Center: chat, composer, terminal
+Right: run status, approvals, diff preview, run log
+```
+
+The UI must use a tokenized visual system for:
+
+- Background, surface, raised surface, border, muted text, primary text.
+- Brand primary, brand accent, success, warning, danger, and code surface.
+- Font sizes and weights for page title, panel title, body, metadata, and code/log text.
+- Border radius, spacing, and focus ring values.
+
+The recommended P0.9 palette is:
+
+```text
+Background: #F6F8FA
+Surface: #FFFFFF
+Subtle surface: #EEF2F5
+Text: #17202A
+Muted text: #64717F
+Border: #D9E0E7
+Brand primary: #2F6F73
+Brand accent: #D6A84F
+Danger: #B42318
+Success: #1F7A4D
+Warning/running: #9A5A00
+Code surface: #111820
+```
+
+The chat area must distinguish:
+
+- User messages.
+- Assistant messages.
+- Streaming assistant state.
+- Empty state.
+- Tool/process status, which should not visually compete with final assistant text.
+
+The app must add a compact CodeCub status chip that maps safe observable run states to visible status text. It must not display hidden chain-of-thought. Allowed status meanings include:
+
+- Ready.
+- Analyzing project context.
+- Requesting model response.
+- Receiving model response.
+- Reading files.
+- Preparing changes.
+- Running command.
+- Waiting for approval.
+- Completed.
+- Failed or needs attention.
+
+The right-side run area must add a compact run trail showing the active run progression:
+
+```text
+Context -> Model -> Tool -> Diff -> Done
+```
+
+The run trail is a visual summary only. It must derive from existing `run_status`, `tool_*`, `diff_summary`, and completion events. It must not require a new backend protocol in P0.9 unless a gap is found and explicitly documented.
+
+Motion is optional in P0.9 and must be minimal. Any animation must:
+
+- Support reduced motion.
+- Use transform and opacity rather than layout-changing properties.
+- Be limited to state transitions such as status chip updates, message arrival, panel expansion, or run trail step changes.
+- Not block user input.
+
+P0.9 must preserve the current functional scope:
+
+- Opening a project.
+- Recent projects.
+- Project chat history and resume.
+- Local plugin/skill installation.
+- Model API settings.
+- Approval flow.
+- Diff preview.
+- Run log.
+- Interactive terminal.
+- Legacy `.pico` import prompt.
+
+P0.9 must not introduce:
+
+- A full pet growth/economy system.
+- Plugin marketplace.
+- New backend service architecture.
+- New model provider behavior.
+- Large decorative background animations.
+- Hidden reasoning display.
+
 ## 5. Page And Panel Requirements
 
 P0 must include these pages or panels:
@@ -227,6 +324,8 @@ P0 must include these pages or panels:
 - Interactive terminal panel.
 - Project chat history panel.
 - Project plugin and skill manager panel.
+- CodeCub status chip.
+- Run trail panel.
 - `.pico` import prompt.
 - Error and crash notification surface.
 
@@ -253,6 +352,8 @@ Shows:
 - Run log sidebar.
 - Project chat history entry point.
 - Project plugin and skill manager entry point.
+- CodeCub status chip for observable run state.
+- Run trail for high-level execution progress.
 - Input area with Send and Stop.
 
 ### Settings Page
@@ -595,6 +696,9 @@ P0 acceptance must cover:
 - React run log sidebar.
 - React project chat history list and resume flow.
 - React project plugin and skill manager.
+- React three-column project workbench layout.
+- React CodeCub status chip.
+- React run trail.
 - React approval dialog.
 - React settings page.
 - React model API settings save/update/clear flow.
@@ -609,6 +713,8 @@ P0 acceptance must cover:
 - E2E resume session flow.
 - E2E local skill install flow.
 - E2E local plugin install flow.
+- E2E UI layout smoke for project session page.
+- E2E run status chip and run trail display.
 - E2E view logs flow.
 - Windows package install/start smoke test.
 - Packaged app calls embedded backend.
