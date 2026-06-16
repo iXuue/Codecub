@@ -224,6 +224,8 @@ The design direction is `Quiet Cub Workbench`: a professional desktop code agent
 
 P0.9 should include a restrained translucent feel. This means selected surfaces may use glass-like semi-transparent backgrounds, light backdrop blur, and subtle borders. Transparency must support readability rather than decoration.
 
+P0.9 should also include restrained dynamic effects. Motion must communicate state changes and interaction feedback, not serve as background decoration.
+
 The project session screen must move toward a three-column workbench:
 
 ```text
@@ -295,12 +297,23 @@ Context -> Model -> Tool -> Diff -> Done
 
 The run trail is a visual summary only. It must derive from existing `run_status`, `tool_*`, `diff_summary`, and completion events. It must not require a new backend protocol in P0.9 unless a gap is found and explicitly documented.
 
-Motion is optional in P0.9 and must be minimal. Any animation must:
+Motion in P0.9 must remain minimal and purposeful. Allowed dynamic effects are:
+
+- Assistant message arrival: subtle opacity and translate transition.
+- Streaming state: compact status chip pulse or shimmer limited to the chip/indicator.
+- Run trail step change: active step transition and completed-step highlight.
+- Side panel interaction: hover/focus elevation or soft background transition.
+- Plugin/skill install success: brief highlight on the installed item.
+- Approval attention: restrained warning emphasis without shaking or flashing.
+
+Any animation must:
 
 - Support reduced motion.
 - Use transform and opacity rather than layout-changing properties.
 - Be limited to state transitions such as status chip updates, message arrival, panel expansion, or run trail step changes.
 - Not block user input.
+- Stay short, generally 120-240ms for micro-interactions and no more than 360ms for view-level transitions.
+- Avoid infinite animations except a very subtle active-run indicator.
 
 P0.9 must preserve the current functional scope:
 
@@ -323,6 +336,7 @@ P0.9 must not introduce:
 - New model provider behavior.
 - Large decorative background animations.
 - Decorative glassmorphism effects that reduce readability.
+- Excessive motion, particle effects, parallax backgrounds, or animations that make the coding workspace feel unstable.
 - Hidden reasoning display.
 
 ## 5. Page And Panel Requirements

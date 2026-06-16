@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Improve CodeCub desktop visual quality with a three-column workbench, unified visual tokens, restrained translucent surfaces, clearer chat hierarchy, a CodeCub status chip, and a run trail.
+**Goal:** Improve CodeCub desktop visual quality with a three-column workbench, unified visual tokens, restrained translucent surfaces, purposeful micro-interactions, clearer chat hierarchy, a CodeCub status chip, and a run trail.
 
 **Architecture:** Keep the existing Electron/React data flow and backend JSONL event protocol unchanged. Refactor the renderer project session page into focused presentational components: left project sidebar, center workbench, and right run inspector. Derive visual run progress from existing frontend `chatState` and `events`.
 
@@ -33,6 +33,7 @@ In scope:
 - Project session page layout changes.
 - CSS token system and visual palette.
 - Restrained glass/translucent surfaces for toolbar, sidebars, status chip, and run trail.
+- Purposeful micro-interactions for message arrival, status updates, run trail transitions, side panel hover/focus, and install success feedback.
 - Chat message hierarchy polish.
 - Project sidebar for project context, chat history, plugins, and skills.
 - Run inspector for status, approvals, diff, run trail, and log.
@@ -48,6 +49,7 @@ Out of scope:
 - Pet growth, skins, affinity, feeding, or economy systems.
 - Plugin marketplace or plugin runtime execution.
 - Large decorative animations.
+- Excessive motion, particles, parallax backgrounds, or animated decorations.
 - Decorative glassmorphism effects that reduce readability.
 - Displaying hidden reasoning or chain-of-thought.
 - Full responsive mobile design; this remains a desktop app with current minimum window constraints.
@@ -90,6 +92,8 @@ describe("UI tokens", () => {
     expect(css).toContain("--color-code-surface: #111820");
     expect(css).toContain("--color-glass-surface: rgba(255, 255, 255, 0.72)");
     expect(css).toContain("--color-glass-border: rgba(217, 224, 231, 0.72)");
+    expect(css).toContain("--motion-fast: 120ms");
+    expect(css).toContain("--motion-base: 180ms");
     expect(css).toContain("--radius-panel: 8px");
     expect(css).toContain("--font-code:");
   });
@@ -130,6 +134,10 @@ In `desktop/src/styles/app.css`, replace the current `:root` block with tokenize
   --color-glass-surface: rgba(255, 255, 255, 0.72);
   --color-glass-border: rgba(217, 224, 231, 0.72);
   --blur-glass: blur(14px);
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --motion-slow: 240ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
   --radius-panel: 8px;
   --radius-control: 7px;
   --space-1: 4px;
@@ -142,7 +150,20 @@ In `desktop/src/styles/app.css`, replace the current `:root` block with tokenize
 }
 ```
 
-Then replace obvious repeated colors in the edited sections with tokens without changing component behavior. Apply translucent surfaces only to toolbar, sidebars, status chip, and run trail containers. Keep terminal, code/diff blocks, error banners, and message content surfaces fully readable.
+Then replace obvious repeated colors in the edited sections with tokens without changing component behavior. Apply translucent surfaces only to toolbar, sidebars, status chip, and run trail containers. Keep terminal, code/diff blocks, error banners, and message content surfaces fully readable. Add a global reduced-motion guard:
+
+```css
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 1ms !important;
+  }
+}
+```
 
 - [ ] **Step 4: Run token test**
 
@@ -430,6 +451,7 @@ Add styles to `app.css` for:
 
 The chip must stay compact and not exceed one row in the right inspector header.
 Use `--color-glass-surface`, `--color-glass-border`, and `--blur-glass` for the chip background, with a solid readable fallback color.
+Use `--motion-base` and `--ease-standard` for status chip state transitions. If adding a running pulse, apply it only to `.cub-status-mark` and keep it subtle.
 
 - [ ] **Step 5: Run component tests**
 
@@ -571,6 +593,7 @@ Add:
 
 Make each column independently scrollable only where needed. Do not create nested cards inside cards.
 Use translucent column surfaces only at the top-level sidebar/inspector shell. Inner content should remain quiet and readable, avoiding stacked glass cards.
+Use hover/focus transitions on side-panel list items through background, border, and transform only. Do not animate widths/heights.
 
 - [ ] **Step 7: Run layout test**
 
@@ -645,6 +668,7 @@ Adjust CSS:
 - User messages: narrower, right-aligned, brand-tinted subtle background.
 - Message roles: consistent 11-12px metadata styling.
 - Composer: stronger separation, stable button sizing.
+- New message entry: subtle opacity and translate animation using `--motion-base`.
 
 Do not change message data shape.
 
@@ -722,6 +746,7 @@ Run the desktop app through the existing dev flow or packaged app available in t
 - Backend startup failure still allows project page and terminal access.
 - No visible text overlap at the current desktop minimum size.
 - Translucent surfaces are visible but do not reduce text, diff, terminal, or error readability.
+- Motion is limited to micro-interactions and respects reduced-motion settings.
 - No hidden reasoning or chain-of-thought is displayed.
 
 - [ ] **Step 6: Check git status**
@@ -736,7 +761,7 @@ Expected: only intended P0.9 files are changed, plus any pre-existing unrelated 
 
 ## Plan Self-Review
 
-- Spec coverage: The plan covers three-column workbench, visual tokens, restrained translucent surfaces, chat hierarchy, CodeCub status chip, run trail, i18n, and verification.
+- Spec coverage: The plan covers three-column workbench, visual tokens, restrained translucent surfaces, purposeful micro-interactions, chat hierarchy, CodeCub status chip, run trail, i18n, and verification.
 - Existing behavior preservation: No task changes backend, IPC, storage, model providers, approval policy, terminal behavior, or extension installation logic.
 - Placeholder scan: No task uses undefined placeholders. Each task identifies target files and concrete verification commands.
 - Type consistency: `RunTrailStepId`, `RunTrailStepState`, `RunTrailStep`, `deriveRunTrail`, `CubStatusChip`, and `RunTrail` are introduced before use in later tasks.
