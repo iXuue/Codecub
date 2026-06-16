@@ -426,6 +426,110 @@ textarea {
   font-variant-numeric: tabular-nums;
 }
 
+.cub-status-chip {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  align-items: center;
+  min-height: 42px;
+  border: 1px solid var(--color-glass-border);
+  border-radius: var(--radius-panel);
+  padding: 8px 10px;
+  background: var(--color-glass-surface);
+  backdrop-filter: var(--blur-glass);
+  transition: border-color var(--motion-base) var(--ease-standard), background var(--motion-base) var(--ease-standard);
+}
+
+.cub-status-chip.running {
+  border-color: rgba(47, 111, 115, 0.38);
+}
+
+.cub-status-mark {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: var(--color-brand);
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.cub-status-chip.running .cub-status-mark {
+  animation: cub-status-pulse 1.8s var(--ease-standard) infinite;
+}
+
+.cub-status-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cub-status-label {
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 12px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cub-status-detail,
+.cub-status-time {
+  color: var(--color-muted);
+  font-size: 11px;
+}
+
+.cub-status-time {
+  font-variant-numeric: tabular-nums;
+}
+
+.run-trail {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-trail-step {
+  min-width: 0;
+  border: 1px solid var(--color-glass-border);
+  border-radius: 999px;
+  padding: 5px 7px;
+  background: var(--color-glass-surface);
+  color: var(--color-muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+  transition: background var(--motion-base) var(--ease-standard), border-color var(--motion-base) var(--ease-standard), color var(--motion-base) var(--ease-standard), transform var(--motion-fast) var(--ease-standard);
+}
+
+.run-trail-step.active {
+  border-color: rgba(47, 111, 115, 0.42);
+  background: rgba(47, 111, 115, 0.1);
+  color: var(--color-brand);
+  transform: translateY(-1px);
+}
+
+.run-trail-step.complete {
+  border-color: rgba(31, 122, 77, 0.3);
+  background: rgba(31, 122, 77, 0.08);
+  color: var(--color-success);
+}
+
+@keyframes cub-status-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(47, 111, 115, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(47, 111, 115, 0.14);
+  }
+}
+
 .terminal-panel {
   display: grid;
   grid-template-rows: 42px minmax(0, 1fr);
