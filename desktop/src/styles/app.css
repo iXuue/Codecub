@@ -224,7 +224,7 @@ textarea {
 .workspace-layout {
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 380px;
+  grid-template-columns: 280px minmax(0, 1fr) 360px;
   min-height: 0;
 }
 
@@ -391,6 +391,58 @@ textarea {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  border-left: 1px solid var(--color-border);
+  border-right: 1px solid var(--color-border);
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.project-sidebar,
+.run-inspector {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  background: var(--color-glass-surface);
+  backdrop-filter: var(--blur-glass);
+}
+
+.project-sidebar {
+  display: grid;
+  grid-auto-rows: max-content;
+  gap: var(--space-3);
+  padding: var(--space-3);
+}
+
+.run-inspector {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.sidebar-project-card,
+.inspector-section {
+  display: grid;
+  gap: var(--space-2);
+  border: 1px solid var(--color-glass-border);
+  border-radius: var(--radius-panel);
+  padding: var(--space-3);
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.sidebar-project-label {
+  color: var(--color-muted);
+  font-size: 11px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.sidebar-project-path {
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.inspector-section {
+  margin: var(--space-3);
 }
 
 .run-status-strip {
