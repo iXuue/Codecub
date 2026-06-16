@@ -6,7 +6,7 @@ import { createInitialApprovalState } from "../src/state/approvalState";
 import { createInitialChatState } from "../src/state/chatState";
 
 function installCodecubMock() {
-  (window as unknown as { codecub: Partial<Window["codecub"]> }).codecub = {
+  (window as unknown as { codecub: unknown }).codecub = {
     loadGitStatus: vi.fn(async () => ({ branch: "main", dirty: false, changedCount: 0, ahead: 0, behind: 0, files: [] })),
     startTerminal: vi.fn(),
     writeTerminal: vi.fn(),
@@ -15,7 +15,7 @@ function installCodecubMock() {
     onTerminalData: vi.fn(() => () => undefined),
     onTerminalExit: vi.fn(() => () => undefined),
     onTerminalError: vi.fn(() => () => undefined),
-  };
+  } as unknown as Partial<Window["codecub"]>;
 }
 
 describe("ProjectSessionPage layout", () => {
