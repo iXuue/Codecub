@@ -222,6 +222,8 @@ P0.9 improves the desktop interface aesthetics and information architecture with
 
 The design direction is `Quiet Cub Workbench`: a professional desktop code agent interface with restrained CodeCub pet identity. The product should read primarily as a serious developer tool, not as a decorative toy app.
 
+P0.9 should include a restrained translucent feel. This means selected surfaces may use glass-like semi-transparent backgrounds, light backdrop blur, and subtle borders. Transparency must support readability rather than decoration.
+
 The project session screen must move toward a three-column workbench:
 
 ```text
@@ -252,7 +254,17 @@ Danger: #B42318
 Success: #1F7A4D
 Warning/running: #9A5A00
 Code surface: #111820
+Glass surface: rgba(255, 255, 255, 0.72)
+Glass border: rgba(217, 224, 231, 0.72)
 ```
+
+Transparency rules:
+
+- Allowed: top toolbar, project sidebar surface, run inspector surface, status chip, run trail, and small floating status surfaces.
+- Avoid: chat message body text surfaces, terminal surface, approval risk content, diff/code blocks, and error banners when transparency would reduce contrast.
+- Text contrast must remain readable against both normal and translucent surfaces.
+- Backdrop blur must be subtle and must have a non-blur fallback through a readable background color.
+- The UI must not use decorative glass orbs, large blurred background blobs, or visual effects that make the code/tooling workspace feel noisy.
 
 The chat area must distinguish:
 
@@ -310,6 +322,7 @@ P0.9 must not introduce:
 - New backend service architecture.
 - New model provider behavior.
 - Large decorative background animations.
+- Decorative glassmorphism effects that reduce readability.
 - Hidden reasoning display.
 
 ## 5. Page And Panel Requirements

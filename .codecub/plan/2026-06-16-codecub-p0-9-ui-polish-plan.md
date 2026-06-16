@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Improve CodeCub desktop visual quality with a three-column workbench, unified visual tokens, clearer chat hierarchy, a CodeCub status chip, and a run trail.
+**Goal:** Improve CodeCub desktop visual quality with a three-column workbench, unified visual tokens, restrained translucent surfaces, clearer chat hierarchy, a CodeCub status chip, and a run trail.
 
 **Architecture:** Keep the existing Electron/React data flow and backend JSONL event protocol unchanged. Refactor the renderer project session page into focused presentational components: left project sidebar, center workbench, and right run inspector. Derive visual run progress from existing frontend `chatState` and `events`.
 
@@ -16,7 +16,7 @@ The user wants the CodeCub desktop interface to look more polished and professio
 
 - 70% professional code agent desktop tool.
 - 20% CodeCub pet identity.
-- 10% restrained motion/state feedback.
+- 10% restrained motion/state feedback and light translucent surface treatment.
 
 This plan only changes renderer UI structure, styling, and component-level presentation. It must not change backend behavior, model calls, storage formats, approval rules, plugin installation behavior, or terminal behavior.
 
@@ -32,6 +32,7 @@ In scope:
 
 - Project session page layout changes.
 - CSS token system and visual palette.
+- Restrained glass/translucent surfaces for toolbar, sidebars, status chip, and run trail.
 - Chat message hierarchy polish.
 - Project sidebar for project context, chat history, plugins, and skills.
 - Run inspector for status, approvals, diff, run trail, and log.
@@ -47,6 +48,7 @@ Out of scope:
 - Pet growth, skins, affinity, feeding, or economy systems.
 - Plugin marketplace or plugin runtime execution.
 - Large decorative animations.
+- Decorative glassmorphism effects that reduce readability.
 - Displaying hidden reasoning or chain-of-thought.
 - Full responsive mobile design; this remains a desktop app with current minimum window constraints.
 
@@ -86,6 +88,8 @@ describe("UI tokens", () => {
     expect(css).toContain("--color-brand: #2F6F73");
     expect(css).toContain("--color-accent: #D6A84F");
     expect(css).toContain("--color-code-surface: #111820");
+    expect(css).toContain("--color-glass-surface: rgba(255, 255, 255, 0.72)");
+    expect(css).toContain("--color-glass-border: rgba(217, 224, 231, 0.72)");
     expect(css).toContain("--radius-panel: 8px");
     expect(css).toContain("--font-code:");
   });
@@ -123,6 +127,9 @@ In `desktop/src/styles/app.css`, replace the current `:root` block with tokenize
   --color-success: #1F7A4D;
   --color-warning: #9A5A00;
   --color-code-surface: #111820;
+  --color-glass-surface: rgba(255, 255, 255, 0.72);
+  --color-glass-border: rgba(217, 224, 231, 0.72);
+  --blur-glass: blur(14px);
   --radius-panel: 8px;
   --radius-control: 7px;
   --space-1: 4px;
@@ -135,7 +142,7 @@ In `desktop/src/styles/app.css`, replace the current `:root` block with tokenize
 }
 ```
 
-Then replace obvious repeated colors in the edited sections with tokens without changing component behavior.
+Then replace obvious repeated colors in the edited sections with tokens without changing component behavior. Apply translucent surfaces only to toolbar, sidebars, status chip, and run trail containers. Keep terminal, code/diff blocks, error banners, and message content surfaces fully readable.
 
 - [ ] **Step 4: Run token test**
 
@@ -422,6 +429,7 @@ Add styles to `app.css` for:
 ```
 
 The chip must stay compact and not exceed one row in the right inspector header.
+Use `--color-glass-surface`, `--color-glass-border`, and `--blur-glass` for the chip background, with a solid readable fallback color.
 
 - [ ] **Step 5: Run component tests**
 
@@ -562,6 +570,7 @@ Add:
 ```
 
 Make each column independently scrollable only where needed. Do not create nested cards inside cards.
+Use translucent column surfaces only at the top-level sidebar/inspector shell. Inner content should remain quiet and readable, avoiding stacked glass cards.
 
 - [ ] **Step 7: Run layout test**
 
@@ -712,6 +721,7 @@ Run the desktop app through the existing dev flow or packaged app available in t
 - Right column contains CodeCub status, run trail, approvals, diff, and run log.
 - Backend startup failure still allows project page and terminal access.
 - No visible text overlap at the current desktop minimum size.
+- Translucent surfaces are visible but do not reduce text, diff, terminal, or error readability.
 - No hidden reasoning or chain-of-thought is displayed.
 
 - [ ] **Step 6: Check git status**
@@ -726,7 +736,7 @@ Expected: only intended P0.9 files are changed, plus any pre-existing unrelated 
 
 ## Plan Self-Review
 
-- Spec coverage: The plan covers three-column workbench, visual tokens, chat hierarchy, CodeCub status chip, run trail, i18n, and verification.
+- Spec coverage: The plan covers three-column workbench, visual tokens, restrained translucent surfaces, chat hierarchy, CodeCub status chip, run trail, i18n, and verification.
 - Existing behavior preservation: No task changes backend, IPC, storage, model providers, approval policy, terminal behavior, or extension installation logic.
 - Placeholder scan: No task uses undefined placeholders. Each task identifies target files and concrete verification commands.
 - Type consistency: `RunTrailStepId`, `RunTrailStepState`, `RunTrailStep`, `deriveRunTrail`, `CubStatusChip`, and `RunTrail` are introduced before use in later tasks.
