@@ -76,6 +76,7 @@ export const zhCN = {
   activityProcessed: "已处理",
   activityTaskReceived: "已接收任务",
   activityWorking: "正在处理任务",
+  activityGeneratingEvidenceAnswer: "正在基于已收集证据生成答案",
   activityBuildingContext: "正在整理上下文",
   activityCheckingWorkspace: "正在检查仓库状态",
   activityLoadingMemory: "正在加载会话记忆",

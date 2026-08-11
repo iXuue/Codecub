@@ -242,6 +242,9 @@ function activeTitle(
   if (phase.includes("diff") || phase.includes("change")) {
     return t("activityCheckingChanges");
   }
+  if (phase.includes("finalization_required")) {
+    return t("activityGeneratingEvidenceAnswer");
+  }
   if (phase.includes("model") || phase.includes("final") || hasAssistantDelta) {
     return t("activityReceivingResponse");
   }

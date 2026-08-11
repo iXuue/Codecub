@@ -76,6 +76,7 @@ export const enUS = {
   activityProcessed: "Processed",
   activityTaskReceived: "Task received",
   activityWorking: "Working on the task",
+  activityGeneratingEvidenceAnswer: "Generating answer from collected evidence",
   activityBuildingContext: "Building context",
   activityCheckingWorkspace: "Checking repository state",
   activityLoadingMemory: "Loading session memory",

@@ -134,4 +134,15 @@ describe("ChatActivityStream", () => {
     expect(screen.getAllByText("Checking repository state").length).toBeGreaterThan(0);
     expect(screen.getByText(/No new backend step for a while/)).toBeTruthy();
   });
+
+  it("shows evidence finalization as the current activity", () => {
+    render(
+      <ChatActivityStream
+        t={(key) => t("en-US", key)}
+        chatState={{ ...chatState(true), runStatus: { ...chatState(true).runStatus!, phase: "finalization_required" } }}
+        events={[event("run_status", { phase: "finalization_required" })]}
+      />,
+    );
+    expect(screen.getAllByText("Generating answer from collected evidence").length).toBeGreaterThan(0);
+  });
 });

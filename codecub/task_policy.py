@@ -10,6 +10,14 @@ def requires_source_evidence(user_message):
     return any(marker in text for marker in CODE_EXPLANATION_MARKERS)
 
 
+def research_tool_budget(user_message):
+    return 6 if requires_source_evidence(user_message) else None
+
+
+def is_research_tool(name):
+    return name in {"list_files", "search", "read_file"}
+
+
 def is_source_path(path):
     return Path(str(path or "")).suffix.lower() in SOURCE_SUFFIXES
 
@@ -18,4 +26,12 @@ def evidence_retry_notice():
     return (
         "Runtime notice: this code-explanation task has no source-file evidence from this run. "
         "Read a relevant implementation file before returning <final>."
+    )
+
+
+def finalization_notice(source_reads, used, budget):
+    paths = ", ".join(sorted(set(source_reads))) or "(none)"
+    return (
+        "Runtime notice: research evidence is sufficient and the research budget is exhausted "
+        f"({used}/{budget}). Source evidence: {paths}. Return one <final> answer now; do not call more tools."
     )

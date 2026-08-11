@@ -900,6 +900,10 @@ class Pico:
 
         tool_steps = 0
         attempts = 0
+        research_steps = 0
+        research_budget = task_policy.research_tool_budget(user_message)
+        finalization_required = False
+        finalization_rejections = 0
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)
 
         # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
@@ -1122,9 +1126,23 @@ class Pico:
             )
 
             if kind == "tool":
-                tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
+                if finalization_required and task_policy.is_research_tool(name):
+                    finalization_rejections += 1
+                    notice = task_policy.finalization_notice(self.current_run_source_reads, research_steps, research_budget)
+                    self.record({"role": "assistant", "content": notice, "created_at": now()})
+                    self.emit_trace(task_state, "research_budget_exhausted", {
+                        "tool_name": name,
+                        "research_steps": research_steps,
+                        "research_budget": research_budget,
+                        "finalization_rejections": finalization_rejections,
+                    })
+                    if finalization_rejections >= 2:
+                        return self.stop_finalization_failed_run(task_state, user_message, run_started_wall, run_started_at)
+                    self.run_store.write_task_state(task_state)
+                    continue
+                tool_steps += 1
                 task_state.record_tool(name)
                 tool_started_at = time.monotonic()
                 self.emit_run_status(
@@ -1149,6 +1167,8 @@ class Pico:
                 )
                 if name == "read_file" and task_policy.is_source_path(args.get("path")):
                     self.current_run_source_reads.append(str(args.get("path")))
+                if research_budget is not None and task_policy.is_research_tool(name):
+                    research_steps += 1
                 self.run_store.write_task_state(task_state)
                 tool_event_payload = {
                     "name": name,
@@ -1179,6 +1199,23 @@ class Pico:
                         "trigger": "tool_executed",
                     },
                 )
+                if research_budget is not None and research_steps >= research_budget:
+                    finalization_required = True
+                    notice = task_policy.finalization_notice(self.current_run_source_reads, research_steps, research_budget)
+                    self.record({"role": "assistant", "content": notice, "created_at": now()})
+                    self.emit_trace(task_state, "finalization_required", {
+                        "source_reads": list(self.current_run_source_reads),
+                        "research_steps": research_steps,
+                        "research_budget": research_budget,
+                    })
+                    self.emit_run_status(
+                        task_state,
+                        "finalization_required",
+                        "Generating answer from collected evidence",
+                        detail=f"{research_steps}/{research_budget}",
+                        started_at=run_started_wall,
+                        run_started_at=run_started_at,
+                    )
                 continue
 
             if kind == "retry":
@@ -1196,6 +1233,17 @@ class Pico:
             return self.finish_successful_run(task_state, user_message, final, run_started_wall, run_started_at)
 
         return self.stop_limited_run(task_state, user_message, attempts, max_attempts, tool_steps, run_started_wall, run_started_at)
+
+    def stop_finalization_failed_run(self, task_state, user_message, run_started_wall, run_started_at):
+        final = "Stopped because the model did not produce a final answer after the research budget was exhausted."
+        task_state.stop("finalization_failed", final_answer=final)
+        self.record({"role": "assistant", "content": final, "created_at": now()})
+        self.promote_durable_memory(user_message, final)
+        self.run_store.write_task_state(task_state)
+        self.emit_run_finished(task_state, final, run_started_at)
+        self.emit_run_status(task_state, "failed", "Failed", detail="finalization_failed", started_at=run_started_wall, run_started_at=run_started_at)
+        self.write_final_report(task_state)
+        return final
 
     def write_final_report(self, task_state):
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))

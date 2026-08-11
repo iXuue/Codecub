@@ -199,6 +199,20 @@ def test_code_explanation_requires_a_source_read_before_final(tmp_path):
     assert any("no source-file evidence" in item["content"] for item in agent.session["history"] if item["role"] == "assistant")
 
 
+def test_code_explanation_forces_final_after_research_budget(tmp_path):
+    (tmp_path / "implementation.py").write_text("def remember():\n    return True\n", encoding="utf-8")
+    reads = ['<tool>{"name":"read_file","args":{"path":"implementation.py","start":1,"end":2}}</tool>']
+    reads.extend(
+        f'<tool>{{"name":"search","args":{{"path":".","pattern":"remember{index}"}}}}</tool>'
+        for index in range(5)
+    )
+    agent = build_agent(tmp_path, reads + ["<final>Evidence-based answer.</final>"])
+
+    assert agent.ask("这个代码上下文记忆怎么做的？") == "Evidence-based answer."
+    assert sum(item["role"] == "tool" for item in agent.session["history"]) == 6
+    assert any("research budget is exhausted" in item["content"] for item in agent.session["history"] if item["role"] == "assistant")
+
+
 def test_agent_retries_after_malformed_tool_payload(tmp_path):
     (tmp_path / "hello.txt").write_text("alpha\n", encoding="utf-8")
     agent = build_agent(
