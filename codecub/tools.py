@@ -187,6 +187,8 @@ def tool_search(agent, args):
             cwd=agent.root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         return result.stdout.strip() or result.stderr.strip() or "(no matches)"
 

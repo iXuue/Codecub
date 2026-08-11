@@ -1,6 +1,7 @@
 import argparse
 import io
 import json
+import re
 import time
 from pathlib import Path
 
@@ -72,6 +73,12 @@ class NonStreamingFakeModelClient:
         return self.outputs.pop(0)
 
 
+class SlowNonStreamingFakeModelClient(NonStreamingFakeModelClient):
+    def complete(self, prompt, max_new_tokens, **kwargs):
+        time.sleep(0.08)
+        return super().complete(prompt, max_new_tokens, **kwargs)
+
+
 def fake_agent_factory(outputs):
     def build(args):
         workspace = WorkspaceContext.build(args.cwd)
@@ -90,8 +97,14 @@ def fake_agent_factory(outputs):
 
 def test_app_runner_emits_session_user_assistant_and_completion_events(tmp_path):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
-    stdin = io.StringIO('{"type":"send_message","message":"say hello"}\n{"type":"close"}\n')
     stdout = io.StringIO()
+    stdin = ApprovalAwareStdin(
+        stdout,
+        [
+            ("", '{"type":"send_message","message":"say hello"}\n'),
+            ('"type":"run_completed"', '{"type":"close"}\n'),
+        ],
+    )
 
     exit_code = run_app_mode(
         make_args(tmp_path),
@@ -118,6 +131,80 @@ def test_app_runner_emits_session_user_assistant_and_completion_events(tmp_path)
     assert primary_events[2]["payload"]["text"] == "Hello from app mode."
     assert primary_events[3]["payload"]["text"] == "Hello from app mode."
     assert primary_events[4]["payload"]["final"] == "Hello from app mode."
+    run_id = primary_events[1]["run_id"]
+    assert re.fullmatch(r"run_\d{8}-\d{6}-\d{6}", run_id)
+    assert primary_events[4]["run_id"] == run_id
+    assert Path(primary_events[4]["payload"]["run_dir"]).name == run_id
+
+
+def test_app_runner_preserves_unicode_messages_over_ascii_safe_jsonl(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    stdout = io.StringIO()
+    command = json.dumps({"type": "send_message", "message": "查看我的代码"}, ensure_ascii=True)
+    stdin = ApprovalAwareStdin(
+        stdout,
+        [
+            ("", f"{command}\n"),
+            ('"type":"run_completed"', '{"type":"close"}\n'),
+        ],
+    )
+
+    exit_code = run_app_mode(
+        make_args(tmp_path),
+        stdin=stdin,
+        stdout=stdout,
+        agent_factory=fake_agent_factory(["<final>已经查看。</final>"]),
+    )
+
+    output = stdout.getvalue()
+    events = parse_jsonl(output)
+    user_event = next(event for event in events if event["type"] == "user_message_received")
+    assistant_event = next(event for event in events if event["type"] == "assistant_message")
+
+    assert exit_code == 0
+    assert "查看我的代码" not in output
+    assert "已经查看" not in output
+    assert user_event["payload"]["message"] == "查看我的代码"
+    assert assistant_event["payload"]["text"] == "已经查看。"
+
+
+def test_app_runner_uses_command_run_id_for_runtime_artifacts(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    stdout = io.StringIO()
+    stdin = ApprovalAwareStdin(
+        stdout,
+        [
+            ("", '{"type":"send_message","run_id":"run-ui-1","message":"say hello"}\n'),
+            ('"type":"run_completed"', '{"type":"close"}\n'),
+        ],
+    )
+
+    exit_code = run_app_mode(
+        make_args(tmp_path),
+        stdin=stdin,
+        stdout=stdout,
+        agent_factory=fake_agent_factory(["<final>Hello from app mode.</final>"]),
+    )
+
+    events = parse_jsonl(stdout.getvalue())
+    user_events = [event for event in events if event["type"] == "user_message_received"]
+    assistant_events = [event for event in events if event["type"] == "assistant_message"]
+    completed_events = [event for event in events if event["type"] == "run_completed"]
+
+    assert exit_code == 0
+    assert user_events[0]["run_id"] == "run-ui-1"
+    assert assistant_events[0]["run_id"] == "run-ui-1"
+    assert completed_events[0]["run_id"] == "run-ui-1"
+
+    report_path = Path(completed_events[0]["payload"]["report_path"])
+    run_dir = Path(completed_events[0]["payload"]["run_dir"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert run_dir == tmp_path / ".codecub" / "runs" / "run-ui-1"
+    assert report_path == run_dir / "report.json"
+    assert Path(completed_events[0]["payload"]["trace_path"]) == run_dir / "trace.jsonl"
+    assert report["run_id"] == "run-ui-1"
+    assert report["task_state"]["run_id"] == "run-ui-1"
 
 
 def test_app_runner_emits_streamed_deltas_before_final_message(tmp_path):
@@ -179,6 +266,41 @@ def test_app_runner_emits_single_compatibility_delta_for_non_streaming_client(tm
     assert deltas[0]["payload"]["text"] == "Hello from compatibility."
 
 
+def test_app_runner_emits_heartbeat_status_while_run_is_active(tmp_path, monkeypatch):
+    import codecub.app_runner as app_runner
+
+    monkeypatch.setattr(app_runner, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    stdout = io.StringIO()
+    stdin = ApprovalAwareStdin(
+        stdout,
+        [
+            ("", '{"type":"send_message","message":"inspect repository"}\n'),
+            ('"heartbeat":true', '{"type":"close"}\n'),
+        ],
+    )
+
+    def build(args):
+        workspace = WorkspaceContext.build(args.cwd)
+        return Pico(
+            model_client=SlowNonStreamingFakeModelClient(["<final>Done.</final>"]),
+            workspace=workspace,
+            session_store=SessionStore(Path(args.cwd) / ".codecub" / "sessions"),
+            approval_policy=args.approval,
+            max_steps=args.max_steps,
+            max_new_tokens=args.max_new_tokens,
+        )
+
+    exit_code = run_app_mode(make_args(tmp_path), stdin=stdin, stdout=stdout, agent_factory=build)
+
+    events = parse_jsonl(stdout.getvalue())
+    heartbeats = [event for event in events if event["type"] == "run_status" and event["payload"].get("heartbeat") is True]
+    assert exit_code == 0
+    assert heartbeats
+    assert heartbeats[0]["payload"]["phase"]
+    assert heartbeats[0]["payload"]["silent_for_ms"] >= 0
+
+
 def test_app_runner_emits_run_failed_for_model_error(tmp_path):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     stdin = io.StringIO('{"type":"send_message","message":"fail"}\n{"type":"close"}\n')
@@ -198,6 +320,11 @@ def test_app_runner_emits_run_failed_for_model_error(tmp_path):
     assert len(failed) == 1
     assert failed[0]["payload"]["error_type"] == "RuntimeError"
     assert "fake model ran out of outputs" in failed[0]["payload"]["message"]
+    report_path = Path(failed[0]["payload"]["report_path"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["stop_reason"] == "model_error"
+    assert report["run_id"] == failed[0]["run_id"]
 
 
 def test_app_runner_accepts_cancel_current_run_command(tmp_path):
@@ -219,6 +346,47 @@ def test_app_runner_accepts_cancel_current_run_command(tmp_path):
     assert len(canceled) == 1
     assert canceled[0]["run_id"] == "run-manual"
     assert canceled[0]["payload"]["reason"] == "user_requested"
+
+
+def test_app_runner_cancel_stops_active_runtime_and_writes_canceled_report(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    args = make_args(tmp_path)
+    args.approval = "ask"
+    stdout = io.StringIO()
+    stdin = ApprovalAwareStdin(
+        stdout,
+        [
+            ("", '{"type":"send_message","run_id":"run-cancel-1","message":"write"}\n'),
+            ('"type":"approval_requested"', '{"type":"cancel_run","run_id":"run-cancel-1"}\n'),
+            ('"type":"run_canceled"', '{"type":"close"}\n'),
+        ],
+    )
+
+    exit_code = run_app_mode(
+        args,
+        stdin=stdin,
+        stdout=stdout,
+        agent_factory=fake_agent_factory(
+            [
+                '<tool name="write_file" path="canceled.txt"><content>no\n</content></tool>',
+                "<final>should not complete</final>",
+            ]
+        ),
+    )
+
+    events = parse_jsonl(stdout.getvalue())
+    canceled = [event for event in events if event["type"] == "run_canceled"]
+    completed = [event for event in events if event["type"] == "run_completed"]
+    report_path = tmp_path / ".codecub" / "runs" / "run-cancel-1" / "report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert len(canceled) == 1
+    assert canceled[0]["run_id"] == "run-cancel-1"
+    assert completed == []
+    assert not (tmp_path / "canceled.txt").exists()
+    assert report["stop_reason"] == "user_canceled"
+    assert report["task_state"]["run_id"] == "run-cancel-1"
 
 
 def test_app_runner_approves_pending_risky_tool_and_emits_diff_summary(tmp_path):

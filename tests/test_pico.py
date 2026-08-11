@@ -1,8 +1,11 @@
 import os
+import base64
+import io
 import json
 import subprocess
 import shlex
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,7 +22,7 @@ from codecub import (
     WorkspaceContext,
     build_welcome,
 )
-from codecub.cli import HELP_DETAILS
+from codecub.cli import HELP_DETAILS, build_arg_parser, decode_cwd_arg
 
 
 def build_workspace(tmp_path):
@@ -38,6 +41,14 @@ def build_agent(tmp_path, outputs, **kwargs):
         approval_policy=approval_policy,
         **kwargs,
     )
+
+
+def test_default_max_steps_is_80(tmp_path):
+    agent = build_agent(tmp_path, [])
+    args = build_arg_parser().parse_args([])
+
+    assert agent.max_steps == 80
+    assert args.max_steps == 80
 
 
 def test_agent_runs_tool_then_final(tmp_path):
@@ -160,6 +171,32 @@ def test_agent_retries_after_empty_model_output(tmp_path):
     assert answer == "Recovered after retry."
     notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
     assert any("empty response" in item for item in notices)
+
+
+def test_agent_retries_when_model_omits_required_protocol_tags(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        ["unstructured planning text", "<final>Recovered after protocol retry.</final>"],
+    )
+
+    assert agent.ask("Do the task") == "Recovered after protocol retry."
+    notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
+    assert any("missing required <tool> or <final> tags" in item for item in notices)
+
+
+def test_code_explanation_requires_a_source_read_before_final(tmp_path):
+    (tmp_path / "implementation.py").write_text("def remember():\n    return True\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            "<final>The design uses a memory module.</final>",
+            '<tool>{"name":"read_file","args":{"path":"implementation.py","start":1,"end":2}}</tool>',
+            "<final>The implementation is in implementation.py.</final>",
+        ],
+    )
+
+    assert agent.ask("这个代码上下文记忆怎么做的？") == "The implementation is in implementation.py."
+    assert any("no source-file evidence" in item["content"] for item in agent.session["history"] if item["role"] == "assistant")
 
 
 def test_agent_retries_after_malformed_tool_payload(tmp_path):
@@ -290,12 +327,60 @@ def test_list_files_hides_internal_agent_state(tmp_path):
 
 def test_repeated_identical_tool_call_is_rejected(tmp_path):
     agent = build_agent(tmp_path, [])
-    agent.record({"role": "tool", "name": "list_files", "args": {}, "content": "(empty)", "created_at": "1"})
-    agent.record({"role": "tool", "name": "list_files", "args": {}, "content": "(empty)", "created_at": "2"})
+    for index in range(4):
+        agent.record({"role": "tool", "name": "list_files", "args": {}, "content": "(empty)", "created_at": str(index)})
 
     result = agent.run_tool("list_files", {})
 
-    assert result == "error: repeated identical tool call for list_files; choose a different tool or return a final answer"
+    assert result == (
+        "error: repeated identical tool call for list_files; "
+        "same no-progress action reached 5 consecutive attempts"
+    )
+
+
+def test_repeated_identical_tool_call_does_not_count_previous_user_turn(tmp_path):
+    agent = build_agent(tmp_path, [])
+    for index in range(4):
+        agent.record({"role": "tool", "name": "list_files", "args": {}, "content": "(empty)", "created_at": str(index)})
+    agent.record({"role": "user", "content": "new request", "created_at": "after-previous-run"})
+
+    result = agent.run_tool("list_files", {})
+
+    assert result.startswith("[")
+
+
+def test_agent_stops_after_five_repeated_no_progress_tool_calls(tmp_path):
+    repeated = '<tool>{"name":"list_files","args":{}}</tool>'
+    agent = build_agent(
+        tmp_path,
+        [
+            repeated,
+            repeated,
+            repeated,
+            repeated,
+            repeated,
+            "<final>should not be reached</final>",
+        ],
+    )
+
+    answer = agent.ask("Inspect the repository")
+
+    assert answer == "Stopped after the same no-progress tool action repeated 5 times: list_files."
+    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
+    trace_events = [
+        json.loads(line)
+        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert report["status"] == "stopped"
+    assert report["stop_reason"] == "repeated_no_progress"
+    assert report["tool_steps"] == 5
+    assert report["task_state"]["final_answer"] == answer
+    assert any(event["event"] == "repeated_no_progress" and event["limit"] == 5 for event in trace_events)
+    assert any(
+        event["event"] == "tool_executed" and event.get("tool_error_code") == "repeated_identical_call"
+        for event in trace_events
+    )
 
 
 def test_welcome_screen_keeps_box_shape_for_long_paths(tmp_path):
@@ -542,6 +627,175 @@ def test_openai_compatible_client_extracts_text_from_event_stream_deltas():
     assert result == "<final>OK</final>"
 
 
+def test_openai_compatible_client_falls_back_to_chat_completions_when_responses_endpoint_is_missing():
+    requests = []
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "<final>chat ok</final>",
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 3,
+                        "total_tokens": 13,
+                    },
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        requests.append(
+            {
+                "url": request.full_url,
+                "timeout": timeout,
+                "body": json.loads(request.data.decode("utf-8")),
+            }
+        )
+        if request.full_url.endswith("/responses"):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                404,
+                "Not Found",
+                None,
+                io.BytesIO(b'{"error":"not found"}'),
+            )
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="qwen-plus",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete("hello", 42)
+
+    assert result == "<final>chat ok</final>"
+    assert [item["url"] for item in requests] == [
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    ]
+    assert requests[1]["timeout"] == 30
+    assert requests[1]["body"] == {
+        "model": "qwen-plus",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 42,
+        "stream": False,
+        "temperature": 0.2,
+    }
+    assert client.last_completion_metadata["input_tokens"] == 10
+    assert client.last_completion_metadata["output_tokens"] == 3
+    assert client.last_completion_metadata["total_tokens"] == 13
+
+
+def test_openai_compatible_stream_falls_back_to_chat_completions_when_responses_endpoint_is_missing():
+    requests = []
+
+    class FakeStreamResponse:
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            lines = [
+                b'data: {"choices":[{"delta":{"content":"<final>"}}]}\n',
+                b'data: {"choices":[{"delta":{"content":"stream ok"}}]}\n',
+                b'data: {"choices":[{"delta":{"content":"</final>"}}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}\n',
+                b"data: [DONE]\n",
+            ]
+            return iter(lines)
+
+    def fake_urlopen(request, timeout):
+        requests.append(
+            {
+                "url": request.full_url,
+                "body": json.loads(request.data.decode("utf-8")),
+            }
+        )
+        if request.full_url.endswith("/responses"):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                404,
+                "Not Found",
+                None,
+                io.BytesIO(b'{"error":"not found"}'),
+            )
+        return FakeStreamResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="qwen-plus",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="sk-test",
+        temperature=None,
+        timeout=30,
+    )
+    chunks = []
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.stream_complete("hello", 42, chunks.append)
+
+    assert result == "<final>stream ok</final>"
+    assert chunks == ["<final>", "stream ok", "</final>"]
+    assert [item["url"] for item in requests] == [
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    ]
+    assert requests[1]["body"] == {
+        "model": "qwen-plus",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 42,
+        "stream": True,
+    }
+
+
+def test_openai_compatible_client_does_not_fallback_on_auth_errors():
+    urls = []
+
+    def fake_urlopen(request, timeout):
+        urls.append(request.full_url)
+        raise urllib.error.HTTPError(
+            request.full_url,
+            401,
+            "Unauthorized",
+            None,
+            io.BytesIO(b'{"error":"bad key"}'),
+        )
+
+    client = OpenAICompatibleModelClient(
+        model="qwen-plus",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="bad-key",
+        temperature=None,
+        timeout=30,
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        with pytest.raises(RuntimeError, match="HTTP 401"):
+            client.complete("hello", 42)
+
+    assert urls == ["https://dashscope.aliyuncs.com/compatible-mode/v1/responses"]
+
+
 def test_anthropic_compatible_client_posts_expected_messages_payload():
     captured = {}
 
@@ -687,10 +941,10 @@ def test_build_agent_uses_openai_provider_and_model_override(tmp_path):
     assert agent.model_client is fake_client
 
 
-def test_build_arg_parser_defaults_provider_to_openai(tmp_path):
+def test_build_arg_parser_leaves_provider_unset_for_env_default(tmp_path):
     args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
 
-    assert args.provider == "openai"
+    assert args.provider is None
 
 
 def test_build_arg_parser_accepts_anthropic_provider(tmp_path):
@@ -699,12 +953,28 @@ def test_build_arg_parser_accepts_anthropic_provider(tmp_path):
     assert args.provider == "anthropic"
 
 
+def test_build_arg_parser_accepts_hosted_provider_presets(tmp_path):
+    for provider in ("deepseek", "kimi", "minimax"):
+        args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", provider])
+
+        assert args.provider == provider
+
+
 def test_build_arg_parser_accepts_app_mode_flags():
     app_args = mini_pkg.build_arg_parser().parse_args(["--app-mode"])
     json_args = mini_pkg.build_arg_parser().parse_args(["--json-events"])
 
     assert app_args.app_mode is True
     assert json_args.app_mode is True
+
+
+def test_build_arg_parser_decodes_utf8_base64_cwd():
+    cwd = "D:\\代码备份\\项目"
+    encoded = base64.b64encode(cwd.encode("utf-8")).decode("ascii")
+
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd-b64", encoded])
+
+    assert decode_cwd_arg(args) == cwd
 
 
 def test_main_dispatches_to_app_mode_without_welcome(monkeypatch, capsys):
@@ -726,6 +996,53 @@ def test_main_dispatches_to_app_mode_without_welcome(monkeypatch, capsys):
     assert called["app_mode"] is True
     assert "codecub>" not in captured.out
     assert "session_started" in captured.out
+
+
+def test_main_interactive_cli_shows_activity_stream(monkeypatch, capsys):
+    from codecub import cli
+
+    class FakeWorkspace:
+        cwd = "D:/repo"
+        branch = "main"
+
+    class FakeModelClient:
+        model = "qwen-test"
+
+    class FakeAgent:
+        workspace = FakeWorkspace()
+        model_client = FakeModelClient()
+        approval_policy = "ask"
+        session = {"id": "s1"}
+        session_path = "D:/repo/.codecub/sessions/s1.json"
+        event_handler = None
+
+        def ask(self, message):
+            assert message == "change ui"
+            self.event_handler("run_status", {"phase": "building_context"}, self, object())
+            self.event_handler("run_status", {"phase": "model_streaming"}, self, object())
+            self.event_handler("assistant_delta", {"text": "done"}, self, object())
+            return "done"
+
+    inputs = iter(["change ui", "/exit"])
+    prompts = []
+
+    def fake_input(prompt):
+        prompts.append(prompt)
+        return next(inputs)
+
+    monkeypatch.setattr(cli, "build_agent", lambda args: FakeAgent())
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    result = cli.main([])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert any("codecub>" in prompt for prompt in prompts)
+    assert all("codecub ›" not in prompt for prompt in prompts)
+    assert "Building context" in captured.out
+    assert "Receiving model response" in captured.out
+    assert "assistant" in captured.out
+    assert "done" in captured.out
 
 
 def test_build_agent_uses_anthropic_provider_and_openai_key_fallback(tmp_path):
@@ -815,6 +1132,211 @@ def test_build_agent_uses_openai_provider_by_default(tmp_path):
     assert agent.model_client is fake_client
 
 
+def test_parse_env_file_supports_quotes_export_and_comments(tmp_path):
+    from codecub.cli import parse_env_file
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "# local model config",
+                'export OPENAI_API_KEY="sk quoted # keep"',
+                "OPENAI_MODEL='env-model'",
+                "OPENAI_API_BASE=https://env.example/v1 # strip comment",
+                "EMPTY_VALUE=",
+                "1_BAD_KEY=ignored",
+                "MISSING_SEPARATOR",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    values = parse_env_file(env_path)
+
+    assert values == {
+        "OPENAI_API_KEY": "sk quoted # keep",
+        "OPENAI_MODEL": "env-model",
+        "OPENAI_API_BASE": "https://env.example/v1",
+        "EMPTY_VALUE": "",
+    }
+
+
+def test_build_agent_loads_dotenv_values_from_workspace_root(tmp_path):
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "OPENAI_API_BASE=https://env.example/v1",
+                'OPENAI_API_KEY="sk-env"',
+                "OPENAI_MODEL=env-model",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
+            fake_client = mock_openai.return_value
+            agent = mini_pkg.build_agent(args)
+
+    mock_openai.assert_called_once()
+    assert mock_openai.call_args.kwargs["model"] == "env-model"
+    assert mock_openai.call_args.kwargs["base_url"] == "https://env.example/v1"
+    assert mock_openai.call_args.kwargs["api_key"] == "sk-env"
+    assert agent.model_client is fake_client
+
+
+def test_build_agent_keeps_system_env_over_dotenv_values(tmp_path):
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "OPENAI_API_BASE=https://env.example/v1",
+                "OPENAI_API_KEY=sk-env",
+                "OPENAI_MODEL=env-model",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-system"}, clear=True):
+        with patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
+            mini_pkg.build_agent(args)
+
+    mock_openai.assert_called_once()
+    assert mock_openai.call_args.kwargs["model"] == "env-model"
+    assert mock_openai.call_args.kwargs["base_url"] == "https://env.example/v1"
+    assert mock_openai.call_args.kwargs["api_key"] == "sk-system"
+
+
+def test_build_agent_uses_dotenv_provider_for_deepseek(tmp_path):
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "CODECUB_PROVIDER=deepseek",
+                "DEEPSEEK_API_BASE=https://api.deepseek.com",
+                "DEEPSEEK_API_KEY=sk-deepseek-env",
+                "DEEPSEEK_MODEL=deepseek-coder",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
+            fake_client = mock_openai.return_value
+            agent = mini_pkg.build_agent(args)
+
+    mock_openai.assert_called_once()
+    assert mock_openai.call_args.kwargs["model"] == "deepseek-coder"
+    assert mock_openai.call_args.kwargs["base_url"] == "https://api.deepseek.com"
+    assert mock_openai.call_args.kwargs["api_key"] == "sk-deepseek-env"
+    assert agent.model_client is fake_client
+
+
+def test_build_agent_uses_dotenv_provider_for_kimi(tmp_path):
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "CODECUB_PROVIDER=kimi",
+                "MOONSHOT_API_BASE=https://api.moonshot.cn/v1",
+                "MOONSHOT_API_KEY=sk-kimi-env",
+                "MOONSHOT_MODEL=moonshot-v1-32k",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
+            fake_client = mock_openai.return_value
+            agent = mini_pkg.build_agent(args)
+
+    mock_openai.assert_called_once()
+    assert mock_openai.call_args.kwargs["model"] == "moonshot-v1-32k"
+    assert mock_openai.call_args.kwargs["base_url"] == "https://api.moonshot.cn/v1"
+    assert mock_openai.call_args.kwargs["api_key"] == "sk-kimi-env"
+    assert agent.model_client is fake_client
+
+
+def test_build_agent_uses_dotenv_provider_for_minimax(tmp_path):
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "CODECUB_PROVIDER=minimax",
+                "MINIMAX_API_BASE=https://api.minimax.io/v1",
+                "MINIMAX_API_KEY=sk-minimax-env",
+                "MINIMAX_MODEL=MiniMax-M3",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
+            fake_client = mock_openai.return_value
+            agent = mini_pkg.build_agent(args)
+
+    mock_openai.assert_called_once()
+    assert mock_openai.call_args.kwargs["model"] == "MiniMax-M3"
+    assert mock_openai.call_args.kwargs["base_url"] == "https://api.minimax.io/v1"
+    assert mock_openai.call_args.kwargs["api_key"] == "sk-minimax-env"
+    assert agent.model_client is fake_client
+
+
+def test_build_agent_uses_dotenv_provider_for_anthropic(tmp_path):
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "CODECUB_PROVIDER=anthropic",
+                "ANTHROPIC_API_BASE=https://anthropic.env/v1",
+                "ANTHROPIC_API_KEY=sk-anthropic-env",
+                "ANTHROPIC_MODEL=claude-env",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("codecub.cli.AnthropicCompatibleModelClient") as mock_anthropic:
+            fake_client = mock_anthropic.return_value
+            agent = mini_pkg.build_agent(args)
+
+    mock_anthropic.assert_called_once()
+    assert mock_anthropic.call_args.kwargs["model"] == "claude-env"
+    assert mock_anthropic.call_args.kwargs["base_url"] == "https://anthropic.env/v1"
+    assert mock_anthropic.call_args.kwargs["api_key"] == "sk-anthropic-env"
+    assert agent.model_client is fake_client
+
+
+def test_build_agent_uses_dotenv_ollama_model_and_host(tmp_path):
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "CODECUB_PROVIDER=ollama",
+                "OLLAMA_MODEL=llama-env",
+                "OLLAMA_HOST=http://127.0.0.1:11435",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("codecub.cli.OllamaModelClient") as mock_ollama:
+            fake_client = mock_ollama.return_value
+            agent = mini_pkg.build_agent(args)
+
+    mock_ollama.assert_called_once()
+    assert mock_ollama.call_args.kwargs["model"] == "llama-env"
+    assert mock_ollama.call_args.kwargs["host"] == "http://127.0.0.1:11435"
+    assert agent.model_client is fake_client
+
+
 def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
     (tmp_path / "hello.txt").write_text("alpha\nbeta\n", encoding="utf-8")
     agent = build_agent(
@@ -851,6 +1373,122 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
     assert trace_events[-1] == "run_finished"
     assert trace_events.count("prompt_built") == 2
     assert "tool_executed" in trace_events
+
+
+def test_ask_uses_supplied_run_id_for_run_artifacts(tmp_path):
+    agent = build_agent(tmp_path, ["<final>Finished.</final>"])
+
+    assert agent.ask("Do the thing", run_id="run-app-1") == "Finished."
+
+    run_dir = tmp_path / ".codecub" / "runs" / "run-app-1"
+    task_state = json.loads((run_dir / "task_state.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+
+    assert run_dir.exists()
+    assert (run_dir / "trace.jsonl").exists()
+    assert task_state["run_id"] == "run-app-1"
+    assert report["run_id"] == "run-app-1"
+    assert report["task_state"]["run_id"] == "run-app-1"
+
+
+def test_ask_traces_context_steps_before_model_request(tmp_path):
+    agent = build_agent(tmp_path, ["<final>Done.</final>"])
+
+    assert agent.ask("Inspect the repository", run_id="run-context-steps") == "Done."
+
+    trace_path = tmp_path / ".codecub" / "runs" / "run-context-steps" / "trace.jsonl"
+    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    event_names = [event["event"] for event in trace_events]
+    context_phases = [event["phase"] for event in trace_events if event["event"] == "context_step_started"]
+
+    assert context_phases[:3] == ["checking_workspace", "loading_memory", "building_prompt"]
+    assert event_names.index("context_step_started") < event_names.index("prompt_built")
+    assert event_names.index("prompt_built") < event_names.index("model_requested")
+
+
+def test_ask_rejects_external_run_id_that_escapes_run_directory(tmp_path):
+    agent = build_agent(tmp_path, ["<final>Finished.</final>"])
+
+    with pytest.raises(ValueError, match="invalid run_id"):
+        agent.ask("Do the thing", run_id="../escape")
+
+    assert not (tmp_path / ".codecub" / "escape").exists()
+    assert not (tmp_path / ".codecub" / "runs" / ".." / "escape").resolve().exists()
+
+
+def test_ask_stops_and_persists_report_when_canceled_before_model_request(tmp_path):
+    agent = build_agent(tmp_path, [])
+    agent.cancel_checker = lambda runtime, task_state: task_state.run_id == "run-cancel-1"
+
+    assert agent.ask("Cancel this run", run_id="run-cancel-1") == "Canceled by user."
+
+    run_dir = tmp_path / ".codecub" / "runs" / "run-cancel-1"
+    task_state = json.loads((run_dir / "task_state.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    trace_events = [json.loads(line)["event"] for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert task_state["status"] == "stopped"
+    assert task_state["stop_reason"] == "user_canceled"
+    assert task_state["final_answer"] == "Canceled by user."
+    assert report["stop_reason"] == "user_canceled"
+    assert report["task_state"]["run_id"] == "run-cancel-1"
+    assert trace_events[-1] == "run_canceled"
+    assert "model_requested" not in trace_events
+
+
+def test_ask_persists_report_when_model_raises(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    answer = agent.ask("Trigger model failure", run_id="run-model-error-1")
+
+    run_dir = tmp_path / ".codecub" / "runs" / "run-model-error-1"
+    task_state = json.loads((run_dir / "task_state.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    trace_lines = (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+    trace_events = [json.loads(line) for line in trace_lines]
+
+    assert answer == "Model error: fake model ran out of outputs"
+    assert task_state["status"] == "failed"
+    assert task_state["stop_reason"] == "model_error"
+    assert report["status"] == "failed"
+    assert report["stop_reason"] == "model_error"
+    assert report["task_state"]["run_id"] == "run-model-error-1"
+    model_errors = [event for event in trace_events if event["event"] == "model_error"]
+    assert len(model_errors) == 1
+    assert model_errors[0]["error_type"] == "RuntimeError"
+    assert model_errors[0]["message"] == "fake model ran out of outputs"
+
+
+def test_model_error_trace_and_report_redact_secret_values(tmp_path):
+    secret = "sk-test-secret-123"
+
+    class SecretErrorModelClient:
+        supports_prompt_cache = False
+
+        def complete(self, prompt, max_new_tokens, **kwargs):
+            del prompt, max_new_tokens, kwargs
+            raise RuntimeError(f"backend down: {secret}")
+
+    with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=False):
+        workspace = build_workspace(tmp_path)
+        store = SessionStore(tmp_path / ".codecub" / "sessions")
+        agent = MiniAgent(
+            model_client=SecretErrorModelClient(),
+            workspace=workspace,
+            session_store=store,
+            approval_policy="auto",
+        )
+
+        assert agent.ask("Trigger secret model failure", run_id="run-model-error-secret") == "Model error: backend down: <redacted>"
+
+    run_dir = tmp_path / ".codecub" / "runs" / "run-model-error-secret"
+    trace_text = (run_dir / "trace.jsonl").read_text(encoding="utf-8")
+    report_text = (run_dir / "report.json").read_text(encoding="utf-8")
+
+    assert secret not in trace_text
+    assert secret not in report_text
+    assert "<redacted>" in trace_text
+    assert "<redacted>" in report_text
 
 
 def test_trace_and_report_redact_secret_env_values(tmp_path):

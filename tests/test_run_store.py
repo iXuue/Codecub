@@ -64,3 +64,18 @@ def test_run_store_tolerates_missing_final_report(tmp_path):
 
     assert store.trace_path(state.run_id).exists()
     assert not store.report_path(state.run_id).exists()
+
+
+def test_run_store_appends_and_loads_usage_jsonl(tmp_path):
+    store = RunStore(tmp_path / ".codecub" / "runs")
+    state = TaskState.create(run_id="run_usage", task_id="task_usage", user_request="Measure usage.")
+    store.start_run(state)
+
+    store.append_usage(state, {"usage_id": "usage_1", "protocol": "responses"})
+    store.append_usage(state.run_id, {"usage_id": "usage_2", "protocol": "anthropic_messages"})
+
+    assert store.load_usage(state.run_id) == [
+        {"usage_id": "usage_1", "protocol": "responses"},
+        {"usage_id": "usage_2", "protocol": "anthropic_messages"},
+    ]
+    assert store.load_usage("missing_run") == []

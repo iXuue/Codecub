@@ -4,6 +4,7 @@ import { ProjectSessionPage } from "../src/components/ProjectSessionPage";
 import { t } from "../src/i18n";
 import { createInitialApprovalState } from "../src/state/approvalState";
 import { createInitialChatState } from "../src/state/chatState";
+import { createInitialUsageState } from "../src/state/usageState";
 
 function installCodecubMock() {
   (window as unknown as { codecub: unknown }).codecub = {
@@ -29,10 +30,12 @@ describe("ProjectSessionPage layout", () => {
         chatState={createInitialChatState()}
         approvalState={createInitialApprovalState()}
         projectSessions={[]}
+        activeSessionId=""
         sessionError=""
         extensions={{ skills: [], plugins: [] }}
         extensionError=""
         backendError=""
+        usageState={createInitialUsageState()}
         onSend={vi.fn()}
         onStop={vi.fn()}
         onApprove={vi.fn()}
@@ -40,15 +43,21 @@ describe("ProjectSessionPage layout", () => {
         onImportLegacy={vi.fn()}
         onRefreshSessions={vi.fn()}
         onResumeSession={vi.fn()}
+        onCreateSession={vi.fn()}
+        onDeleteSession={vi.fn()}
         onRefreshExtensions={vi.fn()}
         onInstallSkill={vi.fn()}
         onInstallPlugin={vi.fn()}
         onSettings={vi.fn()}
+        onBackHome={vi.fn()}
       />,
     );
 
     expect(screen.getByLabelText("Project context")).toBeTruthy();
     expect(screen.getByLabelText("Workbench")).toBeTruthy();
     expect(screen.getByLabelText("Run inspector")).toBeTruthy();
+    expect(document.querySelector(".project-sidebar")).toBeTruthy();
+    expect(document.querySelector(".message-list")).toBeTruthy();
+    expect(document.querySelector(".run-inspector")).toBeTruthy();
   });
 });

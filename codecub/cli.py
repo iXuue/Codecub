@@ -6,19 +6,26 @@
 """
 
 import argparse
+import base64
+import json
 import os
 import shutil
 import sys
 import textwrap
+from pathlib import Path
 
 from .app_runner import run_app_mode
+from .connections import resolve_effective_connection_profile
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
-from .runtime import Pico, SessionStore
+from .runtime import DEFAULT_MAX_STEPS, Pico, SessionStore
 from .workspace import WorkspaceContext, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
+    "DEEPSEEK_API_KEY",
+    "MOONSHOT_API_KEY",
+    "MINIMAX_API_KEY",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "RIGHT_CODES_API_KEY",
@@ -47,15 +54,152 @@ HELP_DETAILS = textwrap.dedent(
     """
 ).strip()
 
+CLI_STATUS_LABELS = {
+    "building_context": "Building context",
+    "model_request": "Requesting model response",
+    "model_streaming": "Receiving model response",
+    "tool_running": "Running tool",
+    "waiting_approval": "Waiting for approval",
+    "finalizing": "Finalizing",
+    "completed": "Completed",
+    "failed": "Failed",
+    "canceled": "Canceled",
+}
+
 
 DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_OPENAI_MODEL = "gpt-5.4"
 DEFAULT_OPENAI_BASE_URL = "https://www.right.codes/codex/v1"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_KIMI_MODEL = "moonshot-v1-8k"
+DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1"
+DEFAULT_MINIMAX_MODEL = "MiniMax-M3"
+DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io/v1"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "CODECUB_SECRET_ENV_NAMES"
+PROVIDER_ENV_VAR = "CODECUB_PROVIDER"
+MODEL_PROVIDERS = ("ollama", "openai", "deepseek", "kimi", "minimax", "anthropic")
+OPENAI_COMPATIBLE_PROVIDER_CONFIG = {
+    "openai": {
+        "model_env": "OPENAI_MODEL",
+        "base_url_env": "OPENAI_API_BASE",
+        "api_key_env": "OPENAI_API_KEY",
+        "default_model": DEFAULT_OPENAI_MODEL,
+        "default_base_url": DEFAULT_OPENAI_BASE_URL,
+    },
+    "deepseek": {
+        "model_env": "DEEPSEEK_MODEL",
+        "base_url_env": "DEEPSEEK_API_BASE",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "default_model": DEFAULT_DEEPSEEK_MODEL,
+        "default_base_url": DEFAULT_DEEPSEEK_BASE_URL,
+    },
+    "kimi": {
+        "model_env": "MOONSHOT_MODEL",
+        "base_url_env": "MOONSHOT_API_BASE",
+        "api_key_env": "MOONSHOT_API_KEY",
+        "default_model": DEFAULT_KIMI_MODEL,
+        "default_base_url": DEFAULT_KIMI_BASE_URL,
+    },
+    "minimax": {
+        "model_env": "MINIMAX_MODEL",
+        "base_url_env": "MINIMAX_API_BASE",
+        "api_key_env": "MINIMAX_API_KEY",
+        "default_model": DEFAULT_MINIMAX_MODEL,
+        "default_base_url": DEFAULT_MINIMAX_BASE_URL,
+    },
+}
+_DOTENV_VALUES_LOADED_BY_CODECUB = {}
+
+
+def _is_env_key(value):
+    if not value:
+        return False
+    first = value[0]
+    if not (first.isalpha() or first == "_"):
+        return False
+    return all(char.isalnum() or char == "_" for char in value)
+
+
+def _strip_unquoted_comment(value):
+    in_single = False
+    in_double = False
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_double:
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == "#" and not in_single and not in_double and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value.strip()
+
+
+def _unquote_env_value(value):
+    value = _strip_unquoted_comment(value.strip())
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def parse_env_file(path):
+    values = {}
+    env_path = Path(path)
+    if not env_path.exists():
+        return values
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if separator != "=" or not _is_env_key(key):
+            continue
+        values[key] = _unquote_env_value(value)
+    return values
+
+
+def load_env_file(repo_root):
+    values = parse_env_file(Path(repo_root) / ".env")
+    stale_keys = set(_DOTENV_VALUES_LOADED_BY_CODECUB) - set(values)
+    for key in stale_keys:
+        if os.environ.get(key) == _DOTENV_VALUES_LOADED_BY_CODECUB[key]:
+            os.environ.pop(key, None)
+        _DOTENV_VALUES_LOADED_BY_CODECUB.pop(key, None)
+    for key, value in values.items():
+        previous_value = _DOTENV_VALUES_LOADED_BY_CODECUB.get(key)
+        if key in os.environ and previous_value is None:
+            continue
+        if key in os.environ and os.environ[key] != previous_value:
+            _DOTENV_VALUES_LOADED_BY_CODECUB.pop(key, None)
+            continue
+        os.environ[key] = value
+        _DOTENV_VALUES_LOADED_BY_CODECUB[key] = value
+    return values
+
+
+def _effective_provider(args):
+    explicit_provider = getattr(args, "provider", None)
+    if explicit_provider:
+        return explicit_provider
+    env_provider = os.environ.get(PROVIDER_ENV_VAR, "").strip().lower()
+    if env_provider in MODEL_PROVIDERS:
+        return env_provider
+    return "openai"
 
 
 def _effective_model(args, provider):
@@ -66,16 +210,20 @@ def _effective_model(args, provider):
     explicit_model = getattr(args, "model", None)
     if explicit_model:
         return explicit_model
-    if provider == "openai":
-        model = os.environ.get("OPENAI_MODEL")
+    if provider in OPENAI_COMPATIBLE_PROVIDER_CONFIG:
+        config = OPENAI_COMPATIBLE_PROVIDER_CONFIG[provider]
+        model = os.environ.get(config["model_env"])
         if model:
             return model
-        return DEFAULT_OPENAI_MODEL
+        return config["default_model"]
     if provider == "anthropic":
         model = os.environ.get("ANTHROPIC_MODEL")
         if model:
             return model
         return DEFAULT_ANTHROPIC_MODEL
+    model = os.environ.get("OLLAMA_MODEL")
+    if model:
+        return model
     return DEFAULT_OLLAMA_MODEL
 
 
@@ -102,20 +250,43 @@ def _configured_secret_names(args):
     return sorted(configured_secret_names)
 
 
+def _decode_connection_profile(value):
+    """Decode a non-secret desktop profile without trusting its verification fields."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        raw = base64.b64decode(text.encode("ascii"), validate=True).decode("utf-8")
+        profile = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid connection profile configuration") from exc
+    if not isinstance(profile, dict) or profile.get("schema_version") != 1:
+        raise ValueError("unsupported connection profile configuration")
+    allowed = {
+        "schema_version", "connection_profile_id", "connection_type", "api_operator", "model_vendor",
+        "protocol", "response_schema", "credential_id", "endpoint_verification_status",
+        "usage_schema_verification_status",
+    }
+    return {key: value for key, value in profile.items() if key in allowed and isinstance(value, (str, int))}
+
+
 def _build_model_client(args):
-    provider = getattr(args, "provider", "openai")
+    provider = _effective_provider(args)
+    supplied_profile = _decode_connection_profile(getattr(args, "connection_profile_b64", ""))
     # CLI 只负责把 provider 选择翻译成具体 client。
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
-    if provider == "openai":
+    if provider in OPENAI_COMPATIBLE_PROVIDER_CONFIG:
+        config = OPENAI_COMPATIBLE_PROVIDER_CONFIG[provider]
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or os.environ.get("OPENAI_API_BASE") or DEFAULT_OPENAI_BASE_URL
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        base_url = getattr(args, "base_url", None) or os.environ.get(config["base_url_env"]) or config["default_base_url"]
+        api_key = os.environ.get(config["api_key_env"], "")
         return OpenAICompatibleModelClient(
             model=model,
             base_url=base_url,
             api_key=api_key,
             temperature=args.temperature,
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
+            connection_profile=resolve_effective_connection_profile(base_url, "openai-chat", supplied_profile),
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
@@ -127,10 +298,11 @@ def _build_model_client(args):
             api_key=api_key,
             temperature=args.temperature,
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
+            connection_profile=resolve_effective_connection_profile(base_url, "anthropic-messages", supplied_profile),
         )
 
     model = _effective_model(args, provider)
-    host = getattr(args, "host", DEFAULT_OLLAMA_HOST)
+    host = getattr(args, "host", None) or os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST
     return OllamaModelClient(
         model=model,
         host=host,
@@ -185,6 +357,71 @@ def build_welcome(agent, model, host):
     return "\n".join([line, *rows, line])
 
 
+class CliActivityRenderer:
+    def __init__(self, stream=None):
+        self.stream = stream or sys.stdout
+        self.last_status = ""
+        self.delta_seen = False
+        self.answer_open = False
+
+    def begin(self, message):
+        self.last_status = ""
+        self.delta_seen = False
+        self.answer_open = False
+        print(f"\n> {message}", file=self.stream)
+
+    def handle(self, event_name, payload, runtime, task_state):
+        del runtime, task_state
+        if event_name == "run_status":
+            phase = str(payload.get("phase", ""))
+            label = CLI_STATUS_LABELS.get(phase) or str(payload.get("label", "")) or "Working"
+            detail = str(payload.get("detail", "")).strip()
+            text = f"{label}: {detail}" if detail else label
+            self.status(text)
+            return
+        if event_name == "tool_executed":
+            name = str(payload.get("name", "tool"))
+            status = str(payload.get("tool_status", "")).strip()
+            text = f"Ran {name}" + (f" ({status})" if status else "")
+            self.status(text)
+            diff_summary = payload.get("diff_summary", [])
+            if payload.get("workspace_changed") or diff_summary:
+                count = len(diff_summary) if isinstance(diff_summary, list) else 0
+                self.status("Checked file changes" + (f": {count} file(s)" if count else ""))
+            return
+        if event_name == "assistant_delta":
+            text = str(payload.get("text", ""))
+            if not text:
+                return
+            if not self.answer_open:
+                print("\nassistant", file=self.stream)
+                self.answer_open = True
+            print(text, end="", file=self.stream, flush=True)
+            self.delta_seen = True
+
+    def status(self, text):
+        if not text or text == self.last_status:
+            return
+        self.last_status = text
+        print(f"  - {text}", file=self.stream, flush=True)
+
+    def finish(self):
+        if self.answer_open:
+            print("", file=self.stream)
+            self.answer_open = False
+        self.status("Completed")
+
+
+def decode_cwd_arg(args):
+    cwd_b64 = str(getattr(args, "cwd_b64", "") or "").strip()
+    if not cwd_b64:
+        return str(getattr(args, "cwd", ".") or ".")
+    try:
+        return base64.b64decode(cwd_b64.encode("ascii"), validate=True).decode("utf-8")
+    except Exception as exc:
+        raise SystemExit(f"invalid --cwd-b64: {exc}") from exc
+
+
 def build_agent(args):
     """根据 CLI 参数装配出一个可运行的 Pico 实例。
 
@@ -204,8 +441,10 @@ def build_agent(args):
     # 这里是 CLI 到 runtime 的装配点：
     # 先整理 secret 名单，再采集工作区快照，随后决定是恢复旧 session
     # 还是创建一个新的 Pico 实例。
-    configured_secret_names = _configured_secret_names(args)
+    args.cwd = decode_cwd_arg(args)
     workspace = WorkspaceContext.build(args.cwd)
+    load_env_file(workspace.repo_root)
+    configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.codecub/sessions")
     model = _build_model_client(args)
     session_id = args.resume
@@ -240,14 +479,21 @@ def build_arg_parser():
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    parser.add_argument("--provider", choices=("ollama", "openai", "anthropic"), default="openai", help="Model backend to use.")
+    parser.add_argument("--cwd-b64", default="", help="UTF-8 base64 encoded workspace directory for desktop-safe launch.")
+    parser.add_argument(
+        "--provider",
+        choices=MODEL_PROVIDERS,
+        default=None,
+        help="Model backend to use. Defaults to CODECUB_PROVIDER from .env, then openai.",
+    )
     parser.add_argument(
         "--model",
         default=None,
-        help="Model name override. Defaults to qwen3.5:4b for Ollama, OPENAI_MODEL for openai, and ANTHROPIC_MODEL for anthropic when set.",
+        help="Model name override. Provider-specific .env variables are used when set.",
     )
-    parser.add_argument("--host", default=DEFAULT_OLLAMA_HOST, help="Ollama server URL.")
-    parser.add_argument("--base-url", default=None, help="Provider API base URL for openai or anthropic.")
+    parser.add_argument("--host", default=None, help="Ollama server URL. Defaults to OLLAMA_HOST from .env, then localhost.")
+    parser.add_argument("--base-url", default=None, help="Provider API base URL for hosted providers.")
+    parser.add_argument("--connection-profile-b64", default="", help="Non-secret desktop connection identity JSON encoded as UTF-8 base64.")
     parser.add_argument("--ollama-timeout", type=int, default=300, help="Ollama request timeout in seconds.")
     parser.add_argument("--openai-timeout", type=int, default=300, help="OpenAI-compatible request timeout in seconds.")
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
@@ -259,8 +505,8 @@ def build_arg_parser():
         default=[],
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
-    parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Maximum tool/model iterations per request.")
+    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     parser.add_argument(
@@ -283,6 +529,8 @@ def main(argv=None):
         return run_app_mode(args)
 
     agent = build_agent(args)
+    activity = CliActivityRenderer()
+    agent.event_handler = activity.handle
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
@@ -292,10 +540,17 @@ def main(argv=None):
         # one-shot 模式：只跑一次 ask，不进入 REPL 循环。
         prompt = " ".join(args.prompt).strip()
         if prompt:
-            print()
+            activity.begin(prompt)
             try:
-                print(agent.ask(prompt))
+                answer = agent.ask(prompt)
+                if activity.delta_seen:
+                    activity.finish()
+                else:
+                    print("\nassistant")
+                    print(answer)
+                    activity.status("Completed")
             except RuntimeError as exc:
+                activity.status("Failed")
                 print(str(exc), file=sys.stderr)
                 return 1
         return 0
@@ -334,8 +589,15 @@ def main(argv=None):
             print("session reset")
             continue
 
-        print()
+        activity.begin(user_input)
         try:
-            print(agent.ask(user_input))
+            answer = agent.ask(user_input)
+            if activity.delta_seen:
+                activity.finish()
+            else:
+                print("\nassistant")
+                print(answer)
+                activity.status("Completed")
         except RuntimeError as exc:
+            activity.status("Failed")
             print(str(exc), file=sys.stderr)

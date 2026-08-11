@@ -2,13 +2,14 @@ import { BrowserWindow, Menu, app, dialog, ipcMain } from "electron";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildBackendLaunchConfig } from "./backendLaunchConfig.js";
-import { BackendProcess } from "./backendProcess.js";
+import { BackendProcess, backendExitErrorMessage } from "./backendProcess.js";
 import { loadSettings, saveSettings } from "./appConfig.js";
 import { apiKeyStatus, clearApiKey, readApiKey, saveApiKey } from "./credentialStore.js";
 import { readGitStatus } from "./gitStatus.js";
 import { installProjectExtension, listProjectExtensions } from "./projectExtensions.js";
-import { listProjectSessions, loadProjectSession } from "./projectSessions.js";
+import { createProjectSession, deleteProjectSession, listProjectSessions, loadProjectSession } from "./projectSessions.js";
 import { loadRecentProjects, rememberProject } from "./projectStore.js";
+import { sendToRenderer } from "./safeIpc.js";
 import { TerminalManager } from "./terminal.js";
 import type {
   BackendCommand,
@@ -26,35 +27,48 @@ const terminals = new TerminalManager();
 
 function createWindow(): void {
   Menu.setApplicationMenu(null);
-  mainWindow = new BrowserWindow({
+  const window = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 960,
     minHeight: 640,
     title: "CodeCub",
+    frame: false,
     webPreferences: {
       preload: join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
+  mainWindow = window;
+
+  window.on("closed", () => {
+    if (mainWindow === window) {
+      mainWindow = null;
+    }
+  });
 
   if (process.env.VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+    window.loadURL(process.env.VITE_DEV_SERVER_URL);
   } else {
-    mainWindow.loadFile(join(__dirname, "../dist-renderer/index.html"));
+    window.loadFile(join(__dirname, "../dist-renderer/index.html"));
   }
 }
 
 app.whenReady().then(() => {
   createWindow();
 
-  backend.on("event", (line) => mainWindow?.webContents.send("backend:event", line));
-  backend.on("error", (message) => mainWindow?.webContents.send("backend:error", message));
-  backend.on("exit", (code) => mainWindow?.webContents.send("backend:error", `Backend exited: ${code ?? "unknown"}`));
-  terminals.on("data", (terminalId, data) => mainWindow?.webContents.send("terminal:data", terminalId, data));
-  terminals.on("exit", (terminalId, exitCode) => mainWindow?.webContents.send("terminal:exit", { terminalId, exitCode }));
-  terminals.on("error", (terminalId, message) => mainWindow?.webContents.send("terminal:error", { terminalId, message }));
+  backend.on("event", (line) => sendToRenderer(mainWindow, "backend:event", line));
+  backend.on("error", (message) => sendToRenderer(mainWindow, "backend:error", message));
+  backend.on("exit", (event) => {
+    const message = backendExitErrorMessage(event);
+    if (message) {
+      sendToRenderer(mainWindow, "backend:error", message);
+    }
+  });
+  terminals.on("data", (terminalId, data) => sendToRenderer(mainWindow, "terminal:data", terminalId, data));
+  terminals.on("exit", (terminalId, exitCode) => sendToRenderer(mainWindow, "terminal:exit", { terminalId, exitCode }));
+  terminals.on("error", (terminalId, message) => sendToRenderer(mainWindow, "terminal:error", { terminalId, message }));
 });
 
 app.on("window-all-closed", () => {
@@ -85,7 +99,8 @@ ipcMain.handle(
   async (_event, projectPath: string, approvalPolicy: "ask" | "auto" | "never" = "ask", resumeSessionId = "") => {
     const settings = await loadSettings();
     const effectiveSettings = { ...settings, approvalPolicy };
-    const apiKey = await readApiKey(effectiveSettings.provider.provider);
+    const credentialId = effectiveSettings.provider.credentialId || effectiveSettings.provider.provider;
+    const apiKey = await readApiKey(credentialId, effectiveSettings.provider.provider);
     backend.start(buildBackendLaunchConfig(projectPath, effectiveSettings, apiKey, process.env, resumeSessionId));
     await rememberProject(projectPath);
   },
@@ -119,8 +134,14 @@ ipcMain.handle("git:status", async (_event, projectPath: string) => readGitStatu
 
 ipcMain.handle("sessions:list", async (_event, projectPath: string) => listProjectSessions(projectPath));
 
+ipcMain.handle("sessions:create", async (_event, projectPath: string) => createProjectSession(projectPath));
+
 ipcMain.handle("sessions:load", async (_event, projectPath: string, sessionId: string) =>
   loadProjectSession(projectPath, sessionId),
+);
+
+ipcMain.handle("sessions:delete", async (_event, projectPath: string, sessionId: string) =>
+  deleteProjectSession(projectPath, sessionId),
 );
 
 ipcMain.handle("extensions:list", async (_event, projectPath: string) => listProjectExtensions(projectPath));
@@ -147,7 +168,7 @@ ipcMain.handle("extensions:install-plugin", async (_event, projectPath: string) 
 
 ipcMain.handle("settings:load", async () => {
   const settings = await loadSettings();
-  const credential = await apiKeyStatus(settings.provider.provider);
+  const credential = await apiKeyStatus(settings.provider.credentialId || settings.provider.provider, settings.provider.provider);
   return saveSettings({
     ...settings,
     provider: { ...settings.provider, credential },
@@ -156,13 +177,14 @@ ipcMain.handle("settings:load", async () => {
 ipcMain.handle("settings:save", async (_event, settings) => saveSettings(settings));
 ipcMain.handle("settings:provider-save", async (_event, request: SaveProviderSettingsRequest) => {
   const current = await loadSettings();
+  const credentialId = request.credentialId || request.provider;
   let credential = current.provider.credential;
   if (request.clearApiKey) {
-    credential = await clearApiKey(request.provider);
+    credential = await clearApiKey(credentialId);
   } else if (request.apiKey && request.apiKey.trim()) {
-    credential = await saveApiKey(request.provider, request.apiKey);
+    credential = await saveApiKey(credentialId, request.apiKey);
   } else {
-    credential = await apiKeyStatus(request.provider);
+    credential = await apiKeyStatus(credentialId, request.provider);
   }
   return saveSettings({
     ...current,
@@ -172,19 +194,45 @@ ipcMain.handle("settings:provider-save", async (_event, request: SaveProviderSet
       baseUrl: request.baseUrl,
       host: request.host,
       credential,
+      connectionProfileId: request.connectionProfileId,
+      connectionType: request.connectionType,
+      apiOperator: request.apiOperator,
+      modelVendor: request.modelVendor,
+      protocol: request.protocol,
+      responseSchema: request.responseSchema,
+      credentialId,
+      verificationStatus: request.verificationStatus,
     },
   });
 });
-ipcMain.handle("settings:provider-clear-credential", async (_event, provider: ModelProvider) => {
+ipcMain.handle("settings:provider-clear-credential", async (_event, credentialId: string) => {
   const current = await loadSettings();
-  const credential = await clearApiKey(provider);
+  const credential = await clearApiKey(credentialId);
   return saveSettings({
     ...current,
     provider: {
       ...current.provider,
-      provider,
       credential,
     },
   });
 });
 ipcMain.handle("projects:recent", async () => loadRecentProjects());
+
+ipcMain.handle("window:minimize", async () => {
+  mainWindow?.minimize();
+});
+
+ipcMain.handle("window:toggle-maximize", async () => {
+  if (!mainWindow) {
+    return;
+  }
+  if (mainWindow.isMaximized()) {
+    mainWindow.unmaximize();
+    return;
+  }
+  mainWindow.maximize();
+});
+
+ipcMain.handle("window:close", async () => {
+  mainWindow?.close();
+});

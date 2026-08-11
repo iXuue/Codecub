@@ -9,15 +9,17 @@
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"tsc -p tsconfig.node.json --watch\" \"wait-on http://127.0.0.1:5173 && electron dist-electron/main.js\"",
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.node.json && vite build",
-    "package:win": "npm run build && electron-builder --config electron-builder.json --win",
-    "package:win:dir": "npm run build && electron-builder --config electron-builder.json --win dir",
-    "package:win:installer": "npm run build && electron-builder --config electron-builder.json --win nsis",
+    "package:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-win-preserve-global.ps1 -Target win",
+    "package:win:dir": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-win-preserve-global.ps1 -Target dir",
+    "package:win:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-win-preserve-global.ps1 -Target installer",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json"
   },
   "dependencies": {
+    "@gsap/react": "^2.1.2",
     "@xterm/xterm": "^6.0.0",
+    "gsap": "^3.15.0",
     "keytar": "^7.9.0",
     "node-pty": "^1.1.0",
     "react": "^19.0.0",

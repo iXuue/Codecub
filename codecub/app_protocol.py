@@ -20,6 +20,8 @@ SUPPORTED_EVENT_TYPES = {
     "run_completed",
     "run_failed",
     "run_canceled",
+    "usage_updated",
+    "usage_snapshot",
     "tool_result",
     "approval_requested",
     "approval_resolved",
@@ -61,7 +63,7 @@ def encode_event(event):
             raise ValueError(f"event missing required field: {field}")
     if not isinstance(event["payload"], dict):
         raise ValueError("event payload must be a dict")
-    return json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+    return json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n"
 
 
 def parse_command_line(line):

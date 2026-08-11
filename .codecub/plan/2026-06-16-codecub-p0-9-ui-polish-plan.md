@@ -18,6 +18,14 @@ The user wants the CodeCub desktop interface to look more polished and professio
 - 20% CodeCub pet identity.
 - 10% restrained motion/state feedback and light translucent surface treatment.
 
+Update on 2026-06-16: the first implementation was too subtle. The required appearance is now an explicit glass interface with large rounded corners, a dark version with light text, a light version with dark text, and user-selectable non-red highlight colors. The reference direction is rounded translucent dashboard surfaces, but the product must remain a code agent desktop app rather than a game dashboard.
+
+Second update on 2026-06-16: the glass implementation must not look like a rounded website shell inside the Electron window. The app should use an integrated desktop surface: no outer padding, no nested outer shell border, toolbar and workbench visually connected, and custom window controls when the native title bar is hidden.
+
+Third update on 2026-06-16: the workbench still reads as visually busy. Use the local GSAP skills to improve polish without using motion as a substitute for structure: tighten column proportions, make chat the central focus, collapse the terminal by default, group the run inspector into tabs, and use scoped transform/opacity GSAP animations that clean up correctly.
+
+Fourth update on 2026-06-16: the terminal still reads as an unstyled raw console and the center workbench lacks focus. The terminal must become a themed bottom dock with an integrated header, custom xterm colors, and a compact collapsed state. The chat empty state and composer should establish the center area as the primary task surface. Left history and right logs should be visually quieter.
+
 This plan only changes renderer UI structure, styling, and component-level presentation. It must not change backend behavior, model calls, storage formats, approval rules, plugin installation behavior, or terminal behavior.
 
 ## Assumptions And Open Questions
@@ -32,6 +40,17 @@ In scope:
 
 - Project session page layout changes.
 - CSS token system and visual palette.
+- Dark glass and light glass theme modes.
+- User-selectable highlight color presets and custom color input.
+- Appearance persistence through existing app settings.
+- Integrated edge-to-edge app shell with no inner outer-shell frame.
+- Custom Windows window controls and draggable toolbar region if the native title bar is hidden.
+- GSAP React motion for workbench entrance, inspector tab transitions, chat message arrival, and terminal drawer expansion.
+- Terminal as a bottom drawer that is collapsed by default.
+- Themed terminal dock with custom xterm colors and no raw gray/black block.
+- Focused center empty chat state and quieter composer surface.
+- Lower visual weight for left history cards and right log cards.
+- Run inspector tabs for changes, logs, and approvals.
 - Restrained glass/translucent surfaces for toolbar, sidebars, status chip, and run trail.
 - Purposeful micro-interactions for message arrival, status updates, run trail transitions, side panel hover/focus, and install success feedback.
 - Chat message hierarchy polish.
@@ -57,6 +76,10 @@ Out of scope:
 ## Files And Responsibilities
 
 - Modify `desktop/src/styles/app.css`: add design tokens, three-column layout, component styling, focus states, and reduced-motion-safe transitions.
+- Modify `desktop/electron/ipcTypes.ts`: add `AppearanceSettings` and include it in `AppSettings`.
+- Modify `desktop/electron/appConfig.ts`: define default appearance and persist sanitized appearance settings.
+- Modify `desktop/src/App.tsx`: load appearance settings and apply root `data-theme` plus accent CSS variable.
+- Modify `desktop/src/components/SettingsPage.tsx`: add appearance controls for dark/light mode and highlight color.
 - Modify `desktop/src/components/ProjectSessionPage.tsx`: reorganize project session UI into left/center/right regions.
 - Create `desktop/src/components/ProjectSidebar.tsx`: render project context, chat history, and extension panels.
 - Create `desktop/src/components/RunInspectorPanel.tsx`: render CodeCub status chip, approval area, run trail, diff preview, and run log.
@@ -67,6 +90,146 @@ Out of scope:
 - Modify `desktop/src/components/Toolbar.tsx`: add compact model/project-oriented visual treatment only if existing props support it; otherwise keep behavior unchanged.
 - Modify `desktop/src/i18n/zh-CN.ts` and `desktop/src/i18n/en-US.ts`: add new labels.
 - Add tests under `desktop/tests`.
+
+## Task 8: Add Explicit Glass Appearance Settings
+
+**Files:**
+- Modify: `desktop/electron/ipcTypes.ts`
+- Modify: `desktop/electron/appConfig.ts`
+- Modify: `desktop/src/App.tsx`
+- Modify: `desktop/src/components/SettingsPage.tsx`
+- Modify: `desktop/src/styles/app.css`
+- Modify: `desktop/src/i18n/zh-CN.ts`
+- Modify: `desktop/src/i18n/en-US.ts`
+- Test: `desktop/tests/appConfig.test.ts`
+- Test: `desktop/tests/SettingsPage.test.tsx`
+- Test: `desktop/tests/uiTokens.test.ts`
+
+- [ ] **Step 1: Extend app settings**
+
+Add an `AppearanceSettings` type with `themeMode: "dark" | "light"` and `accentColor: string`. Include it in `AppSettings`, default it to dark glass with a non-red accent, and sanitize it through `sanitizeSettingsForDisk`.
+
+- [ ] **Step 2: Apply settings in the renderer root**
+
+Load `settings.appearance` in `App.tsx`, apply `data-theme` to the app root, and set `--color-accent-user` from the selected accent color.
+
+- [ ] **Step 3: Add settings UI**
+
+Add an appearance section to `SettingsPage` with dark/light buttons, safe accent swatches, and a custom color input. Saving settings must persist appearance together with language and approval policy.
+
+- [ ] **Step 4: Replace subtle glass tokens**
+
+Update `app.css` so dark and light themes define visible translucent panels, large radii, backdrop blur, rounded inputs/buttons, and accent-driven focus/active states. Keep terminal, diff, error, and log surfaces readable.
+
+- [ ] **Step 5: Verify**
+
+Run:
+
+```powershell
+cd desktop
+npm run test
+npm run typecheck
+npm run package:win
+powershell -ExecutionPolicy Bypass -File scripts/smoke-packaged.ps1
+```
+
+Expected: tests and typecheck pass; packaged app starts; the generated `release/win-unpacked/CodeCub.exe` shows dark glass by default and settings can switch to light glass and another highlight color.
+
+## Task 9: Remove Nested Shell And Integrate Window Chrome
+
+**Files:**
+- Modify: `desktop/electron/main.ts`
+- Modify: `desktop/electron/preload.cts`
+- Modify: `desktop/src/components/Toolbar.tsx`
+- Modify: `desktop/src/components/SettingsPage.tsx`
+- Modify: `desktop/src/styles/app.css`
+- Test: `desktop/tests/uiTokens.test.ts`
+
+- [ ] **Step 1: Hide native title bar safely**
+
+Configure the Electron `BrowserWindow` with `frame: false`. Add IPC handlers for minimize, maximize/restore, and close, and expose them through preload.
+
+- [ ] **Step 2: Use one toolbar everywhere**
+
+Add window controls to `Toolbar.tsx`, make the toolbar draggable except buttons, and reuse the toolbar on the settings page.
+
+- [ ] **Step 3: Remove outer shell frame**
+
+Set `.theme-root` and `.app-shell` to full-window, no padding, no floating rounded outer border. Keep internal panels translucent but visually connected to the toolbar and window edge.
+
+- [ ] **Step 4: Verify**
+
+Run desktop tests, typecheck, package, and packaged smoke. Manually verify the new exe has no native title bar, can be dragged from the toolbar, and exposes usable minimize/maximize/close buttons.
+
+## Task 10: GSAP Workbench Layout Polish
+
+**Files:**
+- Modify: `desktop/package.json`
+- Modify: `desktop/package-lock.json`
+- Create: `desktop/src/motion/gsapSetup.ts`
+- Modify: `desktop/src/components/ProjectSessionPage.tsx`
+- Modify: `desktop/src/components/RunInspectorPanel.tsx`
+- Modify: `desktop/src/components/TerminalPanel.tsx`
+- Modify: `desktop/src/components/ChatView.tsx`
+- Modify: `desktop/src/styles/app.css`
+- Modify: `desktop/src/i18n/zh-CN.ts`
+- Modify: `desktop/src/i18n/en-US.ts`
+
+- [ ] **Step 1: Install local motion dependencies**
+
+Install `gsap` and `@gsap/react` inside `desktop`, updating only the project package files.
+
+- [ ] **Step 2: Add scoped GSAP setup**
+
+Create a small motion setup module that registers `useGSAP` once and exposes a reduced-motion guard.
+
+- [ ] **Step 3: Rebalance layout**
+
+Use a 240px left context rail, a dominant center workbench, and a 320px right inspector. Reduce nested card borders and make the chat region the primary visual surface.
+
+- [ ] **Step 4: Make terminal a drawer**
+
+Keep terminal controls visible but collapse terminal content by default. Opening the terminal expands the drawer; running terminals can be hidden or closed.
+
+- [ ] **Step 5: Group inspector content**
+
+Keep CodeCub status and run trail always visible. Move changes, logs, and approvals into tabs so secondary information does not stack vertically.
+
+- [ ] **Step 6: Add restrained GSAP motion**
+
+Animate workbench columns on entry, inspector tab bodies on switch, latest chat messages on arrival, and terminal drawer expansion using transform/opacity or small height changes only. Respect reduced motion and clean up via `useGSAP`.
+
+## Task 11: Terminal Dock And Workbench Focus Polish
+
+**Files:**
+- Modify: `desktop/src/components/TerminalPanel.tsx`
+- Modify: `desktop/src/components/ChatView.tsx`
+- Modify: `desktop/src/styles/app.css`
+- Modify: `desktop/src/i18n/zh-CN.ts`
+- Modify: `desktop/src/i18n/en-US.ts`
+- Modify: `desktop/tests/TerminalPanel.test.tsx`
+- Modify: `desktop/tests/ChatViewLayout.test.tsx`
+- Modify: `desktop/tests/uiTokens.test.ts`
+
+- [ ] **Step 1: Theme the terminal**
+
+Set xterm font, line height, dark blue-black background, soft foreground, accent cursor, and ANSI colors that fit the CodeCub theme.
+
+- [ ] **Step 2: Replace raw terminal chrome**
+
+Use a terminal title row with a status dot and project/status subtitle. The collapsed dock should be compact and visually integrated, not a gray strip.
+
+- [ ] **Step 3: Focus the chat empty state**
+
+Replace the plain empty text with a centered CodeCub mark, title, and subtitle. Keep the composer visually anchored as the main command surface.
+
+- [ ] **Step 4: Reduce side noise**
+
+Make left history items more compact and lower the contrast of right log/diff cards so the center remains dominant.
+
+- [ ] **Step 5: Verify**
+
+Run related component tests, full desktop tests, typecheck, Windows packaging, and packaged smoke.
 
 ## Task 1: Add UI Token Baseline
 

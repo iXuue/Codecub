@@ -1,10 +1,13 @@
 import itertools
 import sys
 import threading
+import time
 from datetime import datetime
 
 from .app_protocol import encode_event, make_event, parse_command_line
 from .legacy_import import detect_legacy_pico, import_legacy_pico_sessions
+
+HEARTBEAT_INTERVAL_SECONDS = 10
 
 
 class ApprovalRequest:
@@ -32,11 +35,12 @@ def _write_event(stdout, event_type, session_id="", run_id="", payload=None):
 def _run_artifact_payload(agent):
     run_dir = getattr(agent, "current_run_dir", None)
     if not run_dir:
-        return {"run_dir": "", "trace_path": "", "report_path": ""}
+        return {"run_dir": "", "trace_path": "", "report_path": "", "usage_path": ""}
     return {
         "run_dir": str(run_dir),
         "trace_path": str(run_dir / "trace.jsonl"),
         "report_path": str(run_dir / "report.json"),
+        "usage_path": str(run_dir / "usage.jsonl"),
     }
 
 
@@ -70,13 +74,60 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
     pending_lock = threading.Lock()
     pending_approvals = {}
     approval_counter = itertools.count(1)
-    active_run = {"run_id": "", "thread": None, "cancel_requested": False}
+    active_run = {
+        "run_id": "",
+        "thread": None,
+        "cancel_requested": False,
+        "last_status": {},
+        "last_status_time": 0.0,
+        "heartbeat_stop": None,
+        "heartbeat_thread": None,
+    }
     canceled_run_ids = set()
     delta_seen_by_run = set()
 
     def emit(event_type, run_id="", payload=None):
         with output_lock:
             return _write_event(stdout, event_type, session_id=session_id, run_id=run_id, payload=payload or {})
+
+    def remember_run_status(run_id, payload):
+        if run_id and run_id == active_run.get("run_id"):
+            active_run["last_status"] = dict(payload or {})
+            active_run["last_status_time"] = time.monotonic()
+
+    def start_heartbeat(run_id):
+        stop_event = threading.Event()
+        active_run["heartbeat_stop"] = stop_event
+
+        def heartbeat_loop():
+            while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+                if active_run.get("run_id") != run_id:
+                    return
+                last_status = dict(active_run.get("last_status") or {})
+                payload = dict(last_status)
+                payload.update(
+                    {
+                        "phase": payload.get("phase") or "working",
+                        "label": payload.get("label") or "Working",
+                        "detail": payload.get("detail") or "",
+                        "heartbeat": True,
+                        "silent_for_ms": int(
+                            max(0.0, time.monotonic() - float(active_run.get("last_status_time") or 0.0)) * 1000
+                        ),
+                    }
+                )
+                emit("run_status", run_id=run_id, payload=payload)
+
+        thread = threading.Thread(target=heartbeat_loop, daemon=True)
+        active_run["heartbeat_thread"] = thread
+        thread.start()
+
+    def stop_heartbeat():
+        stop_event = active_run.get("heartbeat_stop")
+        if stop_event is not None:
+            stop_event.set()
+        active_run["heartbeat_stop"] = None
+        active_run["heartbeat_thread"] = None
 
     def reject_pending_for_run(run_id, reason):
         with pending_lock:
@@ -142,7 +193,12 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 emit("assistant_delta", run_id=run_id, payload={"text": text})
             return
         if event_name == "run_status":
-            emit("run_status", run_id=run_id, payload=dict(payload or {}))
+            status_payload = dict(payload or {})
+            remember_run_status(run_id, status_payload)
+            emit("run_status", run_id=run_id, payload=status_payload)
+            return
+        if event_name == "usage_updated":
+            emit("usage_updated", run_id=run_id, payload=dict(payload or {}))
             return
         if event_name != "tool_executed":
             return
@@ -160,8 +216,17 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 },
             )
 
+    def cancel_checker(runtime, task_state):
+        del runtime
+        run_id = getattr(task_state, "run_id", "")
+        if run_id and run_id in canceled_run_ids:
+            return True
+        active_run_id = active_run.get("run_id", "")
+        return bool(active_run.get("cancel_requested") and (not active_run_id or active_run_id == run_id))
+
     agent.approval_handler = approval_handler
     agent.event_handler = event_handler
+    agent.cancel_checker = cancel_checker
 
     emit(
         "session_started",
@@ -171,6 +236,11 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
             "session_path": str(agent.session_path),
         },
     )
+    usage_store = getattr(agent, "usage_store", None)
+    if usage_store is not None:
+        snapshot = usage_store.load_snapshot(session_id)
+        if snapshot.get("groups"):
+            emit("usage_snapshot", payload=snapshot)
     legacy = detect_legacy_pico(agent.root)
     if legacy["exists"] and legacy["session_count"] > 0:
         emit(
@@ -184,7 +254,7 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
 
     def run_worker(run_id, message):
         try:
-            answer = agent.ask(message)
+            answer = agent.ask(message, run_id=run_id)
         except Exception as exc:
             if run_id in canceled_run_ids:
                 return
@@ -201,9 +271,26 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
             emit("run_failed", run_id=run_id, payload=payload)
             return
         finally:
-            pass
+            stop_heartbeat()
 
         if run_id in canceled_run_ids or active_run.get("cancel_requested"):
+            return
+
+        task_state = getattr(agent, "current_task_state", None)
+        if getattr(task_state, "status", "") == "failed":
+            model_error = dict(getattr(agent, "last_model_error", {}) or {})
+            payload = {
+                "error_type": model_error.get("error_type", "RuntimeError"),
+                "message": model_error.get("message", answer),
+                **_run_artifact_payload(agent),
+            }
+            emit("run_failed", run_id=run_id, payload=payload)
+            if active_run.get("run_id") == run_id:
+                active_run["run_id"] = ""
+                active_run["thread"] = None
+                active_run["cancel_requested"] = False
+                active_run["last_status"] = {}
+                active_run["last_status_time"] = 0.0
             return
 
         if run_id not in delta_seen_by_run:
@@ -215,6 +302,8 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
             active_run["run_id"] = ""
             active_run["thread"] = None
             active_run["cancel_requested"] = False
+            active_run["last_status"] = {}
+            active_run["last_status_time"] = 0.0
 
     def resolve_approval(command):
         approval_id = command.get("approval_id", "")
@@ -319,7 +408,10 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
             delta_seen_by_run.discard(run_id)
             active_run["run_id"] = run_id
             active_run["cancel_requested"] = False
+            active_run["last_status"] = {"phase": "received", "label": "Task received", "detail": message}
+            active_run["last_status_time"] = time.monotonic()
             emit("user_message_received", run_id=run_id, payload={"message": message})
+            start_heartbeat(run_id)
             thread = threading.Thread(target=run_worker, args=(run_id, message), daemon=True)
             active_run["thread"] = thread
             thread.start()

@@ -32,6 +32,9 @@ class RunStore:
     def report_path(self, run_id):
         return self.run_dir(run_id) / "report.json"
 
+    def usage_path(self, run_id):
+        return self.run_dir(run_id) / "usage.jsonl"
+
     def start_run(self, task_state):
         # 每次 ask() 都会生成一个 run 目录。
         # 这样一次用户请求对应一组独立工件，后续排查更容易。
@@ -56,6 +59,14 @@ class RunStore:
             handle.write("\n")
         return path
 
+    def append_usage(self, task_state, usage_record):
+        path = self.usage_path(task_state)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(usage_record, sort_keys=True, ensure_ascii=True))
+            handle.write("\n")
+        return path
+
     def write_report(self, task_state, report):
         path = self.report_path(task_state)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +78,16 @@ class RunStore:
 
     def load_report(self, task_id):
         return json.loads(self.report_path(task_id).read_text(encoding="utf-8"))
+
+    def load_usage(self, run_id):
+        path = self.usage_path(run_id)
+        if not path.exists():
+            return []
+        records = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+        return records
 
     def _write_json_atomic(self, path, payload):
         # 原子写：先写临时文件，再 replace。

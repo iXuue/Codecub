@@ -18,8 +18,11 @@ from pathlib import Path
 from . import memory as memorylib
 from .context_manager import ContextManager
 from .run_store import RunStore
+from .telemetry import aggregate_usage_records, build_usage_snapshot
+from .usage_store import UsageStore
 from .task_state import TaskState
 from . import tools as toolkit
+from . import task_policy
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
@@ -31,6 +34,9 @@ DEFAULT_FEATURE_FLAGS = {
     "context_reduction": True,
     "prompt_cache": True,
 }
+DEFAULT_MAX_STEPS = 80
+REPEATED_NO_PROGRESS_LIMIT = 5
+STOP_REASON_REPEATED_NO_PROGRESS = "repeated_no_progress"
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
 CHECKPOINT_NONE_STATUS = "no-checkpoint"
 CHECKPOINT_FULL_VALID_STATUS = "full-valid"
@@ -50,6 +56,7 @@ DURABLE_MEMORY_LINE_PATTERNS = (
     ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
 )
 SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 @dataclass
@@ -143,7 +150,7 @@ class Pico:
         session=None,
         run_store=None,
         approval_policy="ask",
-        max_steps=6,
+        max_steps=DEFAULT_MAX_STEPS,
         max_new_tokens=512,
         depth=0,
         max_depth=1,
@@ -168,6 +175,7 @@ class Pico:
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
         self.approval_handler = approval_handler
         self.event_handler = event_handler
+        self.cancel_checker = None
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
@@ -195,6 +203,10 @@ class Pico:
         self.current_run_dir = None
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
+        self.current_run_usage = []
+        self.current_run_source_reads = []
+        self.usage_store = UsageStore(self.root / ".codecub" / "usage")
+        self.last_model_error = {}
         self.last_durable_promotions = []
         self.last_durable_rejections = []
         self.last_durable_superseded = []
@@ -585,9 +597,15 @@ class Pico:
         _, metadata = self._build_prompt_and_metadata(user_message)
         return metadata
 
-    def _build_prompt_and_metadata(self, user_message):
+    def _build_prompt_and_metadata(self, user_message, status_callback=None):
+        if status_callback is not None:
+            status_callback("checking_workspace", "Checking repository state", str(self.root))
         refresh = self.refresh_prefix()
+        if status_callback is not None:
+            status_callback("loading_memory", "Loading session memory", "")
         self.resume_state = self.evaluate_resume_state()
+        if status_callback is not None:
+            status_callback("building_prompt", "Building prompt", "")
         prompt, metadata = self.context_manager.build(user_message)
         # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
         # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
@@ -832,7 +850,7 @@ class Pico:
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
 
-    def ask(self, user_message):
+    def ask(self, user_message, run_id=""):
         """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
 
         为什么存在：
@@ -857,9 +875,12 @@ class Pico:
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
-        task_state = TaskState.create(run_id=self.new_run_id(), task_id=self.new_task_id(), user_request=user_message)
+        task_run_id = self.validate_external_run_id(run_id) if run_id else self.new_run_id()
+        task_state = TaskState.create(run_id=task_run_id, task_id=self.new_task_id(), user_request=user_message)
         task_state.resume_status = self.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         self.current_task_state = task_state
+        self.current_run_usage = []
+        self.current_run_source_reads = []
         self.current_run_dir = self.run_store.start_run(task_state)
         self.emit_run_status(
             task_state,
@@ -888,6 +909,8 @@ class Pico:
         # 4. 记录：把结果写回 history / task_state / trace / memory
         # 然后进入下一轮，直到停机条件满足
         while tool_steps < self.max_steps and attempts < max_attempts:
+            if self.cancellation_requested(task_state):
+                return self.stop_user_canceled_run(task_state, run_started_wall, run_started_at)
             attempts += 1
             task_state.record_attempt()
             self.run_store.write_task_state(task_state)
@@ -899,7 +922,26 @@ class Pico:
                 run_started_at=run_started_at,
             )
             prompt_started_at = time.monotonic()
-            prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
+
+            def emit_context_status(phase, label, detail=""):
+                self.emit_run_status(
+                    task_state,
+                    phase,
+                    label,
+                    detail=detail,
+                    started_at=run_started_wall,
+                    run_started_at=run_started_at,
+                )
+                self.emit_trace(
+                    task_state,
+                    "context_step_started",
+                    {
+                        "phase": phase,
+                        "detail": clip(detail, 300),
+                    },
+                )
+
+            prompt, prompt_metadata = self._build_prompt_and_metadata(user_message, status_callback=emit_context_status)
             self.emit_trace(
                 task_state,
                 "prompt_built",
@@ -960,6 +1002,8 @@ class Pico:
                     "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
                 },
             )
+            if self.cancellation_requested(task_state):
+                return self.stop_user_canceled_run(task_state, run_started_wall, run_started_at)
             self.emit_run_status(
                 task_state,
                 "model_request",
@@ -986,26 +1030,84 @@ class Pico:
             stream_filter = FinalAnswerDeltaFilter(
                 lambda text: self.emit_app_event("assistant_delta", task_state, {"text": text})
             )
-            if hasattr(self.model_client, "stream_complete"):
-                raw = self.model_client.stream_complete(
-                    prompt,
-                    self.max_new_tokens,
-                    on_delta=stream_filter.feed,
-                    prompt_cache_key=prompt_cache_key,
-                    prompt_cache_retention=prompt_cache_retention,
-                )
-            else:
-                raw = self.model_client.complete(
-                    prompt,
-                    self.max_new_tokens,
-                    prompt_cache_key=prompt_cache_key,
-                    prompt_cache_retention=prompt_cache_retention,
-                )
+            self.last_prompt_metadata = prompt_metadata
+            try:
+                model_kwargs = {
+                    "prompt_cache_key": prompt_cache_key,
+                    "prompt_cache_retention": prompt_cache_retention,
+                }
+                if getattr(self.model_client, "supports_structured_prompt_cache", False):
+                    model_kwargs["stable_prefix"] = self.prefix
+                if hasattr(self.model_client, "stream_complete"):
+                    raw = self.model_client.stream_complete(
+                        prompt,
+                        self.max_new_tokens,
+                        on_delta=stream_filter.feed,
+                        **model_kwargs,
+                    )
+                else:
+                    raw = self.model_client.complete(
+                        prompt,
+                        self.max_new_tokens,
+                        **model_kwargs,
+                    )
+            except Exception as exc:
+                return self.stop_model_error_run(task_state, exc, model_started_at, run_started_wall, run_started_at)
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
+            if self.cancellation_requested(task_state):
+                return self.stop_user_canceled_run(task_state, run_started_wall, run_started_at)
             if completion_metadata:
                 # 把后端返回的 usage/cache 统计并回 prompt_metadata，
                 # 方便统一写入 report 和 trace。
                 prompt_metadata.update(completion_metadata)
+            usage_record = completion_metadata.get("usage_record")
+            if isinstance(usage_record, dict):
+                usage_record = dict(usage_record)
+                usage_record.update(
+                    {
+                        "usage_id": f"{task_state.run_id}-request-{attempts}",
+                        "session_id": self.session.get("id", ""),
+                        "run_id": task_state.run_id,
+                        "turn_id": task_state.task_id,
+                        "request_index": attempts,
+                        "recorded_at": now(),
+                        "duration_ms": int((time.monotonic() - model_started_at) * 1000),
+                        "status": "completed",
+                    }
+                )
+                usage_record = self.redact_artifact(usage_record)
+                self.run_store.append_usage(task_state, usage_record)
+                self.current_run_usage.append(usage_record)
+                try:
+                    stored = self.usage_store.record(usage_record)
+                    run_snapshot = build_usage_snapshot(
+                        self.current_run_usage,
+                        "run",
+                        session_id=self.session.get("id", ""),
+                        run_id=task_state.run_id,
+                    )
+                    session_snapshot = (stored or {}).get("snapshot") if isinstance(stored, dict) else None
+                    if isinstance(session_snapshot, dict):
+                        self.emit_app_event("usage_updated", task_state, {
+                            "schema_version": 2,
+                            "usage_id": usage_record["usage_id"],
+                            "run_snapshot": run_snapshot,
+                            "session_snapshot": session_snapshot,
+                        })
+                except Exception as exc:
+                    self.emit_trace(
+                        task_state,
+                        "usage_persistence_warning",
+                        {"error_type": exc.__class__.__name__, "message": self.redact_text(str(exc))},
+                    )
+                self.emit_trace(
+                    task_state,
+                    "model_usage_recorded",
+                    {
+                        "usage_id": usage_record["usage_id"],
+                        "connection_profile_id": usage_record.get("connection_profile_id", ""),
+                    },
+                )
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
             kind, payload = self.parse(raw)
@@ -1034,6 +1136,8 @@ class Pico:
                     run_started_at=run_started_at,
                 )
                 result = self.run_tool(name, args)
+                if self.cancellation_requested(task_state):
+                    return self.stop_user_canceled_run(task_state, run_started_wall, run_started_at)
                 self.record(
                     {
                         "role": "tool",
@@ -1043,6 +1147,8 @@ class Pico:
                         "created_at": now(),
                     }
                 )
+                if name == "read_file" and task_policy.is_source_path(args.get("path")):
+                    self.current_run_source_reads.append(str(args.get("path")))
                 self.run_store.write_task_state(task_state)
                 tool_event_payload = {
                     "name": name,
@@ -1054,6 +1160,15 @@ class Pico:
                 self.emit_trace(task_state, "tool_executed", tool_event_payload)
                 if self.event_handler is not None:
                     self.event_handler("tool_executed", dict(tool_event_payload), self, task_state)
+                if dict(self._last_tool_result_metadata or {}).get("tool_error_code") == "repeated_identical_call":
+                    return self.stop_repeated_no_progress_run(
+                        task_state,
+                        user_message,
+                        name,
+                        args,
+                        run_started_wall,
+                        run_started_at,
+                    )
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
@@ -1071,67 +1186,21 @@ class Pico:
                 self.run_store.write_task_state(task_state)
                 continue
 
+            if task_policy.requires_source_evidence(user_message) and not self.current_run_source_reads:
+                notice = task_policy.evidence_retry_notice()
+                self.record({"role": "assistant", "content": notice, "created_at": now()})
+                self.emit_trace(task_state, "evidence_insufficient", {"required": "source_file_read", "source_reads": []})
+                self.run_store.write_task_state(task_state)
+                continue
             final = (payload or raw).strip()
-            self.emit_run_status(
-                task_state,
-                "finalizing",
-                "Finalizing response",
-                started_at=run_started_wall,
-                run_started_at=run_started_at,
-            )
+            return self.finish_successful_run(task_state, user_message, final, run_started_wall, run_started_at)
 
-            self.record({"role": "assistant", "content": final, "created_at": now()})
-            task_state.finish_success(final)
-            # 长期记忆
-            self.promote_durable_memory(user_message, final)
-            checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
-            self.run_store.write_task_state(task_state)
-            self.emit_trace(
-                task_state,
-                "checkpoint_created",
-                {
-                    "checkpoint_id": checkpoint["checkpoint_id"],
-                    "trigger": "run_finished",
-                },
-            )
-            self.emit_trace(
-                task_state,
-                "run_finished",
-                {
-                    "status": task_state.status,
-                    "stop_reason": task_state.stop_reason,
-                    "final_answer": final,
-                    "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
-                },
-            )
-            self.emit_run_status(
-                task_state,
-                "completed",
-                "Completed",
-                started_at=run_started_wall,
-                run_started_at=run_started_at,
-            )
-            self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
-            return final
+        return self.stop_limited_run(task_state, user_message, attempts, max_attempts, tool_steps, run_started_wall, run_started_at)
 
-        if attempts >= max_attempts and tool_steps < self.max_steps:
-            final = "Stopped after too many malformed model responses without a valid tool call or final answer."
-            task_state.stop_retry_limit(final)
-        else:
-            final = "Stopped after reaching the step limit without a final answer."
-            task_state.stop_step_limit(final)
-        self.record({"role": "assistant", "content": final, "created_at": now()})
-        self.promote_durable_memory(user_message, final)
-        self.run_store.write_task_state(task_state)
-        checkpoint = self.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
-        self.emit_trace(
-            task_state,
-            "checkpoint_created",
-            {
-                "checkpoint_id": checkpoint["checkpoint_id"],
-                "trigger": task_state.stop_reason or "run_stopped",
-            },
-        )
+    def write_final_report(self, task_state):
+        self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+
+    def emit_run_finished(self, task_state, final, run_started_at):
         self.emit_trace(
             task_state,
             "run_finished",
@@ -1142,6 +1211,56 @@ class Pico:
                 "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
             },
         )
+
+    def emit_checkpoint_created(self, task_state, checkpoint, trigger):
+        self.emit_trace(
+            task_state,
+            "checkpoint_created",
+            {
+                "checkpoint_id": checkpoint["checkpoint_id"],
+                "trigger": trigger,
+            },
+        )
+
+    def finish_successful_run(self, task_state, user_message, final, run_started_wall, run_started_at):
+        self.emit_run_status(
+            task_state,
+            "finalizing",
+            "Finalizing response",
+            started_at=run_started_wall,
+            run_started_at=run_started_at,
+        )
+        self.record({"role": "assistant", "content": final, "created_at": now()})
+        task_state.finish_success(final)
+        self.promote_durable_memory(user_message, final)
+        checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
+        self.run_store.write_task_state(task_state)
+        self.emit_checkpoint_created(task_state, checkpoint, "run_finished")
+        self.emit_run_finished(task_state, final, run_started_at)
+        self.emit_run_status(
+            task_state,
+            "completed",
+            "Completed",
+            started_at=run_started_wall,
+            run_started_at=run_started_at,
+        )
+        self.write_final_report(task_state)
+        return final
+
+    def stop_limited_run(self, task_state, user_message, attempts, max_attempts, tool_steps, run_started_wall, run_started_at):
+        if attempts >= max_attempts and tool_steps < self.max_steps:
+            final = "Stopped after too many malformed model responses without a valid tool call or final answer."
+            task_state.stop_retry_limit(final)
+        else:
+            final = "Stopped after reaching the step limit without a final answer."
+            task_state.stop_step_limit(final)
+        self.record({"role": "assistant", "content": final, "created_at": now()})
+        self.promote_durable_memory(user_message, final)
+        self.run_store.write_task_state(task_state)
+        trigger = task_state.stop_reason or "run_stopped"
+        checkpoint = self.create_checkpoint(task_state, user_message, trigger=trigger)
+        self.emit_checkpoint_created(task_state, checkpoint, trigger)
+        self.emit_run_finished(task_state, final, run_started_at)
         self.emit_run_status(
             task_state,
             "failed",
@@ -1150,7 +1269,39 @@ class Pico:
             started_at=run_started_wall,
             run_started_at=run_started_at,
         )
-        self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+        self.write_final_report(task_state)
+        return final
+
+    def stop_repeated_no_progress_run(self, task_state, user_message, tool_name, tool_args, run_started_wall, run_started_at):
+        final = (
+            "Stopped after the same no-progress tool action repeated "
+            f"{REPEATED_NO_PROGRESS_LIMIT} times: {tool_name}."
+        )
+        task_state.stop(STOP_REASON_REPEATED_NO_PROGRESS, final_answer=final)
+        self.record({"role": "assistant", "content": final, "created_at": now()})
+        self.promote_durable_memory(user_message, final)
+        self.run_store.write_task_state(task_state)
+        self.emit_trace(
+            task_state,
+            STOP_REASON_REPEATED_NO_PROGRESS,
+            {
+                "tool_name": str(tool_name or ""),
+                "args": tool_args,
+                "limit": REPEATED_NO_PROGRESS_LIMIT,
+            },
+        )
+        checkpoint = self.create_checkpoint(task_state, user_message, trigger=STOP_REASON_REPEATED_NO_PROGRESS)
+        self.emit_checkpoint_created(task_state, checkpoint, STOP_REASON_REPEATED_NO_PROGRESS)
+        self.emit_run_finished(task_state, final, run_started_at)
+        self.emit_run_status(
+            task_state,
+            "failed",
+            "Stopped",
+            detail=task_state.stop_reason,
+            started_at=run_started_wall,
+            run_started_at=run_started_at,
+        )
+        self.write_final_report(task_state)
         return final
 
     def run_tool(self, name, args):
@@ -1218,7 +1369,10 @@ class Pico:
                 "workspace_changed": False,
                 "diff_summary": [],
             }
-            return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+            return (
+                f"error: repeated identical tool call for {name}; "
+                f"same no-progress action reached {REPEATED_NO_PROGRESS_LIMIT} consecutive attempts"
+            )
         if tool["risky"] and not self.approve(name, args):
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
@@ -1285,11 +1439,21 @@ class Pico:
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
         # 这里提前挡掉最简单的这种循环。
-        tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
-        if len(tool_events) < 2:
+        tool_events = self.current_request_tool_events()
+        required_previous_matches = REPEATED_NO_PROGRESS_LIMIT - 1
+        if len(tool_events) < required_previous_matches:
             return False
-        recent = tool_events[-2:]
+        recent = tool_events[-required_previous_matches:]
         return all(item["name"] == name and item["args"] == args for item in recent)
+
+    def current_request_tool_events(self):
+        tool_events = []
+        for item in reversed(self.session["history"]):
+            if item.get("role") == "user":
+                break
+            if item.get("role") == "tool":
+                tool_events.append(item)
+        return list(reversed(tool_events))
 
     @staticmethod
     def new_task_id():
@@ -1298,6 +1462,74 @@ class Pico:
     @staticmethod
     def new_run_id():
         return "run_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+    def cancellation_requested(self, task_state):
+        checker = getattr(self, "cancel_checker", None)
+        if checker is None:
+            return False
+        return bool(checker(self, task_state))
+
+    def stop_user_canceled_run(self, task_state, run_started_wall, run_started_at):
+        final = "Canceled by user."
+        task_state.stop_user_canceled(final)
+        self.run_store.write_task_state(task_state)
+        self.emit_trace(
+            task_state,
+            "run_canceled",
+            {
+                "status": task_state.status,
+                "stop_reason": task_state.stop_reason,
+                "final_answer": final,
+                "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
+            },
+        )
+        self.emit_run_status(
+            task_state,
+            "canceled",
+            "Canceled",
+            started_at=run_started_wall,
+            run_started_at=run_started_at,
+        )
+        self.write_final_report(task_state)
+        return final
+
+    def stop_model_error_run(self, task_state, exc, model_started_at, run_started_wall, run_started_at):
+        error_message = self.redact_text(str(exc))
+        error_type = exc.__class__.__name__
+        final = f"Model error: {error_message}" if error_message else f"Model error: {error_type}"
+        self.last_model_error = {
+            "error_type": error_type,
+            "message": error_message,
+        }
+        task_state.stop_model_error(final)
+        self.run_store.write_task_state(task_state)
+        self.emit_trace(
+            task_state,
+            "model_error",
+            {
+                "error_type": error_type,
+                "message": error_message,
+                "duration_ms": int((time.monotonic() - model_started_at) * 1000),
+            },
+        )
+        self.emit_run_status(
+            task_state,
+            "failed",
+            "Failed",
+            detail="model_error",
+            started_at=run_started_wall,
+            run_started_at=run_started_at,
+        )
+        self.emit_run_finished(task_state, final, run_started_at)
+        self.write_final_report(task_state)
+        return final
+
+    @staticmethod
+    def validate_external_run_id(run_id):
+        value = str(run_id or "").strip()
+        if value in {"", ".", ".."} or RUN_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError("invalid run_id: use only letters, numbers, underscore, dash, and dot")
+        return value
 
     def build_report(self, task_state):
         # report 是一次运行的最终摘要；
@@ -1314,6 +1546,13 @@ class Pico:
             "resume_status": task_state.resume_status,
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
+            "usage_summary": aggregate_usage_records(self.current_run_usage),
+            "usage_snapshot": build_usage_snapshot(
+                self.current_run_usage,
+                "run",
+                session_id=self.session.get("id", ""),
+                run_id=task_state.run_id,
+            ),
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
@@ -1415,7 +1654,7 @@ class Pico:
             return "retry", Pico.retry_notice("model returned an empty <final> answer")
         raw = raw.strip()
         if raw:
-            return "final", raw
+            return "retry", Pico.retry_notice("model response is missing required <tool> or <final> tags")
         return "retry", Pico.retry_notice("model returned an empty response")
 
     @staticmethod

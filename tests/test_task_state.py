@@ -2,6 +2,7 @@ from codecub.task_state import (
     STOP_REASON_FINAL_ANSWER_RETURNED,
     STOP_REASON_RETRY_LIMIT_REACHED,
     STOP_REASON_STEP_LIMIT_REACHED,
+    STOP_REASON_USER_CANCELED,
     TaskState,
 )
 
@@ -50,6 +51,16 @@ def test_task_state_records_retry_limit_stop_reason():
 
     assert state.status == "stopped"
     assert state.stop_reason == STOP_REASON_RETRY_LIMIT_REACHED
+
+
+def test_task_state_records_user_canceled_stop_reason():
+    state = TaskState.create(run_id="run_007", task_id="task_007", user_request="Cancel this.")
+
+    state.stop_user_canceled("Canceled by user.")
+
+    assert state.status == "stopped"
+    assert state.stop_reason == STOP_REASON_USER_CANCELED
+    assert state.final_answer == "Canceled by user."
 
 
 def test_task_state_snapshot_keeps_final_answer():

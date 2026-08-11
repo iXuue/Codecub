@@ -1,3 +1,5 @@
+import pytest
+
 from codecub.metrics import (
     run_context_ablation_v2,
     run_memory_ablation_v2,
@@ -6,6 +8,8 @@ from codecub.metrics import (
 )
 
 
+@pytest.mark.slow
+@pytest.mark.benchmark
 def test_run_context_ablation_v2_writes_expected_artifact(tmp_path):
     artifact_path = tmp_path / "artifacts" / "context-ablation-v2.json"
 
@@ -21,6 +25,8 @@ def test_run_context_ablation_v2_writes_expected_artifact(tmp_path):
     assert "current_request_preserved_rate" in artifact["summary"]
 
 
+@pytest.mark.slow
+@pytest.mark.benchmark
 def test_run_memory_ablation_v2_writes_expected_artifact(tmp_path):
     artifact_path = tmp_path / "artifacts" / "memory-ablation-v2.json"
 
@@ -36,6 +42,8 @@ def test_run_memory_ablation_v2_writes_expected_artifact(tmp_path):
     assert "memory_hit_rate" in artifact["variants"]["memory_on"]
 
 
+@pytest.mark.slow
+@pytest.mark.benchmark
 def test_run_recovery_ablation_v2_writes_expected_artifact(tmp_path):
     artifact_path = tmp_path / "artifacts" / "recovery-ablation-v2.json"
 
@@ -56,6 +64,8 @@ def test_run_recovery_ablation_v2_writes_expected_artifact(tmp_path):
     }
 
 
+@pytest.mark.slow
+@pytest.mark.benchmark
 def test_write_benchmark_core_report_marks_resume_safe_metrics(tmp_path):
     run_context_ablation_v2(tmp_path / "artifacts" / "context-ablation-v2.json", repetitions=1)
     run_memory_ablation_v2(tmp_path / "artifacts" / "memory-ablation-v2.json", repetitions=1)

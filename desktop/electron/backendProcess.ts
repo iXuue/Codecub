@@ -1,5 +1,4 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -8,8 +7,14 @@ import type { BackendLaunchConfig } from "./backendLaunchConfig.js";
 
 export type BackendProcessEvents = {
   event: [line: string];
-  exit: [code: number | null];
+  exit: [event: BackendExitEvent];
   error: [message: string];
+};
+
+export type BackendExitEvent = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  expected: boolean;
 };
 
 export type BackendCommandResolution = {
@@ -68,8 +73,33 @@ export function resolveBackendCwd(repoRoot: string, fallback = process.resources
   return fallback;
 }
 
+export function backendExitErrorMessage(event: BackendExitEvent): string | null {
+  if (event.expected) {
+    return null;
+  }
+
+  if (event.code !== null) {
+    return `Backend exited with code ${event.code}`;
+  }
+
+  if (event.signal) {
+    return `Backend exited after signal ${event.signal}`;
+  }
+
+  return "Backend exited unexpectedly";
+}
+
+export function encodeAsciiJsonLine(value: unknown): string {
+  const json = JSON.stringify(value);
+  if (!json) {
+    throw new Error("Backend command must be JSON serializable.");
+  }
+  return `${json.replace(/[^\x00-\x7F]/g, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`)}\n`;
+}
+
 export class BackendProcess extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | null = null;
+  private expectedExitChildren = new WeakSet<ChildProcessWithoutNullStreams>();
   private stdoutBuffer = "";
   private repoRoot: string;
 
@@ -94,27 +124,31 @@ export class BackendProcess extends EventEmitter {
     const { command, args } = resolveBackendCommand(launchConfig);
     const cwd = resolveBackendCwd(this.repoRoot);
 
-    this.child = spawn(command, args, {
+    const child = spawn(command, args, {
       cwd,
       env: launchConfig.env,
       shell: false,
     });
+    this.child = child;
 
-    this.child.stdout.on("data", (chunk: Buffer) => {
+    child.stdout.on("data", (chunk: Buffer) => {
       this.handleStdout(chunk.toString("utf-8"));
     });
 
-    this.child.stderr.on("data", (chunk: Buffer) => {
+    child.stderr.on("data", (chunk: Buffer) => {
       this.emit("error", chunk.toString("utf-8"));
     });
 
-    this.child.on("error", (error) => {
+    child.on("error", (error) => {
       this.emit("error", error.message);
     });
 
-    this.child.on("exit", (code) => {
-      this.emit("exit", code);
-      this.child = null;
+    child.on("exit", (code, signal) => {
+      const expected = this.expectedExitChildren.has(child);
+      this.emit("exit", { code, signal, expected });
+      if (this.child === child) {
+        this.child = null;
+      }
     });
   }
 
@@ -123,17 +157,21 @@ export class BackendProcess extends EventEmitter {
       this.emit("error", "Backend is not running");
       return;
     }
-    const payload =
-      command.type === "send_message" && !command.run_id ? { ...command, run_id: `run_${randomUUID()}` } : command;
-    this.child.stdin.write(`${JSON.stringify(payload)}\n`);
+    this.child.stdin.write(encodeAsciiJsonLine(command), "utf-8");
   }
 
   stop(): void {
     if (!this.child) {
       return;
     }
-    this.child.stdin.write(`${JSON.stringify({ type: "close" })}\n`);
-    this.child.kill();
+    const child = this.child;
+    this.expectedExitChildren.add(child);
+    try {
+      child.stdin.write(encodeAsciiJsonLine({ type: "close" }), "utf-8");
+    } catch {
+      // The process may already be closing; the expected exit marker still suppresses a false error.
+    }
+    child.kill();
     this.child = null;
   }
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { SettingsPage } from "./components/SettingsPage";
 import { ProjectSessionPage } from "./components/ProjectSessionPage";
 import { WelcomePage } from "./components/WelcomePage";
@@ -6,11 +6,13 @@ import { t, type Locale } from "./i18n";
 import { parseBackendEventLine, type BackendEvent } from "./state/backendEvents";
 import { applyApprovalEvent, createInitialApprovalState, markApprovalResolving } from "./state/approvalState";
 import { applyBackendEvent, createChatStateFromSession, createInitialChatState } from "./state/chatState";
+import { applyUsageEvent, createInitialUsageState } from "./state/usageState";
 import type { RecentProject } from "./state/sessionIndex";
 import type { AppSettings, ProjectExtensions, ProjectSessionSummary } from "../electron/ipcTypes";
 
 type View = "welcome" | "session" | "settings";
 type ApprovalPolicy = "ask" | "auto" | "never";
+const defaultAppearance: AppSettings["appearance"] = { themeMode: "dark", accentColor: "#38BDF8" };
 
 export function App() {
   const [locale, setLocale] = useState<Locale>("zh-CN");
@@ -18,8 +20,10 @@ export function App() {
   const [projectPath, setProjectPath] = useState("");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("ask");
   const [providerSettings, setProviderSettings] = useState<AppSettings["provider"] | null>(null);
+  const [appearanceSettings, setAppearanceSettings] = useState<AppSettings["appearance"]>(defaultAppearance);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
   const [projectSessions, setProjectSessions] = useState<ProjectSessionSummary[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState("");
   const [sessionError, setSessionError] = useState("");
   const [extensions, setExtensions] = useState<ProjectExtensions>({ skills: [], plugins: [] });
   const [extensionError, setExtensionError] = useState("");
@@ -27,6 +31,7 @@ export function App() {
   const [chatState, setChatState] = useState(createInitialChatState());
   const [approvalState, setApprovalState] = useState(createInitialApprovalState());
   const [backendError, setBackendError] = useState("");
+  const [usageState, setUsageState] = useState(createInitialUsageState());
   const translate = useMemo(() => (key: Parameters<typeof t>[1]) => t(locale, key), [locale]);
 
   useEffect(() => {
@@ -35,12 +40,17 @@ export function App() {
       setLocale(settings.language);
       setApprovalPolicy(settings.approvalPolicy);
       setProviderSettings(settings.provider);
+      setAppearanceSettings(settings.appearance ?? defaultAppearance);
     });
     const removeEventListener = window.codecub.onBackendEvent((line) => {
       const event = parseBackendEventLine(line);
       setEvents((current) => [...current, event]);
+      if (event.type === "session_started") {
+        setActiveSessionId(event.session_id);
+      }
       setChatState((current) => applyBackendEvent(current, event));
       setApprovalState((current) => applyApprovalEvent(current, event));
+      setUsageState((current) => applyUsageEvent(current, event));
     });
     const removeErrorListener = window.codecub.onBackendError((message) => {
       setBackendError(message);
@@ -91,6 +101,7 @@ export function App() {
     setSessionError("");
     setExtensionError("");
     setEvents([]);
+    setActiveSessionId(resumeSessionId);
     if (resumeSessionId) {
       try {
         setChatState(createChatStateFromSession(await window.codecub.loadProjectSession(nextProjectPath, resumeSessionId)));
@@ -102,6 +113,7 @@ export function App() {
       setChatState(createInitialChatState());
     }
     setApprovalState(createInitialApprovalState());
+    setUsageState(createInitialUsageState());
     setView("session");
     try {
       await window.codecub.startBackend(nextProjectPath, approvalPolicy, resumeSessionId);
@@ -113,6 +125,10 @@ export function App() {
     }
     await refreshProjectSessions(nextProjectPath);
     await refreshProjectExtensions(nextProjectPath);
+  }
+
+  async function openSettings() {
+    setView("settings");
   }
 
   async function openRecentProject(nextProjectPath: string) {
@@ -127,6 +143,29 @@ export function App() {
       return;
     }
     await enterProject(projectPath, sessionId);
+  }
+
+  async function createSession() {
+    if (!projectPath || chatState.isRunning) {
+      return;
+    }
+    const session = await window.codecub.createProjectSession(projectPath);
+    await enterProject(projectPath, session.id);
+  }
+
+  async function deleteSession(sessionId: string) {
+    if (!projectPath || chatState.isRunning) {
+      return;
+    }
+    if (!window.confirm(translate("deleteChatConfirm"))) {
+      return;
+    }
+    await window.codecub.deleteProjectSession(projectPath, sessionId);
+    if (sessionId === activeSessionId) {
+      await enterProject(projectPath);
+      return;
+    }
+    await refreshProjectSessions(projectPath);
   }
 
   async function sendMessage(message: string) {
@@ -187,8 +226,18 @@ export function App() {
     await refreshProjectExtensions(projectPath);
   }
 
+  const themed = (content: ReactNode) => (
+    <div
+      className="theme-root"
+      data-theme={appearanceSettings.themeMode}
+      style={{ "--color-accent-user": appearanceSettings.accentColor } as CSSProperties}
+    >
+      {content}
+    </div>
+  );
+
   if (view === "settings") {
-    return (
+    return themed(
       <SettingsPage
         locale={locale}
         setLocale={setLocale}
@@ -196,14 +245,16 @@ export function App() {
         setApprovalPolicy={setApprovalPolicy}
         providerSettings={providerSettings}
         setProviderSettings={setProviderSettings}
+        appearanceSettings={appearanceSettings}
+        setAppearanceSettings={setAppearanceSettings}
         t={translate}
         onBack={() => setView(projectPath ? "session" : "welcome")}
-      />
+      />,
     );
   }
 
   if (view === "session") {
-    return (
+    return themed(
       <ProjectSessionPage
         t={translate}
         projectPath={projectPath}
@@ -211,10 +262,12 @@ export function App() {
         chatState={chatState}
         approvalState={approvalState}
         projectSessions={projectSessions}
+        activeSessionId={activeSessionId}
         sessionError={sessionError}
         extensions={extensions}
         extensionError={extensionError}
         backendError={backendError}
+        usageState={usageState}
         onSend={sendMessage}
         onStop={stopRun}
         onApprove={approveOperation}
@@ -222,21 +275,24 @@ export function App() {
         onImportLegacy={importLegacyPico}
         onRefreshSessions={() => refreshProjectSessions()}
         onResumeSession={resumeSession}
+        onCreateSession={createSession}
+        onDeleteSession={deleteSession}
         onRefreshExtensions={() => refreshProjectExtensions()}
         onInstallSkill={installSkill}
         onInstallPlugin={installPlugin}
-        onSettings={() => setView("settings")}
-      />
+        onSettings={openSettings}
+        onBackHome={() => setView("welcome")}
+      />,
     );
   }
 
-  return (
+  return themed(
     <WelcomePage
       t={translate}
       recentProjects={recentProjects}
       onOpenProject={openProject}
       onOpenRecentProject={openRecentProject}
-      onSettings={() => setView("settings")}
-    />
+      onSettings={openSettings}
+    />,
   );
 }

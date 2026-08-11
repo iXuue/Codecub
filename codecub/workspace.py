@@ -4,6 +4,7 @@
 这份快照刻意保持小而稳定：主要包含 Git 事实和少量白名单项目文档。
 """
 
+import os
 import subprocess
 import textwrap
 import hashlib
@@ -17,6 +18,7 @@ MAX_HISTORY = 12000
 # 我们不会预加载整个仓库，只会先给模型一小份“导航包”。
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
 IGNORED_PATH_NAMES = {".git", ".pico", ".codecub", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+GIT_TIMEOUT_SECONDS = 3
 
 
 def now():
@@ -41,6 +43,63 @@ def middle(text, limit):
     return text[:left] + "..." + text[-right:]
 
 
+def _find_git_marker_root(cwd):
+    current = Path(cwd).resolve()
+    for base in (current, *current.parents):
+        if (base / ".git").exists():
+            return base
+    return None
+
+
+def _kill_process(process):
+    try:
+        process.kill()
+    except Exception:
+        return
+    try:
+        process.communicate(timeout=1)
+    except Exception:
+        pass
+
+
+def _run_git(cwd, args, fallback=""):
+    command = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        *args,
+    ]
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    popen_kwargs = {
+        "cwd": str(cwd),
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
+        "env": env,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+        stdout, _stderr = process.communicate(timeout=GIT_TIMEOUT_SECONDS)
+        if process.returncode != 0:
+            return fallback
+        if isinstance(stdout, bytes):
+            text = stdout.decode("utf-8", errors="replace")
+        else:
+            text = str(stdout)
+        return text.strip() or fallback
+    except subprocess.TimeoutExpired:
+        _kill_process(process)
+        return fallback
+    except Exception:
+        return fallback
+
+
 class WorkspaceContext:
     def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits, project_docs):
         self.cwd = cwd
@@ -54,29 +113,18 @@ class WorkspaceContext:
     @classmethod
     def build(cls, cwd, repo_root_override=None):
         cwd = Path(cwd).resolve()
+        git_root_hint = Path(repo_root_override).resolve() if repo_root_override is not None else _find_git_marker_root(cwd)
+        has_git = git_root_hint is not None
 
         def git(args, fallback=""):
-            try:
-                result = subprocess.run(
-                    ["git", *args],
-                    cwd=cwd,
-                    capture_output=True,
-                    check=True,
-                    timeout=5,
-                )
-                stdout = result.stdout
-                if isinstance(stdout, bytes):
-                    text = stdout.decode("utf-8", errors="replace")
-                else:
-                    text = str(stdout)
-                return text.strip() or fallback
-            except Exception:
+            if not has_git:
                 return fallback
+            return _run_git(cwd, args, fallback)
 
         repo_root = (
             Path(repo_root_override).resolve()
             if repo_root_override is not None
-            else Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
+            else Path(git(["rev-parse", "--show-toplevel"], str(git_root_hint or cwd))).resolve()
         )
         docs = {}
         # 同时扫描 repo_root 和 cwd，这样在子目录启动时也能看到本地文档；
@@ -86,7 +134,10 @@ class WorkspaceContext:
                 path = base / name
                 if not path.exists():
                     continue
-                key = str(path.relative_to(repo_root))
+                try:
+                    key = str(path.relative_to(repo_root))
+                except ValueError:
+                    key = str(path)
                 if key in docs:
                     continue
                 docs[key] = clip(path.read_text(encoding="utf-8", errors="replace"), 1200)

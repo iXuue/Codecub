@@ -193,6 +193,17 @@ def test_bound_tool_methods_delegate_into_tools_module(tmp_path):
     fake_delegate.assert_called_once()
 
 
+def test_search_decodes_rg_output_as_utf8_with_replacement(tmp_path):
+    agent = build_agent(tmp_path, [], approval_policy="auto")
+
+    with patch("codecub.tools.shutil.which", return_value="rg"), patch("codecub.tools.subprocess.run") as fake_run:
+        fake_run.return_value = type("Result", (), {"stdout": "memory: \ufffd\n", "stderr": ""})()
+        assert "memory" in agent.tool_search({"pattern": "memory", "path": "."})
+
+    assert fake_run.call_args.kwargs["encoding"] == "utf-8"
+    assert fake_run.call_args.kwargs["errors"] == "replace"
+
+
 def test_delegate_depth_limit_is_enforced(tmp_path):
     agent = build_agent(tmp_path, [], depth=1, max_depth=1)
 

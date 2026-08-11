@@ -13,7 +13,7 @@ describe("model API secret safety", () => {
         host: "http://127.0.0.1:11434",
         credential: {
           configured: true,
-          source: "secure-store",
+          source: "global-file",
           displayHint: "saved ending cret",
         },
       },

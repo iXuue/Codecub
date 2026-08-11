@@ -30,6 +30,7 @@ desktop/node_modules/
 desktop/dist-electron/
 desktop/dist-renderer/
 desktop/.electron-cache/
+desktop/.package-preserve/
 desktop/release/
 desktop/resources/backend/
 
@@ -42,6 +43,9 @@ desktop/resources/backend/
 *~
 
 # Local scratch space
+.env
+.env.*
+!.env.example
 tmp/
 .worktrees/
 .pico/

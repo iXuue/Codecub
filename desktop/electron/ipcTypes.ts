@@ -1,8 +1,8 @@
-export type ModelProvider = "openai" | "anthropic" | "ollama";
+export type ModelProvider = "openai" | "deepseek" | "kimi" | "minimax" | "anthropic" | "ollama";
 
 export type CredentialStatus = {
   configured: boolean;
-  source: "secure-store" | "environment" | "none";
+  source: "global-file" | "secure-store" | "environment" | "project-env" | "none";
   displayHint: string;
 };
 
@@ -12,6 +12,16 @@ export type ProviderSettings = {
   baseUrl: string;
   host: string;
   credential: CredentialStatus;
+  connectionProfileId?: string;
+  connectionType?: "direct" | "relay" | "local" | "custom";
+  apiOperator?: string;
+  modelVendor?: string;
+  protocol?: string;
+  responseSchema?: string;
+  credentialId?: string;
+  verificationStatus?: "verified" | "unverified";
+  endpointVerificationStatus?: "verified" | "unverified";
+  usageSchemaVerificationStatus?: "verified" | "unverified";
 };
 
 export type SaveProviderSettingsRequest = {
@@ -21,12 +31,28 @@ export type SaveProviderSettingsRequest = {
   host: string;
   apiKey?: string;
   clearApiKey?: boolean;
+  connectionProfileId?: string;
+  connectionType?: "direct" | "relay" | "local" | "custom";
+  apiOperator?: string;
+  modelVendor?: string;
+  protocol?: string;
+  responseSchema?: string;
+  credentialId?: string;
+  verificationStatus?: "verified" | "unverified";
+  endpointVerificationStatus?: "verified" | "unverified";
+  usageSchemaVerificationStatus?: "verified" | "unverified";
+};
+
+export type AppearanceSettings = {
+  themeMode: "dark" | "light";
+  accentColor: string;
 };
 
 export type AppSettings = {
   language: "zh-CN" | "en-US";
   approvalPolicy: "ask" | "auto" | "never";
   provider: ProviderSettings;
+  appearance: AppearanceSettings;
 };
 
 export type OpenProjectResult = {
@@ -43,6 +69,7 @@ export type RecentProject = {
 
 export type ProjectSessionSummary = {
   id: string;
+  title: string;
   createdAt: string;
   updatedAt: string;
   messageCount: number;
@@ -58,6 +85,15 @@ export type ProjectSessionMessage = {
 export type ProjectSessionDetail = {
   id: string;
   messages: ProjectSessionMessage[];
+};
+
+export type CreateProjectSessionResult = {
+  id: string;
+  createdAt: string;
+};
+
+export type DeleteProjectSessionResult = {
+  deleted: boolean;
 };
 
 export type ExtensionKind = "skill" | "plugin";

@@ -2,9 +2,10 @@ import { contextBridge, ipcRenderer } from "electron";
 import type {
   AppSettings,
   BackendCommand,
+  CreateProjectSessionResult,
+  DeleteProjectSessionResult,
   GitStatus,
   InstallProjectExtensionResult,
-  ModelProvider,
   OpenProjectResult,
   ProjectExtensions,
   ProjectSessionDetail,
@@ -28,13 +29,17 @@ const api = {
   saveSettings: (settings: AppSettings): Promise<AppSettings> => ipcRenderer.invoke("settings:save", settings),
   saveProviderSettings: (request: SaveProviderSettingsRequest): Promise<AppSettings> =>
     ipcRenderer.invoke("settings:provider-save", request),
-  clearProviderCredential: (provider: ModelProvider): Promise<AppSettings> =>
-    ipcRenderer.invoke("settings:provider-clear-credential", provider),
+  clearProviderCredential: (credentialId: string): Promise<AppSettings> =>
+    ipcRenderer.invoke("settings:provider-clear-credential", credentialId),
   loadRecentProjects: (): Promise<RecentProject[]> => ipcRenderer.invoke("projects:recent"),
   listProjectSessions: (projectPath: string): Promise<ProjectSessionSummary[]> =>
     ipcRenderer.invoke("sessions:list", projectPath),
+  createProjectSession: (projectPath: string): Promise<CreateProjectSessionResult> =>
+    ipcRenderer.invoke("sessions:create", projectPath),
   loadProjectSession: (projectPath: string, sessionId: string): Promise<ProjectSessionDetail> =>
     ipcRenderer.invoke("sessions:load", projectPath, sessionId),
+  deleteProjectSession: (projectPath: string, sessionId: string): Promise<DeleteProjectSessionResult> =>
+    ipcRenderer.invoke("sessions:delete", projectPath, sessionId),
   listProjectExtensions: (projectPath: string): Promise<ProjectExtensions> =>
     ipcRenderer.invoke("extensions:list", projectPath),
   installProjectSkill: (projectPath: string): Promise<InstallProjectExtensionResult> =>
@@ -46,6 +51,9 @@ const api = {
   writeTerminal: (request: TerminalWriteRequest): Promise<void> => ipcRenderer.invoke("terminal:write", request),
   resizeTerminal: (request: TerminalResizeRequest): Promise<void> => ipcRenderer.invoke("terminal:resize", request),
   closeTerminal: (terminalId: string): Promise<void> => ipcRenderer.invoke("terminal:close", terminalId),
+  minimizeWindow: (): Promise<void> => ipcRenderer.invoke("window:minimize"),
+  toggleMaximizeWindow: (): Promise<void> => ipcRenderer.invoke("window:toggle-maximize"),
+  closeWindow: (): Promise<void> => ipcRenderer.invoke("window:close"),
   onTerminalData: (callback: (terminalId: string, data: string) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, terminalId: string, data: string) => callback(terminalId, data);
     ipcRenderer.on("terminal:data", listener);

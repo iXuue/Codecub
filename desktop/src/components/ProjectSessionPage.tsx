@@ -1,8 +1,11 @@
+import { useRef } from "react";
 import type { I18nKey } from "../i18n";
 import type { BackendEvent } from "../state/backendEvents";
 import type { ApprovalState } from "../state/approvalState";
 import type { ChatState } from "../state/chatState";
 import type { ProjectExtensions, ProjectSessionSummary } from "../../electron/ipcTypes";
+import type { UsageState } from "../state/usageState";
+import { gsap, motionAllowed, useGSAP } from "../motion/gsapSetup";
 import { ChatView } from "./ChatView";
 import { LegacyImportPrompt } from "./LegacyImportPrompt";
 import { ProjectSidebar } from "./ProjectSidebar";
@@ -17,10 +20,12 @@ type ProjectSessionPageProps = {
   chatState: ChatState;
   approvalState: ApprovalState;
   projectSessions: ProjectSessionSummary[];
+  activeSessionId: string;
   sessionError: string;
   extensions: ProjectExtensions;
   extensionError: string;
   backendError: string;
+  usageState: UsageState;
   onSend: (message: string) => void;
   onStop: () => void;
   onApprove: (approvalId: string, runId: string) => void;
@@ -28,10 +33,13 @@ type ProjectSessionPageProps = {
   onImportLegacy: () => void;
   onRefreshSessions: () => void;
   onResumeSession: (sessionId: string) => void;
+  onCreateSession: () => void;
+  onDeleteSession: (sessionId: string) => void;
   onRefreshExtensions: () => void;
   onInstallSkill: () => void;
   onInstallPlugin: () => void;
   onSettings: () => void;
+  onBackHome: () => void;
 };
 
 export function ProjectSessionPage({
@@ -41,10 +49,12 @@ export function ProjectSessionPage({
   chatState,
   approvalState,
   projectSessions,
+  activeSessionId,
   sessionError,
   extensions,
   extensionError,
   backendError,
+  usageState,
   onSend,
   onStop,
   onApprove,
@@ -52,46 +62,77 @@ export function ProjectSessionPage({
   onImportLegacy,
   onRefreshSessions,
   onResumeSession,
+  onCreateSession,
+  onDeleteSession,
   onRefreshExtensions,
   onInstallSkill,
   onInstallPlugin,
   onSettings,
+  onBackHome,
 }: ProjectSessionPageProps) {
+  const layoutRef = useRef<HTMLDivElement | null>(null);
+  const projectName = projectPath.split(/[\\/]+/).filter(Boolean).at(-1) ?? projectPath;
+
+  useGSAP(
+    () => {
+      if (!motionAllowed()) {
+        return;
+      }
+      gsap.from(".workspace-column", {
+        autoAlpha: 0,
+        y: 14,
+        duration: 0.42,
+        ease: "power2.out",
+        stagger: 0.06,
+      });
+    },
+    { scope: layoutRef },
+  );
+
   return (
     <div className="app-shell">
-      <Toolbar t={t} projectPath={projectPath} onSettings={onSettings} />
-      <div className="workspace-layout workspace-layout-polished">
+      <Toolbar t={t} projectPath={projectPath} onSettings={onSettings} onBack={onBackHome} backLabel={t("home")} />
+      <div className="workspace-layout workspace-layout-polished" ref={layoutRef}>
         <ProjectSidebar
           t={t}
           projectPath={projectPath}
           projectSessions={projectSessions}
+          activeSessionId={activeSessionId}
           sessionError={sessionError}
           extensions={extensions}
           extensionError={extensionError}
           onRefreshSessions={onRefreshSessions}
           onResumeSession={onResumeSession}
+          onCreateSession={onCreateSession}
+          onDeleteSession={onDeleteSession}
           onRefreshExtensions={onRefreshExtensions}
           onInstallSkill={onInstallSkill}
           onInstallPlugin={onInstallPlugin}
         />
-        <main className="workspace-main" aria-label={t("workbench")}>
+        <main className="workspace-main workspace-column" aria-label={t("workbench")}>
           <div className="project-strip">
-            <span>{t("project")}</span>
-            <strong>{projectPath}</strong>
-            <span className={chatState.isRunning ? "status running" : "status"}>{chatState.isRunning ? t("running") : t("ready")}</span>
+            <div className="project-strip-main">
+              <span>{t("workbench")}</span>
+              <strong>{projectName}</strong>
+              <small>{projectPath}</small>
+            </div>
+            <span className={chatState.isRunning ? "status running" : "status"}>
+              <span className="status-dot" />
+              {chatState.isRunning ? t("running") : t("ready")}
+            </span>
           </div>
           {backendError ? <div className="error-banner">{backendError}</div> : null}
           <LegacyImportPrompt t={t} events={events} onImport={onImportLegacy} />
-          <ChatView t={t} chatState={chatState} onSend={onSend} onStop={onStop} />
+          <ChatView t={t} chatState={chatState} events={events} activeSessionId={activeSessionId} onSend={onSend} onStop={onStop} />
           <TerminalPanel t={t} projectPath={projectPath} />
         </main>
         <RunInspectorPanel
           t={t}
           events={events}
-          chatState={chatState}
           approvalState={approvalState}
           onApprove={onApprove}
           onReject={onReject}
+          usageState={usageState}
         />
       </div>
     </div>

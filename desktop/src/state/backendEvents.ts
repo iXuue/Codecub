@@ -8,6 +8,8 @@ export type BackendEventType =
   | "run_completed"
   | "run_failed"
   | "run_canceled"
+  | "usage_updated"
+  | "usage_snapshot"
   | "tool_result"
   | "approval_requested"
   | "approval_resolved"

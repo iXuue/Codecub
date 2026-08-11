@@ -61,6 +61,14 @@ def test_make_event_accepts_run_status():
     assert event["payload"]["phase"] == "model_streaming"
 
 
+def test_make_event_accepts_usage_events():
+    updated = make_event("usage_updated", session_id="session-1", run_id="run-1", payload={"groups": []})
+    snapshot = make_event("usage_snapshot", session_id="session-1", payload={"scope": "session", "groups": []})
+
+    assert updated["type"] == "usage_updated"
+    assert snapshot["type"] == "usage_snapshot"
+
+
 def test_make_event_rejects_unknown_event_type():
     with pytest.raises(ValueError, match="unknown event type"):
         make_event("unknown_event")
@@ -82,6 +90,22 @@ def test_encode_event_returns_one_json_line():
     decoded = json.loads(line)
     assert decoded["type"] == "run_completed"
     assert decoded["payload"] == {"final": "done"}
+
+
+def test_encode_event_escapes_unicode_for_ascii_safe_transport():
+    line = encode_event(
+        {
+            "type": "user_message_received",
+            "timestamp": "2026-06-11T00:00:00Z",
+            "session_id": "session-1",
+            "run_id": "run-1",
+            "payload": {"message": "查看我的代码"},
+        }
+    )
+
+    assert "查看我的代码" not in line
+    assert line.encode("ascii")
+    assert json.loads(line)["payload"]["message"] == "查看我的代码"
 
 
 def test_parse_send_message_command():

@@ -1,29 +1,51 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
 import type { I18nKey } from "../i18n";
+import type { BackendEvent } from "../state/backendEvents";
 import type { ChatState } from "../state/chatState";
+import { gsap, motionAllowed, useGSAP } from "../motion/gsapSetup";
+import { ChatActivityStream } from "./ChatActivityStream";
 
 type ChatViewProps = {
   t: (key: I18nKey) => string;
   chatState: ChatState;
+  events: BackendEvent[];
+  activeSessionId?: string;
   onSend: (message: string) => void;
   onStop: () => void;
 };
 
-export function ChatView({ t, chatState, onSend, onStop }: ChatViewProps) {
+export function ChatView({ t, chatState, events, activeSessionId = "", onSend, onStop }: ChatViewProps) {
+  const chatRef = useRef<HTMLElement | null>(null);
+  const messageListRef = useRef<HTMLDivElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [draft, setDraft] = useState("");
-  const [now, setNow] = useState(() => Date.now());
+
+  useGSAP(
+    () => {
+      if (!motionAllowed() || chatState.messages.length === 0) {
+        return;
+      }
+      gsap.from(".message:last-child", {
+        autoAlpha: 0,
+        y: 10,
+        duration: 0.22,
+        ease: "power2.out",
+      });
+    },
+    { dependencies: [chatState.messages.length], scope: chatRef, revertOnUpdate: true },
+  );
 
   useEffect(() => {
-    if (!chatState.isRunning) {
+    const list = messageListRef.current;
+    if (!list) {
       return;
     }
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [chatState.isRunning]);
-
-  const status = chatState.runStatus;
-  const startedAtMs = status?.startedAt ? new Date(status.startedAt).getTime() : Number.NaN;
-  const elapsedMs = Number.isFinite(startedAtMs) ? now - startedAtMs : status?.elapsedMs ?? 0;
+    const scroll = () => {
+      list.scrollTop = list.scrollHeight;
+    };
+    const frame = window.requestAnimationFrame(scroll);
+    return () => window.cancelAnimationFrame(frame);
+  }, [chatState.messages.length, events.length, chatState.isRunning, chatState.runStatus?.phase, chatState.runStatus?.updatedAt]);
 
   function submit() {
     const message = draft.trim();
@@ -34,19 +56,26 @@ export function ChatView({ t, chatState, onSend, onStop }: ChatViewProps) {
     onSend(message);
   }
 
+  function focusComposer(event: MouseEvent<HTMLDivElement>) {
+    const target = event.target as HTMLElement;
+    if (target.closest("textarea, button")) {
+      return;
+    }
+    event.preventDefault();
+    textareaRef.current?.focus();
+  }
+
   return (
-    <section className="chat-view" aria-label="Chat">
-      {chatState.isRunning && status ? (
-        <div className="run-status-strip" aria-label={t("activeRunStatus")}>
-          <span className="run-status-dot" />
-          <span className="run-status-label">{status.label || t("running")}</span>
-          {status.detail ? <span className="run-status-detail">{status.detail}</span> : null}
-          <span className="run-status-elapsed">{formatElapsed(elapsedMs)}</span>
-        </div>
-      ) : null}
-      <div className="message-list">
+    <section className="chat-view" aria-label="Chat" ref={chatRef}>
+      <div className="message-list" ref={messageListRef}>
         {chatState.messages.length === 0 ? (
-          <div className="empty-state">{t("emptyChat")}</div>
+          <div className="chat-empty-state">
+            <div className="chat-empty-mark">C</div>
+            <div>
+              <div className="chat-empty-title">{activeSessionId ? t("emptyActiveChatTitle") : t("emptyChatTitle")}</div>
+              <div className="chat-empty-subtitle">{activeSessionId ? t("emptyActiveChat") : t("emptyChat")}</div>
+            </div>
+          </div>
         ) : (
           chatState.messages.map((message) => (
             <article className={`message ${message.role}`} key={message.id}>
@@ -55,9 +84,11 @@ export function ChatView({ t, chatState, onSend, onStop }: ChatViewProps) {
             </article>
           ))
         )}
+        <ChatActivityStream t={t} events={events} chatState={chatState} />
       </div>
-      <div className="composer">
+      <div className="composer" onMouseDown={focusComposer}>
         <textarea
+          ref={textareaRef}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
@@ -77,13 +108,4 @@ export function ChatView({ t, chatState, onSend, onStop }: ChatViewProps) {
       </div>
     </section>
   );
-}
-
-function formatElapsed(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1000));
-  if (seconds < 60) {
-    return `${seconds}s`;
-  }
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${seconds % 60}s`;
 }

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { chooseTerminalShell, TerminalManager } from "../electron/terminal";
+import {
+  buildPowerShellCodecubBootstrap,
+  chooseTerminalShell,
+  resolveTerminalCodecubCommand,
+  TerminalManager,
+} from "../electron/terminal";
 
 describe("chooseTerminalShell", () => {
   it("uses PowerShell on Windows by default", () => {
@@ -13,6 +18,21 @@ describe("chooseTerminalShell", () => {
     const shell = chooseTerminalShell("linux", {});
 
     expect(shell.file).toBe("sh");
+  });
+
+  it("builds a packaged codecub terminal command and PowerShell bootstrap", () => {
+    const command = resolveTerminalCodecubCommand({
+      packaged: true,
+      resourcesPath: "D:/app/resources",
+      exists: (path) => path.endsWith("backend\\codecub-agent.exe"),
+    });
+    const bootstrap = buildPowerShellCodecubBootstrap(command);
+
+    expect(command.command).toBe("D:\\app\\resources\\backend\\codecub-agent.exe");
+    expect(bootstrap).toContain("function global:codecub");
+    expect(bootstrap).toContain("--cwd-b64");
+    expect(bootstrap).toContain("[System.Text.Encoding]::UTF8");
+    expect(bootstrap).toContain("CodeCub terminal ready");
   });
 
   it("emits a terminal error when cwd does not exist", async () => {
