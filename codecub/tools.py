@@ -27,6 +27,21 @@ BASE_TOOL_SPECS = {
         "risky": False,
         "description": "Search the workspace with rg or a simple fallback.",
     },
+    "symbol_search": {
+        "schema": {"query": "str", "path": "str='.'", "kind": "str=''", "limit": "int=20"},
+        "risky": False,
+        "description": "Search Python definitions in the local structural symbol index.",
+    },
+    "file_outline": {
+        "schema": {"path": "str"},
+        "risky": False,
+        "description": "List classes and functions from a Python file index.",
+    },
+    "find_references": {
+        "schema": {"symbol": "str", "path": "str='.'"},
+        "risky": False,
+        "description": "Find syntactic Python call candidates (not semantic LSP references).",
+    },
     "run_shell": {
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
@@ -54,6 +69,9 @@ TOOL_EXAMPLES = {
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
     "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
+    "symbol_search": '<tool>{"name":"symbol_search","args":{"query":"binary_search","path":"."}}</tool>',
+    "file_outline": '<tool>{"name":"file_outline","args":{"path":"codecub/runtime.py"}}</tool>',
+    "find_references": '<tool>{"name":"find_references","args":{"symbol":"binary_search","path":"."}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
@@ -102,6 +120,27 @@ def validate_tool(agent, name, args):
         pattern = str(args.get("pattern", "")).strip()
         if not pattern:
             raise ValueError("pattern must not be empty")
+        agent.path(args.get("path", "."))
+        return
+
+    if name == "symbol_search":
+        if not str(args.get("query", "")).strip():
+            raise ValueError("query must not be empty")
+        agent.path(args.get("path", "."))
+        limit = int(args.get("limit", 20))
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be in [1, 100]")
+        return
+
+    if name == "file_outline":
+        path = agent.path(args["path"])
+        if not path.is_file():
+            raise ValueError("path is not a file")
+        return
+
+    if name == "find_references":
+        if not str(args.get("symbol", "")).strip():
+            raise ValueError("symbol must not be empty")
         agent.path(args.get("path", "."))
         return
 
@@ -206,6 +245,28 @@ def tool_search(agent, args):
     return "\n".join(matches) or "(no matches)"
 
 
+def tool_symbol_search(agent, args):
+    results = agent.code_index.symbol_search(args["query"], args.get("path", "."), args.get("kind", ""), args.get("limit", 20))
+    return "\n".join(
+        f"{item.qualified_name}\n  kind: {item.kind}\n  path: {item.path}\n  lines: {item.start_line}-{item.end_line}"
+        for item in results
+    ) or "(no matches)"
+
+
+def tool_file_outline(agent, args):
+    symbols = agent.code_index.file_outline(args["path"])
+    return "\n".join(
+        f"{'  ' if item.parent else ''}{item.kind} {item.qualified_name}  {item.start_line}-{item.end_line}"
+        for item in symbols
+    ) or "(no symbols indexed)"
+
+
+def tool_find_references(agent, args):
+    references = agent.code_index.find_references(args["symbol"], args.get("path", "."))
+    lines = ["resolution: syntactic"] + [f"{path}:{line}" for path, line in references]
+    return "\n".join(lines) if references else "resolution: syntactic\n(no matches)"
+
+
 def tool_run_shell(agent, args):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -294,6 +355,9 @@ _TOOL_RUNNERS = {
     "list_files": tool_list_files,
     "read_file": tool_read_file,
     "search": tool_search,
+    "symbol_search": tool_symbol_search,
+    "file_outline": tool_file_outline,
+    "find_references": tool_find_references,
     "run_shell": tool_run_shell,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,

@@ -17,6 +17,8 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
+from .code_index import CodeIndex
+from .token_budget import resolve_prompt_budget, resolve_token_counter
 from .run_store import RunStore
 from .telemetry import aggregate_usage_records, build_usage_snapshot
 from .usage_store import UsageStore
@@ -160,6 +162,8 @@ class Pico:
         feature_flags=None,
         approval_handler=None,
         event_handler=None,
+        context_window=None,
+        safety_margin_tokens=256,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -168,6 +172,9 @@ class Pico:
         self.approval_policy = approval_policy
         self.max_steps = max_steps
         self.max_new_tokens = max_new_tokens
+        self.context_window = context_window
+        self.safety_margin_tokens = int(safety_margin_tokens)
+        self.token_counter = getattr(model_client, "token_counter", None) or resolve_token_counter(getattr(model_client, "model", ""))
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
@@ -193,6 +200,8 @@ class Pico:
             workspace_root=self.root,
         )
         self.session["memory"] = self.memory.to_dict()
+        self.code_index = CodeIndex(self.root)
+        self.code_index.refresh()
         self.tools = self.build_tools()
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
@@ -607,6 +616,7 @@ class Pico:
         if status_callback is not None:
             status_callback("building_prompt", "Building prompt", "")
         prompt, metadata = self.context_manager.build(user_message)
+        available_prompt_tokens = resolve_prompt_budget(self.context_window, self.max_new_tokens, self.safety_margin_tokens)
         # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
         # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
         metadata.update(
@@ -630,6 +640,12 @@ class Pico:
                 "stale_summary_invalidations": int(self.resume_state.get("stale_summary_invalidations", 0)),
                 "stale_paths": list(self.resume_state.get("stale_paths", [])),
                 "runtime_identity_mismatch_fields": list(self.resume_state.get("runtime_identity_mismatch_fields", [])),
+                "context_window": self.context_window,
+                "max_new_tokens": int(self.max_new_tokens),
+                "safety_margin_tokens": self.safety_margin_tokens,
+                "available_prompt_tokens": available_prompt_tokens,
+                "token_counter_source": getattr(self.token_counter, "source", "unavailable"),
+                "token_counter_quality": getattr(self.token_counter, "quality", "unavailable"),
             }
         )
         metadata.update(self.detected_secret_env_summary())
@@ -1064,6 +1080,13 @@ class Pico:
                 # 把后端返回的 usage/cache 统计并回 prompt_metadata，
                 # 方便统一写入 report 和 trace。
                 prompt_metadata.update(completion_metadata)
+            estimated_tokens = prompt_metadata.get("estimated_prompt_tokens")
+            actual_tokens = completion_metadata.get("input_tokens")
+            if isinstance(estimated_tokens, int) and isinstance(actual_tokens, int) and actual_tokens > 0:
+                prompt_metadata["actual_input_tokens"] = actual_tokens
+                prompt_metadata["token_estimation_error"] = abs(actual_tokens - estimated_tokens) / actual_tokens
+                if prompt_metadata.get("available_prompt_tokens"):
+                    prompt_metadata["context_utilization"] = estimated_tokens / prompt_metadata["available_prompt_tokens"]
             usage_record = completion_metadata.get("usage_record")
             if isinstance(usage_record, dict):
                 usage_record = dict(usage_record)
@@ -1463,6 +1486,8 @@ class Pico:
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
             }
+            if workspace_changed:
+                self._last_tool_result_metadata["code_index_refresh"] = self.code_index.refresh(affected_paths)
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return result
         except Exception as exc:

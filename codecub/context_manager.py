@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .token_budget import clip_to_budget, resolve_prompt_budget
+
 
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
@@ -74,6 +76,7 @@ class ContextManager:
         self._section_floor_overrides = {str(key): int(value) for key, value in (section_floors or {}).items()}
         self.section_floors = self._compute_section_floors()
         self.reduction_order = tuple(reduction_order or DEFAULT_REDUCTION_ORDER)
+        self.token_counter = getattr(agent, "token_counter", None)
 
     def build(self, user_message):
         """按预算组装一轮完整 prompt。
@@ -115,7 +118,8 @@ class ContextManager:
         if hasattr(self.agent, "render_checkpoint_text"):
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
         if checkpoint_text:
-            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
+            # Checkpoint 是恢复会话的关键信息；前置后即便 prefix 被裁剪也不会丢失。
+            section_texts["prefix"] = checkpoint_text + "\n\n" + section_texts["prefix"]
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
@@ -135,6 +139,14 @@ class ContextManager:
             return prompt, metadata
 
         budgets = dict(self.section_budgets)
+        token_budget = resolve_prompt_budget(
+            getattr(self.agent, "context_window", None),
+            getattr(self.agent, "max_new_tokens", 0),
+            getattr(self.agent, "safety_margin_tokens", 0),
+        ) if self.token_counter is not None else None
+        total_budget = token_budget if token_budget is not None else self.total_budget
+        if token_budget is not None:
+            budgets = self._fit_section_budgets(budgets, total_budget)
         rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
         prompt = self._assemble_prompt(rendered)
         reduction_log = []
@@ -143,8 +155,8 @@ class ContextManager:
         # 这里的顺序体现了平台偏好：
         # 先牺牲 relevant_memory，再牺牲 history，然后才动 memory 和 prefix。
         # 最新用户请求永远不裁剪，因为那是本轮最重要的输入。
-        while len(prompt) > self.total_budget:
-            overflow = len(prompt) - self.total_budget
+        while self._measure(prompt) > total_budget:
+            overflow = self._measure(prompt) - total_budget
             reduced = False
             for section in self.reduction_order:
                 floor = int(self.section_floors.get(section, 0))
@@ -157,9 +169,10 @@ class ContextManager:
                 reduction_log.append(
                     {
                         "section": section,
-                        "before_chars": current_budget,
-                        "after_chars": new_budget,
-                        "overflow_chars": overflow,
+                        "before_budget": current_budget,
+                        "after_budget": new_budget,
+                        "overflow": overflow,
+                        "unit": self._unit(),
                     }
                 )
                 budgets[section] = new_budget
@@ -179,7 +192,25 @@ class ContextManager:
             user_message=user_message,
             section_texts=section_texts,
         )
+        metadata["prompt_budget"] = total_budget
+        metadata["prompt_over_budget"] = self._measure(prompt) > total_budget
+        metadata["current_request_over_budget"] = self._measure(section_texts[CURRENT_REQUEST_SECTION]) > total_budget
         return prompt, metadata
+
+    def _unit(self):
+        return "tokens" if self.token_counter is not None else "chars"
+
+    def _measure(self, text):
+        return self.token_counter.count(text) if self.token_counter is not None else len(text)
+
+    def _clip(self, text, budget):
+        return clip_to_budget(text, budget, self.token_counter) if self.token_counter is not None else _tail_clip(text, budget)
+
+    def _fit_section_budgets(self, budgets, total):
+        section_total = sum(int(value) for value in budgets.values())
+        if section_total <= total:
+            return budgets
+        return {section: max(1, int(value * total / section_total)) for section, value in budgets.items()}
 
     def _render_sections_without_reduction(self, section_texts, selected_notes=None):
         selected_notes = selected_notes or []
@@ -236,7 +267,7 @@ class ContextManager:
                 rendered[section] = self._render_history_section(int(budget or 0))
             else:
                 raw = section_texts[section]
-                rendered_text = _tail_clip(raw, int(budget)) if budget is not None else raw
+                rendered_text = self._clip(raw, int(budget)) if budget is not None else raw
                 rendered[section] = SectionRender(raw=raw, budget=int(budget) if budget is not None else 0, rendered=rendered_text, details={})
         return rendered
 
@@ -264,14 +295,14 @@ class ContextManager:
         rendered_notes = []
         while True:
             # 让每条 note 平分这一段的预算，避免一条超长笔记把其他笔记都挤掉。
-            rendered_notes = [_tail_clip(text, per_note_budget) for text in note_texts]
+            rendered_notes = [self._clip(text, per_note_budget) for text in note_texts]
             rendered = "\n".join([header] + [f"- {text}" for text in rendered_notes])
-            if len(rendered) <= budget or per_note_budget <= 1:
+            if self._measure(rendered) <= budget or per_note_budget <= 1:
                 break
             per_note_budget -= 1
 
-        if len(rendered) > budget and budget > 0:
-            rendered = _tail_clip(raw, budget)
+        if self._measure(rendered) > budget and budget > 0:
+            rendered = self._clip(raw, budget)
             rendered_notes = [rendered]
 
         return SectionRender(
@@ -322,7 +353,7 @@ class ContextManager:
             candidate_lines = list(entry.get("lines", []))
             candidate_entries = candidate_lines + rendered_entries
             candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-            if len(candidate_rendered) <= budget:
+            if self._measure(candidate_rendered) <= budget:
                 rendered_entries = candidate_entries
                 continue
             if recent:
@@ -330,21 +361,21 @@ class ContextManager:
                 if rendered_entries:
                     available -= sum(len(line) + 1 for line in rendered_entries)
                 available = max(20, available - 1)
-                candidate_lines = [_tail_clip(line, available) for line in candidate_lines]
+                candidate_lines = [self._clip(line, available) for line in candidate_lines]
                 candidate_entries = candidate_lines + rendered_entries
                 candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-                if len(candidate_rendered) <= budget:
+                if self._measure(candidate_rendered) <= budget:
                     rendered_entries = candidate_entries
             else:
-                smaller_lines = [_tail_clip(line, 20) for line in candidate_lines]
+                smaller_lines = [self._clip(line, 20) for line in candidate_lines]
                 smaller_entries = smaller_lines + rendered_entries
                 smaller_rendered = "\n".join(["Transcript:", *smaller_entries])
-                if len(smaller_rendered) <= budget:
+                if self._measure(smaller_rendered) <= budget:
                     rendered_entries = smaller_entries
         rendered = "\n".join(["Transcript:", *rendered_entries])
 
-        if len(rendered) > budget and budget > 0:
-            rendered = _tail_clip(raw, budget)
+        if self._measure(rendered) > budget and budget > 0:
+            rendered = self._clip(raw, budget)
 
         return SectionRender(
             raw=raw,
@@ -470,6 +501,10 @@ class ContextManager:
             "prompt_chars": len(prompt),
             "prompt_budget_chars": self.total_budget,
             "prompt_over_budget": len(prompt) > self.total_budget,
+            "budget_mode": "token" if self.token_counter is not None else "char",
+            "budget_unit": self._unit(),
+            "estimated_prompt_tokens": self._measure(prompt) if self.token_counter is not None else None,
+            "prompt_tokens": self._measure(prompt) if self.token_counter is not None else None,
             "section_order": list(SECTION_ORDER),
             "section_budgets": {
                 section: (None if section == CURRENT_REQUEST_SECTION else int(budgets.get(section, 0)))

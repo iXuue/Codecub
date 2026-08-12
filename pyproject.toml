@@ -9,6 +9,11 @@ description = "CodeCub local desktop-first coding agent backend"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+tokenizers = [
+  "tiktoken>=0.8.0",
+]
+
 [project.scripts]
 codecub = "codecub.cli:main"
 
