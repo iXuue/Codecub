@@ -44,7 +44,7 @@ describe("app settings sanitization", () => {
       provider: {
         ...defaultSettings.provider,
         provider: "deepseek",
-        model: "deepseek-chat",
+        model: "deepseek-v4-flash",
         baseUrl: "https://api.deepseek.com",
         credential: { configured: true, source: "global-file", displayHint: "saved ending 0790" },
       },

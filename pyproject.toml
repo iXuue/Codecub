@@ -29,6 +29,8 @@ packages = ["codecub"]
 
 [tool.pytest.ini_options]
 addopts = "-m 'not slow and not benchmark'"
+testpaths = ["tests"]
+norecursedirs = ["artifacts"]
 markers = [
   "slow: long-running tests excluded from the default pytest run",
   "benchmark: benchmark and metrics tests excluded from the default pytest run",

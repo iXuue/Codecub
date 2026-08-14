@@ -10,7 +10,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "--suite",
-        choices=("real-agent", "context", "memory", "recovery"),
+        choices=("development", "real-agent", "context", "memory", "recovery"),
         required=True,
     )
     parser.add_argument(

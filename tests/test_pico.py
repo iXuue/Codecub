@@ -23,6 +23,8 @@ from codecub import (
     build_welcome,
 )
 from codecub.cli import HELP_DETAILS, build_arg_parser, decode_cwd_arg
+from codecub.experiments.tasks import tasks_for_suite
+from codecub import task_policy
 
 
 def build_workspace(tmp_path):
@@ -49,6 +51,173 @@ def test_default_max_steps_is_80(tmp_path):
 
     assert agent.max_steps == 80
     assert args.max_steps == 80
+
+
+def test_allowed_tools_filter_prompt_visibility_but_runtime_still_rejects(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [],
+        allowed_tools=("read_file", "patch_file"),
+    )
+
+    assert set(agent.tools) == {"read_file", "patch_file"}
+    assert "list_files(" not in agent.prefix
+    assert '<tool name="write_file"' not in agent.prefix
+    assert agent.run_tool("list_files", {"path": "."}).startswith("error: unknown tool")
+
+
+def test_semantic_repeat_helpers_distinguish_overlap_and_fresh_ranges():
+    first = {"path": "A.py", "start": 1, "end": 200}
+    overlapping = {"path": "./a.py", "start": 20, "end": 200}
+    next_page = {"path": "a.py", "start": 201, "end": 400}
+
+    assert task_policy.is_semantic_repeat("read_file", overlapping, "read_file", first)
+    assert not task_policy.is_semantic_repeat("read_file", next_page, "read_file", first)
+    assert task_policy.is_semantic_repeat(
+        "search", {"path": "./codecub", "pattern": "Feature   Flags"},
+        "search", {"path": "codecub", "pattern": "feature flags"},
+    )
+    assert task_policy.normalize_shell_command({"command": "  PYTHON   -m pytest  -q "}) == "python -m pytest -q"
+
+
+def test_exploration_warning_is_generic_and_patch_resets_counter(tmp_path):
+    (tmp_path / "hello.txt").write_text("alpha\n", encoding="utf-8")
+    outputs = [
+        f'<tool>{{"name":"search","args":{{"path":".","pattern":"term{index}"}}}}</tool>'
+        for index in range(6)
+    ] + [
+        '<tool>{"name":"patch_file","args":{"path":"hello.txt","old_text":"alpha","new_text":"beta"}}</tool>',
+        "<final>Done.</final>",
+    ]
+    agent = build_agent(tmp_path, outputs)
+
+    assert agent.ask("Repair the file") == "Done."
+    trace = [
+        json.loads(line)
+        for line in (tmp_path / ".codecub" / "runs").glob("*/trace.jsonl").__next__().read_text(encoding="utf-8").splitlines()
+    ]
+    warning = next(event for event in trace if event["event"] == "exploration_warning")
+    report = json.loads(next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(encoding="utf-8"))
+
+    assert "runtime.py" not in json.dumps(warning)
+    assert report["planning"]["first_action_step"] == 7
+    assert report["planning"]["exploration_steps_before_first_action"] == 6
+
+
+def test_modification_contract_tracks_change_epochs_and_shell_verification(tmp_path):
+    (tmp_path / "hello.txt").write_text("alpha\n", encoding="utf-8")
+    command = "python -c \"print('ok')\""
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"patch_file","args":{"path":"hello.txt","old_text":"alpha","new_text":"beta"}}</tool>',
+            f'<tool>{{"name":"run_shell","args":{{"command":{json.dumps(command)}}}}}</tool>',
+            f'<tool>{{"name":"run_shell","args":{{"command":{json.dumps(command)}}}}}</tool>',
+            '<tool>{"name":"patch_file","args":{"path":"hello.txt","old_text":"beta","new_text":"gamma"}}</tool>',
+            f'<tool>{{"name":"run_shell","args":{{"command":{json.dumps(command)}}}}}</tool>',
+            "<final>Done.</final>",
+        ],
+        requires_workspace_change=True,
+    )
+
+    assert "requires an actual workspace modification" in agent.prefix
+    assert agent.ask("Repair the workspace") == "Done."
+    report = json.loads(next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(encoding="utf-8"))
+    planning = report["planning"]
+    assert planning["workspace_change_count"] == 2
+    assert planning["first_workspace_change_step"] == 1
+    assert planning["first_execution_step"] == 2
+    assert planning["first_verification_after_change_step"] == 2
+    assert planning["verification_steps"] == 3
+    assert planning["redundant_verification_steps"] == 1
+    assert planning["productive_verification_steps"] == 2
+
+
+def test_implementation_warning_requires_contract_and_two_shells(tmp_path):
+    command_one = "python -c \"print('one')\""
+    command_two = "python -c \"print('two')\""
+    agent = build_agent(
+        tmp_path,
+        [
+            f'<tool>{{"name":"run_shell","args":{{"command":{json.dumps(command_one)}}}}}</tool>',
+            f'<tool>{{"name":"run_shell","args":{{"command":{json.dumps(command_two)}}}}}</tool>',
+            "<final>Stopped.</final>",
+        ],
+        requires_workspace_change=True,
+    )
+
+    agent.ask("Repair the workspace")
+    trace_path = next((tmp_path / ".codecub" / "runs").glob("*/trace.jsonl"))
+    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    report = json.loads(next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(encoding="utf-8"))
+    assert sum(event["event"] == "implementation_warning" for event in events) == 1
+    assert report["planning"]["verification_before_first_action"] == 2
+    assert report["planning"]["implementation_warning_count"] == 1
+
+    ordinary_path = tmp_path / "ordinary"
+    ordinary_path.mkdir()
+    ordinary = build_agent(ordinary_path, [], requires_workspace_change=False)
+    ordinary.current_planning = ordinary.new_planning_state()
+    ordinary.current_planning["verification_steps"] = 2
+    assert ordinary.maybe_emit_implementation_warning(None) is False
+
+
+def test_evidence_ledger_marks_visible_overlap_as_avoidable_and_softly_reminds(tmp_path):
+    (tmp_path / "evidence.py").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"path":"evidence.py","start":1,"end":3}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"evidence.py","start":1,"end":3}}</tool>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    assert agent.ask("Inspect evidence.py") == "Done."
+    run_dir = next((tmp_path / ".codecub" / "runs").glob("*"))
+    trace = [json.loads(line) for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    reads = [event for event in trace if event["event"] == "tool_executed" and event["name"] == "read_file"]
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+
+    assert reads[1]["read_evidence_classification"] == "avoidable_repeated_read"
+    assert "substantially overlaps source code" in reads[1]["result"]
+    assert "evidence.py" not in reads[1]["result"].split("Runtime notice:", 1)[1].split("\n", 1)[0]
+    assert report["planning"]["avoidable_repeated_read_calls"] == 1
+    assert report["planning"]["evidence_evicted_reread_calls"] == 0
+    prompts = [event["prompt_metadata"] for event in trace if event["event"] == "prompt_built"]
+    assert prompts[1]["inspected_evidence"]["visible_entry_count"] == 1
+
+
+def test_evidence_ledger_distinguishes_eviction_freshness_and_new_ranges(tmp_path):
+    (tmp_path / "evidence.py").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+    agent.current_planning = agent.new_planning_state()
+    agent.record_read_evidence({"path": "evidence.py", "start": 1, "end": 3}, "# evidence.py\n1: alpha", 1)
+    entry = agent.evidence_ledger_entries()[0]
+    agent.last_prompt_metadata = {"inspected_evidence": {"entries": [{**entry, "visible": False}]}}
+
+    assert agent.assess_read_evidence({"path": "evidence.py", "start": 1, "end": 3})[0] == "evidence_evicted_reread"
+    assert agent.assess_read_evidence({"path": "evidence.py", "start": 4, "end": 6})[0] == "new"
+    (tmp_path / "evidence.py").write_text("changed\n", encoding="utf-8")
+    assert agent.assess_read_evidence({"path": "evidence.py", "start": 1, "end": 3})[0] == "new"
+
+
+def test_evidence_ledger_is_bounded_and_redacts_compact_hints(tmp_path):
+    (tmp_path / "evidence.py").write_text("alpha\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+    agent.current_planning = agent.new_planning_state()
+    for step in range(1, 9):
+        agent.record_read_evidence(
+            {"path": "evidence.py", "start": step, "end": step},
+            f"# evidence.py\n{step}: API_KEY=not-a-real-secret-{step}",
+            step,
+        )
+
+    ledger = agent.evidence_ledger_entries()
+    assert len(ledger) == 6
+    assert agent.current_planning["evidence_eviction_count"] == 2
+    assert all("not-a-real-secret" not in entry["hint"] for entry in ledger)
+    assert len(agent.evidence_ledger_text()) < 2200
 
 
 def test_agent_runs_tool_then_final(tmp_path):
@@ -313,6 +482,115 @@ def test_patch_file_replaces_exact_match(tmp_path):
 
     assert result == "patched sample.txt"
     assert file_path.read_text(encoding="utf-8") == "hello agent\n"
+
+
+def test_patch_contract_parser_and_rejections_preserve_multiline_arguments(tmp_path):
+    agent = build_agent(tmp_path, [], allowed_tools=("read_file", "patch_file"))
+    target = tmp_path / "sample.py"
+    target.write_text("alpha = '<&>'\nbeta = 1\nalpha = '<&>'\nbeta = 1\n", encoding="utf-8")
+    xml = (
+        '<tool name="patch_file" path="sample.py"><old_text>alpha = \'<&>\'\nbeta = 1\n'
+        "</old_text><new_text>alpha = 'fixed'\nbeta = 2\n</new_text></tool>"
+    )
+    parsed = MiniAgent.parse(xml)
+    assert parsed == (
+        "tool",
+        {"name": "patch_file", "args": {"path": "sample.py", "old_text": "alpha = '<&>'\nbeta = 1\n", "new_text": "alpha = 'fixed'\nbeta = 2\n"}},
+    )
+    assert "occur exactly once, found 2" in agent.run_tool("patch_file", parsed[1]["args"])
+    assert "occur exactly once, found 0" in agent.run_tool(
+        "patch_file", {"path": "sample.py", "old_text": "missing", "new_text": "x"}
+    )
+    assert "missing new_text" in agent.run_tool("patch_file", {"path": "sample.py", "old_text": "beta = 1"})
+    assert "path escapes workspace" in agent.run_tool(
+        "patch_file", {"path": "../outside.py", "old_text": "x", "new_text": "y"}
+    )
+    assert agent.run_tool("write_file", {"path": "blocked.py", "content": "x"}).startswith("error: unknown tool")
+    json_call = (
+        '<tool>{"name":"patch_file","args":{"path":"sample.py",'
+        '"old_text":"alpha = \'<&>\'\\nbeta = 1\\n",'
+        '"new_text":"alpha = \'fixed\'\\nbeta = 2\\n"}}</tool>'
+    )
+    assert MiniAgent.parse(json_call)[1]["args"] == {
+        "path": "sample.py",
+        "old_text": "alpha = '<&>'\nbeta = 1\n",
+        "new_text": "alpha = 'fixed'\nbeta = 2\n",
+    }
+
+
+def test_patch_contract_prompt_and_read_only_feedback_are_consistent(tmp_path):
+    agent = build_agent(tmp_path, [], allowed_tools=("patch_file",))
+    assert "<old_text>...</old_text><new_text>...</new_text>" in agent.prefix
+    assert "<content>...</content>" not in agent.prefix
+    (tmp_path / "sample.txt").write_text("old", encoding="utf-8")
+    read_only = build_agent(tmp_path, [], read_only=True)
+    result = read_only.run_tool(
+        "patch_file", {"path": "sample.txt", "old_text": "old", "new_text": "new"}
+    )
+    assert result == "error: approval denied for patch_file"
+    assert read_only._last_tool_result_metadata["security_event_type"] == "read_only_block"
+
+
+def test_workspace_change_prompt_contract_is_explicit_and_scoped(tmp_path):
+    modify_agent = build_agent(tmp_path, [], requires_workspace_change=True)
+    inspect_agent = build_agent(tmp_path, [], requires_workspace_change=False)
+
+    assert "Analysis, repository inspection, and test execution alone do not complete it." in modify_agent.prefix
+    assert "actual workspace modification" in modify_agent.prefix
+    assert "actual workspace modification" not in inspect_agent.prefix
+
+
+def test_action_readiness_transitions_after_source_evidence_and_workspace_change(tmp_path):
+    agent = build_agent(tmp_path, [], requires_workspace_change=True)
+    agent.current_planning = agent.new_planning_state()
+
+    agent.update_planning_state("search", {"path": ".", "pattern": "target"}, {"tool_status": "ok"}, 1)
+    assert agent.current_planning["action_readiness"] == "evidence_gathering"
+    agent.update_planning_state("read_file", {"path": "module.py", "start": 1, "end": 20}, {"tool_status": "ok"}, 2)
+    assert agent.current_planning["action_readiness"] == "action_expected"
+    assert "inspected relevant source evidence" in agent.action_readiness_text()
+    agent.update_planning_state("run_shell", {"command": "python -m pytest"}, {"tool_status": "ok"}, 3)
+    assert agent.current_planning["action_readiness"] == "action_expected"
+    agent.update_planning_state("patch_file", {}, {"tool_status": "ok", "workspace_changed": True}, 4)
+    assert agent.current_planning["action_readiness"] == "action_taken"
+    assert agent.current_planning["action_readiness_transitions"] == [
+        {"state": "unknown", "tool_step": 0},
+        {"state": "evidence_gathering", "tool_step": 1},
+        {"state": "action_expected", "tool_step": 2},
+        {"state": "action_taken", "tool_step": 4},
+    ]
+
+
+def test_tool_patch_contract_is_visible_and_executes_in_a_fresh_workspace(tmp_path):
+    task = next(task for task in tasks_for_suite("development") if task.id == "tool_patch_contract")
+    target = tmp_path / task.path
+    target.parent.mkdir(parents=True)
+    target.write_text(f"def guarded_patch(count):\n{task.mutation}\n        return True\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            f'<tool>{{"name":"read_file","args":{{"path":{json.dumps(task.path)},"start":1,"end":10}}}}</tool>',
+            f'<tool>{{"name":"patch_file","args":{{"path":{json.dumps(task.path)},"old_text":{json.dumps(task.mutation)},"new_text":{json.dumps(task.baseline)}}}}}</tool>',
+            "<final>Done.</final>",
+        ],
+        allowed_tools=task.allowed_tools,
+        requires_workspace_change=task.requires_workspace_change,
+    )
+
+    assert task.requires_workspace_change is True
+    assert "patch_file(path: str, old_text: str, new_text: str)" in agent.prefix
+    assert "<old_text>return -1</old_text>" in agent.prefix
+    assert agent.run_tool("write_file", {"path": "blocked.py", "content": "x"}).startswith("error: unknown tool")
+    assert agent.ask(task.prompt) == "Done."
+
+    report = json.loads(next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(encoding="utf-8"))
+    assert target.read_text(encoding="utf-8").count(task.baseline) == 1
+    assert report["planning"]["workspace_change_count"] == 1
+    assert report["planning"]["first_action_step"] == 2
+    assert not report["planning"]["evidence_ledger"]
+    assert MiniAgent.parse(
+        '<tool name="patch_file" path="sample.py"><old_text>old</old_text><new_text>new</new_text></tool>'
+    ) == ("tool", {"name": "patch_file", "args": {"path": "sample.py", "old_text": "old", "new_text": "new"}})
 
 
 def test_invalid_risky_tool_does_not_prompt_for_approval(tmp_path):
@@ -1247,6 +1525,22 @@ def test_build_agent_uses_dotenv_provider_for_deepseek(tmp_path):
     assert mock_openai.call_args.kwargs["base_url"] == "https://api.deepseek.com"
     assert mock_openai.call_args.kwargs["api_key"] == "sk-deepseek-env"
     assert agent.model_client is fake_client
+
+
+def test_deepseek_uses_current_official_default_model_when_unset(tmp_path):
+    (tmp_path / ".env").write_text(
+        "DEEPSEEK_API_KEY=sk-deepseek-env\n",
+        encoding="utf-8",
+    )
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "deepseek"])
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
+            mini_pkg.build_agent(args)
+
+    assert mock_openai.call_args.kwargs["model"] == "deepseek-v4-flash"
+    assert mock_openai.call_args.kwargs["base_url"] == "https://api.deepseek.com"
+    assert mock_openai.call_args.kwargs["api_key"] == "sk-deepseek-env"
 
 
 def test_build_agent_uses_dotenv_provider_for_kimi(tmp_path):

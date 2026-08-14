@@ -49,7 +49,7 @@ const providerDefaults: Record<ConnectionPreset, AppSettings["provider"]> = {
   },
   "deepseek-official": {
     provider: "deepseek",
-    model: "deepseek-chat",
+    model: "deepseek-v4-flash",
     baseUrl: "https://api.deepseek.com",
     host: "http://127.0.0.1:11434",
     credential: { configured: false, source: "none", displayHint: "not configured" },

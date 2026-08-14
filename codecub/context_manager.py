@@ -485,6 +485,20 @@ class ContextManager:
         ).strip()
 
     def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts):
+        evidence_entries = []
+        if hasattr(self.agent, "evidence_ledger_entries"):
+            for entry in self.agent.evidence_ledger_entries():
+                marker = str(entry.get("marker", ""))
+                evidence_entries.append(
+                    {
+                        "path": str(entry.get("path", "")),
+                        "start": int(entry.get("start", 1)),
+                        "end": int(entry.get("end", 200)),
+                        "freshness": str(entry.get("freshness", "")),
+                        "last_read_step": entry.get("last_read_step"),
+                        "visible": bool(marker and marker in rendered["memory"].rendered),
+                    }
+                )
         section_metadata = {}
         for section in SECTION_ORDER[:-1]:
             section_metadata[section] = {
@@ -511,6 +525,11 @@ class ContextManager:
                 for section in SECTION_ORDER
             },
             "sections": section_metadata,
+            "inspected_evidence": {
+                "entry_count": len(evidence_entries),
+                "visible_entry_count": sum(1 for entry in evidence_entries if entry["visible"]),
+                "entries": evidence_entries,
+            },
             "budget_reductions": reduction_log,
             "reduction_order": list(self.reduction_order),
             "relevant_memory": {

@@ -15,11 +15,13 @@ class ExperimentTask:
     path: str
     baseline: str
     mutation: str
+    expected_baseline_occurrences: int = 1
     step_budget: int = 24
     allowed_tools: tuple[str, ...] = ("read_file", "search", "patch_file", "run_shell")
     phases: tuple[str, ...] = ()
     fault: str = ""
     metadata: dict = field(default_factory=dict)
+    requires_workspace_change: bool = False
 
     def verifier_description(self):
         return f"{self.path} contains the baseline implementation fragment"
@@ -73,8 +75,8 @@ _COMMON = (
         "cross-file-change",
         "Exact patches no longer protect against ambiguous source matches. Repair the tool contract so an ambiguous patch is rejected instead of silently changing code.",
         "codecub/tools.py",
-        "    if count != 1:",
-        "    if count < 1:",
+        "    count = text.count(old_text)\n    if count != 1:",
+        "    count = text.count(old_text)\n    if count < 1:",
     ),
     (
         "usage_cache_channel",
@@ -126,12 +128,21 @@ _COMMON = (
     ),
 )
 
-REAL_AGENT_TASKS = tuple(ExperimentTask(*row) for row in _COMMON)
+# Development tasks tune the harness and are deliberately excluded from the
+# holdout real-agent benchmark.  Their mutations remain reproducible so that
+# planning changes can be compared against archived planning baselines.
+DEVELOPMENT_TASKS = (
+    replace(ExperimentTask(*_COMMON[0]), metadata={"evaluation_role": "development"}, requires_workspace_change=True),
+    replace(ExperimentTask(*_COMMON[5]), metadata={"evaluation_role": "development"}, requires_workspace_change=True),
+    replace(ExperimentTask(*_COMMON[4]), metadata={"evaluation_role": "development"}, requires_workspace_change=True),
+)
+
+REAL_AGENT_TASKS = tuple(ExperimentTask(*row, requires_workspace_change=True) for row in _COMMON[1:])
 
 # 长链路 task 复用现实 mutation，但显式要求先理解多个模块并注入同等历史。
 CONTEXT_TASKS = tuple(
     ExperimentTask(
-        *row, step_budget=32, phases=("seed_history", "investigate", "repair", "verify")
+        *row, step_budget=32, phases=("seed_history", "investigate", "repair", "verify"), requires_workspace_change=True
     )
     for row in _COMMON[:8]
 )
@@ -141,6 +152,7 @@ MEMORY_TASKS = tuple(
         *row,
         step_budget=32,
         phases=("phase1_architecture", "distractor_work", "phase2_repair", "verify"),
+        requires_workspace_change=True,
     )
     for row in (
         _COMMON[0],
@@ -156,27 +168,30 @@ MEMORY_TASKS = tuple(
 
 RECOVERY_TASKS = (
     replace(
-        ExperimentTask(*_COMMON[3]), id="invalid_patch_failure", fault="invalid_patch"
+        ExperimentTask(*_COMMON[3]), id="invalid_patch_failure", fault="invalid_patch", requires_workspace_change=True
     ),
     replace(
         ExperimentTask(*_COMMON[0]),
         id="concurrent_file_mutation",
         fault="concurrent_mutation",
+        requires_workspace_change=True,
     ),
     replace(
-        ExperimentTask(*_COMMON[10]), id="stale_memory_freshness", fault="stale_memory"
+        ExperimentTask(*_COMMON[10]), id="stale_memory_freshness", fault="stale_memory", requires_workspace_change=True
     ),
     replace(
         ExperimentTask(*_COMMON[8]),
         id="workspace_resume_mismatch",
         fault="workspace_mismatch",
+        requires_workspace_change=True,
     ),
-    replace(ExperimentTask(*_COMMON[7]), id="unsafe_path_access", fault="unsafe_path"),
+    replace(ExperimentTask(*_COMMON[7]), id="unsafe_path_access", fault="unsafe_path", requires_workspace_change=True),
 )
 
 
 def tasks_for_suite(suite):
     suites = {
+        "development": DEVELOPMENT_TASKS,
         "real-agent": REAL_AGENT_TASKS,
         "context": CONTEXT_TASKS,
         "memory": MEMORY_TASKS,

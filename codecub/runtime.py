@@ -39,6 +39,12 @@ DEFAULT_FEATURE_FLAGS = {
 DEFAULT_MAX_STEPS = 80
 REPEATED_NO_PROGRESS_LIMIT = 5
 STOP_REASON_REPEATED_NO_PROGRESS = "repeated_no_progress"
+EXPLORATION_WARNING_THRESHOLD = 6
+SEMANTIC_REPEAT_WARNING_THRESHOLD = 2
+SEMANTIC_REPEAT_HARD_STOP_THRESHOLD = 8
+READ_OVERLAP_THRESHOLD = 0.8
+EVIDENCE_LEDGER_LIMIT = 6
+EVIDENCE_HINT_LIMIT = 280
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
 CHECKPOINT_NONE_STATUS = "no-checkpoint"
 CHECKPOINT_FULL_VALID_STATUS = "full-valid"
@@ -164,6 +170,8 @@ class Pico:
         event_handler=None,
         context_window=None,
         safety_margin_tokens=256,
+        allowed_tools=None,
+        requires_workspace_change=False,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -178,6 +186,8 @@ class Pico:
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
+        self.allowed_tools = None if allowed_tools is None else frozenset(allowed_tools)
+        self.requires_workspace_change = bool(requires_workspace_change)
         self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
         self.approval_handler = approval_handler
@@ -214,6 +224,7 @@ class Pico:
         self.last_completion_metadata = {}
         self.current_run_usage = []
         self.current_run_source_reads = []
+        self.current_planning = {}
         self.usage_store = UsageStore(self.root / ".codecub" / "usage")
         self.last_model_error = {}
         self.last_durable_promotions = []
@@ -379,7 +390,10 @@ class Pico:
         del bucket[:-limit]
 
     def build_tools(self):
-        return toolkit.build_tool_registry(self)
+        tools = toolkit.build_tool_registry(self)
+        if self.allowed_tools is None:
+            return tools
+        return {name: tool for name, tool in tools.items() if name in self.allowed_tools}
 
     def tool_signature(self):
         payload = []
@@ -402,15 +416,27 @@ class Pico:
             risk = "approval required" if tool["risky"] else "safe"
             tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
         tool_text = "\n".join(tool_lines)
+        xml_tool_rules = ""
+        if "write_file" in self.tools:
+            xml_tool_rules += (
+                "- For write_file calls with multi-line content, prefer XML style:\n"
+                "  <tool name=\"write_file\" path=\"file.py\"><content>...</content></tool>\n"
+            )
+        if "patch_file" in self.tools:
+            xml_tool_rules += (
+                "- For patch_file calls with multi-line text, use <old_text> and <new_text>:\n"
+                "  <tool name=\"patch_file\" path=\"file.py\"><old_text>...</old_text><new_text>...</new_text></tool>"
+            )
         examples = "\n".join(
-            [
-                '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-                '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-                '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-                '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-                '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-                "<final>Done.</final>",
-            ]
+            [toolkit.tool_example(name) for name in self.tools if toolkit.tool_example(name)]
+            + ["<final>Done.</final>"]
+        )
+        task_contract = (
+            "- This task requires an actual workspace modification. Analysis, repository inspection, and test execution alone do not complete it.\n"
+            "- Once you have identified a plausible minimal fix, use an allowed editing tool to make the smallest justified change, then verify it.\n"
+            "- Do not continue broad exploration after you have enough evidence to make a specific edit."
+            if self.requires_workspace_change
+            else ""
         )
         # prefix 可以理解成 agent 的“工作手册”：
         # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
@@ -423,8 +449,7 @@ class Pico:
             - Return exactly one <tool>...</tool> or one <final>...</final>.
             - Tool calls must look like:
               <tool>{{"name":"tool_name","args":{{...}}}}</tool>
-            - For write_file and patch_file with multi-line text, prefer XML style:
-              <tool name="write_file" path="file.py"><content>...</content></tool>
+            {xml_tool_rules}
             - Final answers must look like:
               <final>your answer</final>
             - Never invent tool results.
@@ -435,6 +460,7 @@ class Pico:
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
             - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+            {task_contract}
 
             Tools:
             {tool_text}
@@ -481,7 +507,31 @@ class Pico:
         return dict(self._last_prefix_refresh)
 
     def memory_text(self):
-        return self.memory.render_memory_text()
+        evidence = self.evidence_ledger_text()
+        memory = self.memory.render_memory_text()
+        readiness = self.action_readiness_text()
+        return "\n".join(part for part in (readiness, evidence, memory) if part)
+
+    def action_readiness_text(self):
+        if not self.requires_workspace_change:
+            return ""
+        if self.current_planning.get("action_readiness") != "action_expected":
+            return ""
+        return (
+            "Action readiness: you have inspected relevant source evidence. "
+            "If you can identify a specific minimal fix, make the edit before performing more broad exploration."
+        )
+
+    def evidence_ledger_text(self):
+        entries = self.current_planning.get("evidence_ledger", [])
+        if not entries:
+            return ""
+        lines = ["Inspected source evidence (current workspace revision):"]
+        for entry in entries:
+            lines.append(
+                f"- {entry['path']} lines {entry['start']}-{entry['end']} [{entry['marker']}]: {entry['hint']}"
+            )
+        return "\n".join(lines)
 
     def memory_recall_debug_text(self, query):
         return self.memory.retrieval_debug_view(query)
@@ -897,6 +947,7 @@ class Pico:
         self.current_task_state = task_state
         self.current_run_usage = []
         self.current_run_source_reads = []
+        self.current_planning = self.new_planning_state()
         self.current_run_dir = self.run_store.start_run(task_state)
         self.emit_run_status(
             task_state,
@@ -1176,7 +1227,24 @@ class Pico:
                     started_at=run_started_wall,
                     run_started_at=run_started_at,
                 )
+                read_notice = ""
+                read_classification = "new"
+                if name == "read_file":
+                    read_notice, read_classification = self.read_guard_notice(args)
                 result = self.run_tool(name, args)
+                if read_notice:
+                    result = f"{read_notice}\n\n{result}"
+                if name == "read_file":
+                    self._last_tool_result_metadata["read_evidence_classification"] = read_classification
+                    if read_classification == "avoidable_repeated_read":
+                        self.current_planning["avoidable_repeated_read_calls"] += 1
+                    elif read_classification == "evidence_evicted_reread":
+                        self.current_planning["evidence_evicted_reread_calls"] += 1
+                    self.record_read_evidence(args, result, task_state.tool_steps)
+                elif bool((self._last_tool_result_metadata or {}).get("workspace_changed")):
+                    self.invalidate_evidence_for_paths(
+                        (self._last_tool_result_metadata or {}).get("affected_paths")
+                    )
                 if self.cancellation_requested(task_state):
                     return self.stop_user_canceled_run(task_state, run_started_wall, run_started_at)
                 self.record(
@@ -1203,6 +1271,17 @@ class Pico:
                 self.emit_trace(task_state, "tool_executed", tool_event_payload)
                 if self.event_handler is not None:
                     self.event_handler("tool_executed", dict(tool_event_payload), self, task_state)
+                semantic_repeat = self.update_planning_state(
+                    name, args, self._last_tool_result_metadata, task_state.tool_steps
+                )
+                if semantic_repeat:
+                    self.emit_trace(
+                        task_state,
+                        "semantic_redundant_exploration",
+                        {"tool_name": name, "tool_step": task_state.tool_steps},
+                    )
+                self.maybe_emit_exploration_warning(task_state)
+                self.maybe_emit_implementation_warning(task_state)
                 if dict(self._last_tool_result_metadata or {}).get("tool_error_code") == "repeated_identical_call":
                     return self.stop_repeated_no_progress_run(
                         task_state,
@@ -1211,6 +1290,20 @@ class Pico:
                         args,
                         run_started_wall,
                         run_started_at,
+                    )
+                if (
+                    (
+                        self.current_planning["warning_sent"]
+                        or self.current_planning["implementation_warning_sent"]
+                    )
+                    and (
+                        self.current_planning["redundant_exploration_steps"]
+                        + self.current_planning["redundant_verification_steps"]
+                    ) >= SEMANTIC_REPEAT_HARD_STOP_THRESHOLD
+                    and self.current_planning["first_action_step"] is None
+                ):
+                    return self.stop_repeated_no_progress_run(
+                        task_state, user_message, name, args, run_started_wall, run_started_at
                     )
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 self.run_store.write_task_state(task_state)
@@ -1529,6 +1622,259 @@ class Pico:
         return list(reversed(tool_events))
 
     @staticmethod
+    def new_planning_state():
+        return {
+            "consecutive_exploration": 0,
+            "redundant_exploration_steps": 0,
+            "productive_exploration_steps": 0,
+            "rejected_steps": 0,
+            "first_action_step": None,
+            "exploration_steps_before_first_action": 0,
+            "exploration_warning_count": 0,
+            "warning_sent": False,
+            "seen_reads": {},
+            "seen_searches": set(),
+            "seen_verifications": set(),
+            "workspace_change_count": 0,
+            "last_verified_change_count": 0,
+            "first_workspace_change_step": None,
+            "first_execution_step": None,
+            "first_verification_after_change_step": None,
+            "verification_steps": 0,
+            "verification_before_first_action": 0,
+            "productive_verification_steps": 0,
+            "redundant_verification_steps": 0,
+            "implementation_warning_count": 0,
+            "implementation_warning_sent": False,
+            "evidence_ledger": [],
+            "evidence_eviction_count": 0,
+            "avoidable_repeated_read_calls": 0,
+            "evidence_evicted_reread_calls": 0,
+            "read_guard_notices": set(),
+            "action_readiness": "unknown",
+            "action_readiness_transitions": [{"state": "unknown", "tool_step": 0}],
+        }
+
+    @staticmethod
+    def set_action_readiness(state, readiness, tool_step):
+        if state["action_readiness"] == readiness:
+            return False
+        state["action_readiness"] = readiness
+        state["action_readiness_transitions"].append(
+            {"state": readiness, "tool_step": tool_step}
+        )
+        return True
+
+    def update_planning_state(self, name, args, metadata, tool_step):
+        state = self.current_planning
+        status = str((metadata or {}).get("tool_status", ""))
+        if name in task_policy.ACTION_TOOLS:
+            if state["first_action_step"] is None:
+                state["first_action_step"] = tool_step
+                state["exploration_steps_before_first_action"] = state["consecutive_exploration"]
+            state["consecutive_exploration"] = 0
+            state["seen_reads"].clear()
+            state["seen_searches"].clear()
+            if bool((metadata or {}).get("workspace_changed")):
+                state["workspace_change_count"] += 1
+                if state["first_workspace_change_step"] is None:
+                    state["first_workspace_change_step"] = tool_step
+                self.set_action_readiness(state, "action_taken", tool_step)
+            if status == "rejected":
+                state["rejected_steps"] += 1
+            return False
+        if status == "rejected":
+            state["rejected_steps"] += 1
+            return False
+        if name == "run_shell":
+            state["verification_steps"] += 1
+            if state["first_execution_step"] is None:
+                state["first_execution_step"] = tool_step
+            if state["first_action_step"] is None:
+                state["verification_before_first_action"] += 1
+            epoch = state["workspace_change_count"]
+            signature = (task_policy.normalize_shell_command(args), epoch)
+            redundant = signature in state["seen_verifications"]
+            state["seen_verifications"].add(signature)
+            if redundant:
+                state["redundant_verification_steps"] += 1
+            else:
+                state["productive_verification_steps"] += 1
+            if epoch > state["last_verified_change_count"]:
+                if state["first_verification_after_change_step"] is None:
+                    state["first_verification_after_change_step"] = tool_step
+                state["last_verified_change_count"] = epoch
+            return redundant
+        if name not in task_policy.EXPLORATION_TOOLS:
+            return False
+        state["consecutive_exploration"] += 1
+        if status == "ok" and self.requires_workspace_change:
+            if name == "read_file" and task_policy.is_source_path(args.get("path")):
+                self.set_action_readiness(state, "action_expected", tool_step)
+            elif state["action_readiness"] == "unknown":
+                self.set_action_readiness(state, "evidence_gathering", tool_step)
+        redundant = False
+        if name == "search":
+            signature = task_policy.normalize_search(args)
+            redundant = signature in state["seen_searches"]
+            state["seen_searches"].add(signature)
+        elif name == "read_file":
+            path = task_policy.canonical_path(args.get("path"))
+            prior = state["seen_reads"].setdefault(path, [])
+            redundant = any(
+                task_policy.read_overlap_ratio(args, previous) >= READ_OVERLAP_THRESHOLD
+                for previous in prior
+            )
+            prior.append(dict(args))
+        if redundant:
+            state["redundant_exploration_steps"] += 1
+        else:
+            state["productive_exploration_steps"] += 1
+        return redundant
+
+    def evidence_ledger_entries(self):
+        return list(self.current_planning.get("evidence_ledger", []))
+
+    def assess_read_evidence(self, args):
+        """Classify a read against evidence rendered in the prompt that chose it."""
+        if not self.current_planning or not self.last_prompt_metadata:
+            return "new", None
+        path = task_policy.canonical_path((args or {}).get("path"))
+        current_freshness = memorylib.file_freshness(path, self.root)
+        prompt_entries = (self.last_prompt_metadata.get("inspected_evidence") or {}).get("entries", [])
+        candidates = [
+            entry
+            for entry in prompt_entries
+            if entry.get("path") == path
+            and entry.get("freshness") == current_freshness
+            and task_policy.read_overlap_ratio(args, entry) >= READ_OVERLAP_THRESHOLD
+        ]
+        if not candidates:
+            return "new", None
+        visible = any(bool(entry.get("visible")) for entry in candidates)
+        return ("avoidable_repeated_read" if visible else "evidence_evicted_reread"), candidates[-1]
+
+    def read_guard_notice(self, args):
+        classification, entry = self.assess_read_evidence(args)
+        if classification != "avoidable_repeated_read" or entry is None:
+            return "", classification
+        key = (entry["path"], entry["freshness"])
+        notices = self.current_planning["read_guard_notices"]
+        if key in notices:
+            return "", classification
+        notices.add(key)
+        return (
+            "Runtime notice: this range substantially overlaps source code already inspected in the current workspace revision. "
+            "Use the existing evidence if it is sufficient. If a specific unresolved detail is needed, read a narrower non-overlapping range.",
+            classification,
+        )
+
+    def compact_evidence_hint(self, result):
+        lines = [line.strip() for line in str(result).splitlines() if line.strip()]
+        if lines and lines[0].startswith("# "):
+            lines = lines[1:]
+        hint = " | ".join(lines[:8])
+        hint = self.redact_text(hint)
+        hint = re.sub(
+            r"(?i)((?:api[_ -]?key|token|secret|password)\s*[:=]\s*[\"']?)[^\s,\"']+",
+            r"\1<redacted>",
+            hint,
+        )
+        return clip(hint, EVIDENCE_HINT_LIMIT)
+
+    def record_read_evidence(self, args, result, tool_step):
+        path = task_policy.canonical_path((args or {}).get("path"))
+        if not path:
+            return
+        entry = {
+            "path": path,
+            "start": int((args or {}).get("start", 1)),
+            "end": int((args or {}).get("end", 200)),
+            "freshness": memorylib.file_freshness(path, self.root),
+            "last_read_step": tool_step,
+            "hint": self.compact_evidence_hint(result),
+        }
+        entry["marker"] = hashlib.sha256(
+            f"{entry['path']}:{entry['start']}:{entry['end']}:{entry['freshness']}".encode("utf-8")
+        ).hexdigest()[:12]
+        ledger = self.current_planning["evidence_ledger"]
+        ledger[:] = [
+            prior
+            for prior in ledger
+            if not (
+                prior["path"] == entry["path"]
+                and prior["start"] == entry["start"]
+                and prior["end"] == entry["end"]
+                and prior["freshness"] == entry["freshness"]
+            )
+        ]
+        ledger.append(entry)
+        if len(ledger) > EVIDENCE_LEDGER_LIMIT:
+            del ledger[: len(ledger) - EVIDENCE_LEDGER_LIMIT]
+            self.current_planning["evidence_eviction_count"] += 1
+
+    def invalidate_evidence_for_paths(self, paths):
+        changed = {task_policy.canonical_path(path) for path in (paths or [])}
+        if not changed:
+            return
+        ledger = self.current_planning.get("evidence_ledger", [])
+        retained = [entry for entry in ledger if entry["path"] not in changed]
+        self.current_planning["evidence_eviction_count"] += len(ledger) - len(retained)
+        self.current_planning["evidence_ledger"] = retained
+
+    def maybe_emit_exploration_warning(self, task_state):
+        state = self.current_planning
+        if state["warning_sent"]:
+            return False
+        if (
+            state["consecutive_exploration"] < EXPLORATION_WARNING_THRESHOLD
+            and state["redundant_exploration_steps"] < SEMANTIC_REPEAT_WARNING_THRESHOLD
+        ):
+            return False
+        state["warning_sent"] = True
+        state["exploration_warning_count"] += 1
+        notice = (
+            "Runtime planning notice: substantial repository exploration has occurred without an implementation action. "
+            "Reassess whether further exploration is necessary. If evidence is sufficient, make the smallest justified change and verify it."
+        )
+        self.record({"role": "assistant", "content": notice, "created_at": now()})
+        self.emit_trace(
+            task_state,
+            "exploration_warning",
+            {
+                "consecutive_exploration": state["consecutive_exploration"],
+                "redundant_exploration_steps": state["redundant_exploration_steps"],
+            },
+        )
+        return True
+
+    def maybe_emit_implementation_warning(self, task_state):
+        state = self.current_planning
+        if (
+            not self.requires_workspace_change
+            or state["implementation_warning_sent"]
+            or state["workspace_change_count"]
+            or state["verification_steps"] < 2
+        ):
+            return False
+        state["implementation_warning_sent"] = True
+        state["implementation_warning_count"] += 1
+        notice = (
+            "Runtime planning notice: this task requires a workspace change, but verification commands have run without a successful change. "
+            "Use the evidence already gathered to make the smallest justified implementation change; only continue diagnosing if a concrete question remains unresolved."
+        )
+        self.record({"role": "assistant", "content": notice, "created_at": now()})
+        self.emit_trace(
+            task_state,
+            "implementation_warning",
+            {
+                "verification_steps": state["verification_steps"],
+                "workspace_change_count": state["workspace_change_count"],
+            },
+        )
+        return True
+
+    @staticmethod
     def new_task_id():
         return "task_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
@@ -1620,6 +1966,18 @@ class Pico:
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "usage_summary": aggregate_usage_records(self.current_run_usage),
+            "planning": {
+                key: value
+                for key, value in self.current_planning.items()
+                if key not in {
+                    "seen_reads",
+                    "seen_searches",
+                    "seen_verifications",
+                    "warning_sent",
+                    "implementation_warning_sent",
+                    "read_guard_notices",
+                }
+            },
             "usage_snapshot": build_usage_snapshot(
                 self.current_run_usage,
                 "run",
