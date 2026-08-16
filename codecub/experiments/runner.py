@@ -23,7 +23,7 @@ from ..cli import (
 from ..evaluator import run_harness_regression_v2
 from ..models import FakeModelClient
 from ..run_store import RunStore
-from ..runtime import Pico, SessionStore
+from ..runtime import RUNTIME_MODE_EXPERIMENT, Pico, SessionStore
 from ..workspace import WorkspaceContext
 from .metrics import extract_metrics, summarize
 from .tasks import tasks_for_suite
@@ -488,6 +488,7 @@ class ExperimentRunner:
             context_window=self.config.context_window,
             allowed_tools=task.allowed_tools,
             requires_workspace_change=task.requires_workspace_change,
+            runtime_mode=RUNTIME_MODE_EXPERIMENT,
         )
         return agent
 

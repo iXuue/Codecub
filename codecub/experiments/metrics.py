@@ -94,9 +94,17 @@ def extract_metrics(report, trace):
             repeated_searches += 1
         seen_searches.add(signature)
     planning = (report or {}).get("planning") or {}
+    watchdog = (report or {}).get("watchdog") or {}
     result = {
         "attempts": (report or {}).get("attempts"),
         "tool_steps": (report or {}).get("tool_steps"),
+        "runtime_mode": (report or {}).get("runtime_mode"),
+        "effective_step_budget": (report or {}).get("effective_step_budget"),
+        "emergency_cap": (report or {}).get("emergency_cap"),
+        "stuck_suspected_count": watchdog.get("stuck_suspected_count", 0),
+        "stuck_recovery_count": watchdog.get("recovery_turn_count", 0),
+        "stuck_recovery_success_count": watchdog.get("recovery_success_count", 0),
+        "stuck_confirmed_count": watchdog.get("stuck_confirmed_count", 0),
         "read_calls": counts["read_file"],
         "unique_read_files": unique_reads,
         "repeated_read_calls": repeat_count,
@@ -212,6 +220,10 @@ def summarize(rows):
         "evidence_evicted_reread_calls",
         "evidence_ledger_entries",
         "evidence_eviction_count",
+        "stuck_suspected_count",
+        "stuck_recovery_count",
+        "stuck_recovery_success_count",
+        "stuck_confirmed_count",
     ):
         values = [row.get(key) for row in completed]
         summary[f"mean_{key}"] = _number(values)

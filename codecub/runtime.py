@@ -25,6 +25,7 @@ from .usage_store import UsageStore
 from .task_state import TaskState
 from . import tools as toolkit
 from . import task_policy
+from .watchdog import ProgressWatchdog
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
@@ -51,6 +52,12 @@ DEFAULT_FEATURE_FLAGS = {
     "prompt_cache": True,
 }
 DEFAULT_MAX_STEPS = 80
+DEFAULT_INTERACTIVE_EMERGENCY_CAP = 500
+DEFAULT_INTERACTIVE_ATTEMPT_CAP = 1200
+RUNTIME_MODE_INTERACTIVE = "interactive"
+RUNTIME_MODE_EXPERIMENT = "experiment"
+STOP_REASON_STUCK_CONFIRMED = "stuck_confirmed"
+STOP_REASON_EMERGENCY_CAP_REACHED = "emergency_cap_reached"
 EDIT_EVIDENCE_RETRY_BUDGET = 2
 EDIT_DECISION_ATTEMPT_BUDGET = 4
 REPEATED_NO_PROGRESS_LIMIT = 5
@@ -61,6 +68,16 @@ SEMANTIC_REPEAT_HARD_STOP_THRESHOLD = 8
 READ_OVERLAP_THRESHOLD = 0.8
 EVIDENCE_LEDGER_LIMIT = 6
 EVIDENCE_HINT_LIMIT = 280
+RECOVERY_TURN_PROMPT = (
+    "Your recent actions have not produced new evidence, workspace changes, "
+    "or new verification information.\n\n"
+    "Summarize:\n"
+    "1. what is already known,\n"
+    "2. the current blocker,\n"
+    "3. why the recent strategy is not progressing,\n"
+    "4. choose a materially different next action.\n\n"
+    "Do not repeat the same search/read/test pattern."
+)
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
 CHECKPOINT_NONE_STATUS = "no-checkpoint"
 CHECKPOINT_FULL_VALID_STATUS = "full-valid"
@@ -180,7 +197,7 @@ class Pico:
         session=None,
         run_store=None,
         approval_policy="ask",
-        max_steps=DEFAULT_MAX_STEPS,
+        max_steps=None,
         max_new_tokens=512,
         depth=0,
         max_depth=1,
@@ -194,13 +211,27 @@ class Pico:
         safety_margin_tokens=256,
         allowed_tools=None,
         requires_workspace_change=False,
+        runtime_mode=None,
+        emergency_cap=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
         self.root = Path(workspace.repo_root)
         self.session_store = session_store
         self.approval_policy = approval_policy
+        # max_steps=None 表示“不设固定步数预算”：interactive 模式由
+        # Progress Watchdog + emergency cap 决定何时停止；experiment 模式
+        # 由 ExperimentRunner 显式传入 task.step_budget。
         self.max_steps = max_steps
+        self.runtime_mode = (
+            str(runtime_mode or RUNTIME_MODE_INTERACTIVE).strip()
+            or RUNTIME_MODE_INTERACTIVE
+        )
+        self.emergency_cap = (
+            int(emergency_cap)
+            if emergency_cap is not None
+            else DEFAULT_INTERACTIVE_EMERGENCY_CAP
+        )
         self.max_new_tokens = max_new_tokens
         self.context_window = context_window
         self.safety_margin_tokens = int(safety_margin_tokens)
@@ -255,6 +286,7 @@ class Pico:
         self.current_run_usage = []
         self.current_run_source_reads = []
         self.current_planning = {}
+        self.watchdog = ProgressWatchdog()
         self.usage_store = UsageStore(self.root / ".codecub" / "usage")
         self.last_model_error = {}
         self.last_durable_promotions = []
@@ -300,7 +332,9 @@ class Pico:
             "model_client": self.model_client.__class__.__name__,
             "approval_policy": self.approval_policy,
             "read_only": bool(self.read_only),
-            "max_steps": int(self.max_steps),
+            "max_steps": self.max_steps,
+            "runtime_mode": self.runtime_mode,
+            "emergency_cap": int(self.emergency_cap or 0),
             "max_new_tokens": int(self.max_new_tokens),
             "feature_flags": dict(self.feature_flags),
             "shell_env_allowlist": list(self.shell_env_allowlist),
@@ -311,6 +345,16 @@ class Pico:
             ),
             "tool_signature": self.tool_signature(),
         }
+
+    @property
+    def effective_step_budget(self):
+        """当前 run 的固定步数预算；interactive unlimited 时为 None。"""
+        if self.max_steps is not None:
+            return int(self.max_steps)
+        if self.runtime_mode == RUNTIME_MODE_EXPERIMENT:
+            # experiment 必须保留固定预算语义，防止配置漂移成 unlimited。
+            return DEFAULT_MAX_STEPS
+        return None
 
     def checkpoint_state(self):
         self._ensure_session_shape()
@@ -360,6 +404,8 @@ class Pico:
                     "approval_policy",
                     "read_only",
                     "max_steps",
+                    "runtime_mode",
+                    "emergency_cap",
                     "max_new_tokens",
                     "feature_flags",
                     "shell_env_allowlist",
@@ -1105,7 +1151,19 @@ class Pico:
         research_budget = task_policy.research_tool_budget(user_message)
         finalization_required = False
         finalization_rejections = 0
-        max_attempts = max(self.max_steps * 3, self.max_steps + 4)
+        # Phase 1: 每次 ask() 独立跟踪 stuck 状态，不跨 run 累积。
+        self.watchdog = ProgressWatchdog()
+        step_budget = self.effective_step_budget
+        attempt_cap = (
+            max(step_budget * 3, step_budget + 4)
+            if step_budget is not None
+            else DEFAULT_INTERACTIVE_ATTEMPT_CAP
+        )
+        emergency_cap = (
+            None
+            if step_budget is not None
+            else int(self.emergency_cap or DEFAULT_INTERACTIVE_EMERGENCY_CAP)
+        )
         native_mode = bool(getattr(self.model_client, "supports_native_tools", False))
         native_messages = []
         pending_native_calls = []
@@ -1147,12 +1205,47 @@ class Pico:
         # 2. 决策：让模型返回一个工具调用，或一个最终答案
         # 3. 行动：如果是工具调用，就执行工具
         # 4. 记录：把结果写回 history / task_state / trace / memory
-        # 然后进入下一轮，直到停机条件满足
-        while tool_steps < self.max_steps and attempts < max_attempts:
+        # 然后进入下一轮，直到停机条件满足。
+        #
+        # Phase 1 停机语义：
+        # - experiment / 显式 max_steps：固定预算 + retry 上限，语义不变；
+        # - interactive：没有小固定步数预算，只由 emergency cap（兜底）
+        #   与 Progress Watchdog（stuck 判定）决定停止。
+        while True:
             if self.cancellation_requested(task_state):
                 return self.stop_user_canceled_run(
                     task_state, run_started_wall, run_started_at
                 )
+            if step_budget is not None:
+                if tool_steps >= step_budget or attempts >= attempt_cap:
+                    return self.stop_limited_run(
+                        task_state,
+                        user_message,
+                        attempts,
+                        attempt_cap,
+                        tool_steps,
+                        run_started_wall,
+                        run_started_at,
+                    )
+            else:
+                if tool_steps >= emergency_cap:
+                    return self.stop_emergency_cap_run(
+                        task_state,
+                        user_message,
+                        emergency_cap,
+                        run_started_wall,
+                        run_started_at,
+                    )
+                if attempts >= attempt_cap:
+                    return self.stop_limited_run(
+                        task_state,
+                        user_message,
+                        attempts,
+                        attempt_cap,
+                        tool_steps,
+                        run_started_wall,
+                        run_started_at,
+                    )
             attempts += 1
             task_state.record_attempt()
             self.run_store.write_task_state(task_state)
@@ -1831,40 +1924,10 @@ class Pico:
                         "semantic_redundant_exploration",
                         {"tool_name": name, "tool_step": task_state.tool_steps},
                     )
+                # 纯 observability：exploration / implementation warning 仍会发出，
+                # 但它们不再直接导致停机。是否卡住只由 Progress Watchdog 判定。
                 self.maybe_emit_exploration_warning(task_state)
                 self.maybe_emit_implementation_warning(task_state)
-                if (
-                    dict(self._last_tool_result_metadata or {}).get("tool_error_code")
-                    == "repeated_identical_call"
-                ):
-                    return self.stop_repeated_no_progress_run(
-                        task_state,
-                        user_message,
-                        name,
-                        args,
-                        run_started_wall,
-                        run_started_at,
-                    )
-                if (
-                    (
-                        self.current_planning["warning_sent"]
-                        or self.current_planning["implementation_warning_sent"]
-                    )
-                    and (
-                        self.current_planning["redundant_exploration_steps"]
-                        + self.current_planning["redundant_verification_steps"]
-                    )
-                    >= SEMANTIC_REPEAT_HARD_STOP_THRESHOLD
-                    and self.current_planning["first_action_step"] is None
-                ):
-                    return self.stop_repeated_no_progress_run(
-                        task_state,
-                        user_message,
-                        name,
-                        args,
-                        run_started_wall,
-                        run_started_at,
-                    )
                 checkpoint = self.create_checkpoint(
                     task_state, user_message, trigger="tool_executed"
                 )
@@ -1877,6 +1940,41 @@ class Pico:
                         "trigger": "tool_executed",
                     },
                 )
+                # Phase 1: Progress Watchdog 是唯一的 stuck 决策来源。
+                watchdog_decision = self._advance_watchdog(
+                    task_state, name, args, result, task_state.tool_steps
+                )
+                if watchdog_decision.suspected_now:
+                    # 第一次疑似卡住：注入 Recovery Turn 提示（不含任务答案），
+                    # 继续运行，不直接结束。
+                    self.record(
+                        {
+                            "role": "assistant",
+                            "content": RECOVERY_TURN_PROMPT,
+                            "created_at": now(),
+                        }
+                    )
+                    if native_mode:
+                        native_messages.append(
+                            {"role": "user", "content": RECOVERY_TURN_PROMPT}
+                        )
+                    self.emit_run_status(
+                        task_state,
+                        "stuck_suspected",
+                        "Recovery turn",
+                        detail=watchdog_decision.stuck_pattern,
+                        started_at=run_started_wall,
+                        run_started_at=run_started_at,
+                    )
+                    self.run_store.write_task_state(task_state)
+                    continue
+                if watchdog_decision.confirmed_now:
+                    return self.stop_stuck_confirmed_run(
+                        task_state,
+                        user_message,
+                        run_started_wall,
+                        run_started_at,
+                    )
                 if research_budget is not None and research_steps >= research_budget:
                     finalization_required = True
                     notice = task_policy.finalization_notice(
@@ -1963,16 +2061,6 @@ class Pico:
                 task_state, user_message, final, run_started_wall, run_started_at
             )
 
-        return self.stop_limited_run(
-            task_state,
-            user_message,
-            attempts,
-            max_attempts,
-            tool_steps,
-            run_started_wall,
-            run_started_at,
-        )
-
     def stop_finalization_failed_run(
         self, task_state, user_message, run_started_wall, run_started_at
     ):
@@ -2054,12 +2142,13 @@ class Pico:
         task_state,
         user_message,
         attempts,
-        max_attempts,
+        attempt_cap,
         tool_steps,
         run_started_wall,
         run_started_at,
     ):
-        if attempts >= max_attempts and tool_steps < self.max_steps:
+        budget = self.effective_step_budget
+        if attempts >= attempt_cap and (budget is None or tool_steps < budget):
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
             task_state.stop_retry_limit(final)
         else:
@@ -2083,37 +2172,141 @@ class Pico:
         self.write_final_report(task_state)
         return final
 
-    def stop_repeated_no_progress_run(
+    def _advance_watchdog(self, task_state, name, args, result, step):
+        """把一次工具事件交给 Progress Watchdog，并发射 trace 事件。
+
+        suspected_now 触发时由 ask() 负责注入 Recovery Turn 提示；本方法只做
+        watchdog 推进与可观测性记录。返回 WatchdogDecision。
+        """
+        decision = self.watchdog.record_tool_event(
+            name, args, self._last_tool_result_metadata, result, step
+        )
+        for signal in decision.progress_signals:
+            self.emit_trace(
+                task_state,
+                "progress_detected",
+                {
+                    "kind": signal.kind,
+                    "reason": self.redact_text(signal.reason),
+                    "step": signal.step,
+                },
+            )
+        if decision.suspected_now:
+            self.emit_trace(
+                task_state,
+                "stuck_suspected",
+                {
+                    "pattern": decision.stuck_pattern,
+                    "step": step,
+                    "no_progress_score": self.watchdog.no_progress_score,
+                },
+            )
+            self.watchdog.begin_recovery(step)
+            self.emit_trace(
+                task_state,
+                "recovery_turn_started",
+                {
+                    "step": step,
+                    "recovery_turn_count": self.watchdog.recovery_turn_count,
+                },
+            )
+        elif decision.recovered_now:
+            self.emit_trace(
+                task_state,
+                "recovery_turn_finished",
+                {
+                    "success": True,
+                    "step": step,
+                    "recovery_success_count": self.watchdog.recovery_success_count,
+                },
+            )
+        elif decision.confirmed_now:
+            self.emit_trace(
+                task_state,
+                "stuck_confirmed",
+                {
+                    "pattern": decision.stuck_pattern,
+                    "step": step,
+                    "stuck_confirmed_count": self.watchdog.stuck_confirmed_count,
+                },
+            )
+        return decision
+
+    def stop_stuck_confirmed_run(
         self,
         task_state,
         user_message,
-        tool_name,
-        tool_args,
         run_started_wall,
         run_started_at,
     ):
-        final = (
-            "Stopped after the same no-progress tool action repeated "
-            f"{REPEATED_NO_PROGRESS_LIMIT} times: {tool_name}."
+        """STUCK_CONFIRMED：experiment 以 stop_reason 结束；interactive graceful stop。"""
+        pattern = self.watchdog.current_pattern or "no_progress_window"
+        if self.runtime_mode == RUNTIME_MODE_INTERACTIVE:
+            last_reason = self.watchdog.last_progress_reason or "the start of the task"
+            last_step = self.watchdog.last_progress_step or 0
+            final = (
+                "Agent paused because it appears stuck.\n"
+                f"Current blocker: repeated recovery turns did not produce new "
+                f"evidence, workspace changes, or verification information.\n"
+                f"Last useful progress: {last_reason} (step {last_step})."
+            )
+        else:
+            final = (
+                "Stopped because the agent appeared stuck and did not recover "
+                f"(pattern: {pattern})."
+            )
+        task_state.stop(STOP_REASON_STUCK_CONFIRMED, final_answer=final)
+        self.record({"role": "assistant", "content": final, "created_at": now()})
+        self.promote_durable_memory(user_message, final)
+        self.run_store.write_task_state(task_state)
+        checkpoint = self.create_checkpoint(
+            task_state, user_message, trigger=STOP_REASON_STUCK_CONFIRMED
         )
-        task_state.stop(STOP_REASON_REPEATED_NO_PROGRESS, final_answer=final)
+        self.emit_checkpoint_created(
+            task_state, checkpoint, STOP_REASON_STUCK_CONFIRMED
+        )
+        self.emit_run_finished(task_state, final, run_started_at)
+        self.emit_run_status(
+            task_state,
+            "failed",
+            "Stopped",
+            detail=task_state.stop_reason,
+            started_at=run_started_wall,
+            run_started_at=run_started_at,
+        )
+        self.write_final_report(task_state)
+        return final
+
+    def stop_emergency_cap_run(
+        self,
+        task_state,
+        user_message,
+        emergency_cap,
+        run_started_wall,
+        run_started_at,
+    ):
+        """Interactive 模式的 emergency fuse：只兜 Runtime Bug / watchdog 漏检 / runaway。"""
+        final = (
+            "Stopped after reaching the emergency step cap "
+            f"({emergency_cap}) without a final answer."
+        )
+        task_state.stop(STOP_REASON_EMERGENCY_CAP_REACHED, final_answer=final)
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.promote_durable_memory(user_message, final)
         self.run_store.write_task_state(task_state)
         self.emit_trace(
             task_state,
-            STOP_REASON_REPEATED_NO_PROGRESS,
+            "emergency_cap_reached",
             {
-                "tool_name": str(tool_name or ""),
-                "args": tool_args,
-                "limit": REPEATED_NO_PROGRESS_LIMIT,
+                "cap": int(emergency_cap or 0),
+                "tool_steps": task_state.tool_steps,
             },
         )
         checkpoint = self.create_checkpoint(
-            task_state, user_message, trigger=STOP_REASON_REPEATED_NO_PROGRESS
+            task_state, user_message, trigger=STOP_REASON_EMERGENCY_CAP_REACHED
         )
         self.emit_checkpoint_created(
-            task_state, checkpoint, STOP_REASON_REPEATED_NO_PROGRESS
+            task_state, checkpoint, STOP_REASON_EMERGENCY_CAP_REACHED
         )
         self.emit_run_finished(task_state, final, run_started_at)
         self.emit_run_status(
@@ -2684,6 +2877,14 @@ class Pico:
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
             "task_state": task_state.to_dict(),
+            "runtime_mode": self.runtime_mode,
+            "effective_step_budget": self.effective_step_budget,
+            "emergency_cap": (
+                None
+                if self.effective_step_budget is not None
+                else int(self.emergency_cap or 0)
+            ),
+            "watchdog": self.watchdog.snapshot(),
             "prompt_metadata": self.last_prompt_metadata,
             "usage_summary": aggregate_usage_records(self.current_run_usage),
             "planning": {

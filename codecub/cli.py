@@ -17,7 +17,7 @@ from pathlib import Path
 from .app_runner import run_app_mode
 from .connections import resolve_effective_connection_profile
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
-from .runtime import DEFAULT_MAX_STEPS, Pico, SessionStore
+from .runtime import Pico, SessionStore
 from .workspace import WorkspaceContext, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
@@ -505,7 +505,12 @@ def build_arg_parser():
         default=[],
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Maximum tool/model iterations per request.")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Explicit step budget per request. Interactive mode has no fixed budget unless this is set; experiments always use the task step budget.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")

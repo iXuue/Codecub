@@ -50,10 +50,21 @@ def build_agent(tmp_path, outputs, **kwargs):
 
 def test_default_max_steps_is_80(tmp_path):
     agent = build_agent(tmp_path, [])
-    args = build_arg_parser().parse_args([])
 
-    assert agent.max_steps == 80
-    assert args.max_steps == 80
+    assert agent.max_steps is None
+    assert agent.runtime_mode == "interactive"
+    assert agent.effective_step_budget is None
+    assert agent.emergency_cap == 500
+
+    args = build_arg_parser().parse_args([])
+    assert args.max_steps is None
+
+
+def test_explicit_max_steps_override_still_creates_fixed_budget(tmp_path):
+    agent = build_agent(tmp_path, [], max_steps=12)
+
+    assert agent.max_steps == 12
+    assert agent.effective_step_budget == 12
 
 
 def test_allowed_tools_filter_prompt_visibility_but_runtime_still_rejects(tmp_path):
@@ -1215,7 +1226,7 @@ def test_repeated_identical_tool_call_does_not_count_previous_user_turn(tmp_path
     assert result.startswith("[")
 
 
-def test_agent_stops_after_five_repeated_no_progress_tool_calls(tmp_path):
+def test_agent_enters_recovery_turn_after_repeated_no_progress_tool_calls(tmp_path):
     repeated = '<tool>{"name":"list_files","args":{}}</tool>'
     agent = build_agent(
         tmp_path,
@@ -1225,16 +1236,15 @@ def test_agent_stops_after_five_repeated_no_progress_tool_calls(tmp_path):
             repeated,
             repeated,
             repeated,
-            "<final>should not be reached</final>",
+            "<final>Done.</final>",
         ],
     )
 
     answer = agent.ask("Inspect the repository")
 
-    assert (
-        answer
-        == "Stopped after the same no-progress tool action repeated 5 times: list_files."
-    )
+    # Phase 1: 相同无进展动作不再直接停机，而是进入 STUCK_SUSPECTED ->
+    # Recovery Turn；模型随后给出 final 则正常完成。
+    assert answer == "Done."
     report = json.loads(
         agent.run_store.report_path(agent.current_task_state).read_text(
             encoding="utf-8"
@@ -1247,19 +1257,25 @@ def test_agent_stops_after_five_repeated_no_progress_tool_calls(tmp_path):
         .splitlines()
     ]
 
-    assert report["status"] == "stopped"
-    assert report["stop_reason"] == "repeated_no_progress"
-    assert report["tool_steps"] == 5
-    assert report["task_state"]["final_answer"] == answer
+    assert report["status"] == "completed"
+    assert report["stop_reason"] == "final_answer_returned"
+    assert report["watchdog"]["stuck_suspected_count"] == 1
+    assert report["watchdog"]["recovery_turn_count"] == 1
+    assert report["watchdog"]["stuck_pattern"] == "identical_loop"
     assert any(
-        event["event"] == "repeated_no_progress" and event["limit"] == 5
+        event["event"] == "stuck_suspected"
+        and event["pattern"] == "identical_loop"
         for event in trace_events
+    )
+    assert any(
+        event["event"] == "recovery_turn_started" for event in trace_events
     )
     assert any(
         event["event"] == "tool_executed"
         and event.get("tool_error_code") == "repeated_identical_call"
         for event in trace_events
     )
+    assert report["watchdog"]["stuck_confirmed_count"] == 0
 
 
 def test_welcome_screen_keeps_box_shape_for_long_paths(tmp_path):
