@@ -190,6 +190,8 @@ def main(argv=None):
     main_completed = 0
 
     # Precompute seed workspace roots per memory-seeded task (Session A).
+    seeds_dir = output / "runs" / "seeds"
+    seeds_dir.mkdir(parents=True, exist_ok=True)
     seeds_root = work_root / "seeds"
     for task in FINAL_HOLDOUT_V1:
         if task.task_id not in MEMORY_SEEDED_TASK_IDS:
@@ -213,11 +215,9 @@ def main(argv=None):
             continue
         print(f"== Seed (Session A): {task.task_id} ==")
         seed_rows.append(run_seed(task, seed_ws, VARIANT_FLAGS[V_FULL]))
-        (output / "runs" / "seeds" / f"{task.task_id}.json").write_text(
+        (seeds_dir / f"{task.task_id}.json").write_text(
             json.dumps(seed_rows[-1], ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    seeds_dir = output / "runs" / "seeds"
-    seeds_dir.mkdir(parents=True, exist_ok=True)
     (seeds_dir / "seed_rows.json").write_text(
         json.dumps(seed_rows, ensure_ascii=False, indent=2), encoding="utf-8"
     )
