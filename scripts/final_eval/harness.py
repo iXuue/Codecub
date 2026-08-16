@@ -53,16 +53,16 @@ from .tasks import (  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# Files excluded from every model workspace (evaluation harness + dev artifacts
-# + benchmark answer keys; everything else is the frozen product tree).
+# Files excluded from every model workspace: evaluation harness + dev
+# artifacts. codecub/experiments/tasks.py is KEPT — it is frozen product code
+# whose task keys belong to old benchmarks, and removing it breaks `pytest`
+# collection; the FINAL holdout answers live only under scripts/final_eval/.
 WORKSPACE_EXCLUDE_DIRS = {
     ".codecub", ".env", ".git", "__pycache__", ".pytest_cache", ".ruff_cache",
     ".venv", "artifacts", "build", "dist", "dist-electron", "dist-renderer",
     "node_modules", "release", "desktop", "docs", "scripts",
 }
-WORKSPACE_EXCLUDE_FILES = {
-    "codecub/experiments/tasks.py",  # old benchmark answer keys
-}
+WORKSPACE_EXCLUDE_FILES: set[str] = set()
 
 PROVIDER_TRANSIENT_CODES = {429, 500, 502, 503, 504}
 
@@ -179,7 +179,9 @@ def preflight_all(output_root):
             checks["workspace_isolation"] = not (ws / "scripts").exists() and not (
                 ws / "artifacts"
             ).exists()
-            checks["no_eval_file_visibility"] = not (ws / "codecub" / "experiments" / "tasks.py").exists()
+            # The evaluation tree (task definitions / manifests / metrics) must
+            # never be visible to the model.
+            checks["no_eval_file_visibility"] = not (ws / "scripts" / "final_eval").exists()
             # Answer leakage: prompt must not contain path/baseline/mutation tokens.
             prompt = task.prompt.lower()
             leaked = (
@@ -338,7 +340,6 @@ def build_agent(workspace, task, flags, max_steps, requires_workspace_change=Tru
         max_new_tokens=args.max_new_tokens,
         secret_env_names=_configured_secret_names(args),
         feature_flags=flags,
-        context_window=args.context_window,
         allowed_tools=("read_file", "search", "symbol_search", "file_outline",
                        "find_references", "run_shell", "patch_file", "write_file"),
         requires_workspace_change=requires_workspace_change,

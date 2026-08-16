@@ -158,6 +158,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="CodeCub 2.0 Final Formal Evaluation")
     parser.add_argument("--phase", choices=("preflight", "run", "stats", "all"), default="all")
     parser.add_argument("--dry-run", action="store_true", help="plumbing check (no API)")
+    parser.add_argument("--limit", type=int, default=0, help="run only the first N schedule entries (smoke test)")
     args = parser.parse_args(argv)
 
     output = output_root()
@@ -215,9 +216,15 @@ def main(argv=None):
         (output / "runs" / "seeds" / f"{task.task_id}.json").write_text(
             json.dumps(seed_rows[-1], ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    (output / "runs" / "seeds" / "seed_rows.json").write_text(
+    seeds_dir = output / "runs" / "seeds"
+    seeds_dir.mkdir(parents=True, exist_ok=True)
+    (seeds_dir / "seed_rows.json").write_text(
         json.dumps(seed_rows, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    if args.limit:
+        schedule = schedule[: args.limit]
+        print(f"== LIMIT {args.limit} schedule entries (smoke) ==")
 
     for entry in schedule:
         run_one(entry, work_root, output, seed_rows, all_rows, dry_run=args.dry_run)
@@ -246,7 +253,9 @@ def main(argv=None):
                 run_stress_one(task, fault, repeat, work_root, output, all_rows)
 
     # Persist full results.
-    (output / "metrics" / "final_runs.json").write_text(
+    metrics_dir = output / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    (metrics_dir / "final_runs.json").write_text(
         json.dumps(all_rows, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     stats = build_statistics(all_rows)
