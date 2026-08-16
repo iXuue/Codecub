@@ -140,6 +140,10 @@ IGNORED_NAMES = {
     ".electron-cache", ".git", ".next", ".pytest_cache", ".ruff_cache", ".tmp",
     ".uv-cache", ".venv", "__pycache__", "artifacts", "build", "dist",
     "dist-electron", "dist-renderer", "node_modules", "release",
+    # Development artifacts of CodeCub itself, not the project under test:
+    # docs/ contains the Phase 3 design doc that names the mutation location;
+    # scripts/ contains this runner and the development probes.
+    "docs", "scripts", "desktop",
 }
 
 
@@ -162,6 +166,16 @@ def copy_workspace(src, dst, keep_codecub=False):
     shutil.copytree(src, dst, ignore=ignore)
 
 
+def copy_seed_memory(src_fixture, dst_fixture):
+    """Carry over a previously produced seed memory into a clean fixture."""
+    src_codecub = Path(src_fixture) / ".codecub"
+    if not src_codecub.exists():
+        raise ValueError(f"seed workspace has no .codecub: {src_fixture}")
+    dst_codecub = Path(dst_fixture) / ".codecub"
+    dst_codecub.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src_codecub, dst_codecub, dirs_exist_ok=True)
+
+
 class FastValidationRunner:
     def __init__(self, args):
         self.args = args
@@ -173,6 +187,13 @@ class FastValidationRunner:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.rows = []
         self.seed_rows = []
+        self.seed_workspace_root = (
+            Path(args.seed_workspace_dir).resolve() if args.seed_workspace_dir else None
+        )
+        wanted = set(args.tasks or [])
+        self.tasks = [
+            task for task in TASKS if not wanted or task.metadata.get("memory2_task") in wanted
+        ]
 
     # ------------------------------------------------------------------
     # Fixture helpers (mirror ExperimentRunner; no side-effect dirs)
@@ -414,18 +435,29 @@ class FastValidationRunner:
     # ------------------------------------------------------------------
 
     def run(self):
-        for task in TASKS:
+        for task in self.tasks:
             task_root = self.output_root / task.id
             task_root.mkdir(parents=True, exist_ok=True)
-            # 1) Fresh fixture workspace.
+            # 1) Fresh fixture workspace (no docs/scripts/desktop — see IGNORED_NAMES).
             fixture = task_root / "fixture"
             copy_workspace(REPO_ROOT, fixture, keep_codecub=False)
             self.preflight_task(task, fixture)
             order = str(task.metadata.get("seed_mutation_order") or "before")
             if order == "before":
                 self.apply_mutation(task, fixture)
-            # 2) Session A seed (real run, Memory 2.0 ON).
-            seed_row = self.run_seed(task, fixture)
+            # 2) Session A seed: run fresh, or carry over an existing seed memory.
+            if self.seed_workspace_root is not None:
+                seed_source = self.seed_workspace_root / task.id / "fixture"
+                copy_seed_memory(seed_source, fixture)
+                seed_row = {
+                    "task_id": task.id,
+                    "phase": "seed",
+                    "carried_over": True,
+                    "source": str(seed_source),
+                }
+                self.seed_rows.append(seed_row)
+            else:
+                seed_row = self.run_seed(task, fixture)
             if order == "after":
                 self.apply_mutation(task, fixture)
             self._write_json(task_root / "seed.json", seed_row)
@@ -547,6 +579,8 @@ def main(argv=None):
     parser.add_argument("--context-window", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--tasks", action="append", default=[])
+    parser.add_argument("--seed-workspace-dir", default=None)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     runner = FastValidationRunner(args)
