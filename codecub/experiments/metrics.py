@@ -95,8 +95,10 @@ def extract_metrics(report, trace):
         seen_searches.add(signature)
     planning = (report or {}).get("planning") or {}
     watchdog = (report or {}).get("watchdog") or {}
+    edit_watchdog = (report or {}).get("edit_decision_watchdog") or {}
     latest_prompt = prompt_rows[-1] if prompt_rows else {}
     compiler = latest_prompt.get("context_compiler") or {}
+    hysteresis = compiler.get("hysteresis") or {}
     result = {
         "attempts": (report or {}).get("attempts"),
         "tool_steps": (report or {}).get("tool_steps"),
@@ -118,6 +120,39 @@ def extract_metrics(report, trace):
         "compressed_history_tokens": compiler.get("compressed_history_tokens"),
         "repo_map_tokens": compiler.get("repo_map_tokens"),
         "raw_history_tokens": compiler.get("raw_history_tokens"),
+        "compiled_history_tokens": compiler.get("compiled_history_tokens"),
+        "history_reduction_ratio": compiler.get("history_reduction_ratio"),
+        "raw_model_visible_tokens": compiler.get("raw_model_visible_tokens"),
+        "compiled_model_visible_tokens": compiler.get("compiled_model_visible_tokens"),
+        "context_tokens_reclaimed": compiler.get("context_tokens_reclaimed"),
+        "context_reduction_ratio": compiler.get("context_reduction_ratio"),
+        "provider_actual_input_tokens": compiler.get("provider_actual_input_tokens"),
+        "hysteresis_steps_since_last_compression": hysteresis.get(
+            "steps_since_last_compression"
+        ),
+        "hysteresis_compression_skipped_no_gain": hysteresis.get(
+            "compression_skipped_no_gain", 0
+        ),
+        "hysteresis_compression_thrashing_detected": hysteresis.get(
+            "compression_thrashing_detected", False
+        ),
+        "hysteresis_high_watermark": hysteresis.get("high_watermark"),
+        "hysteresis_target_watermark": hysteresis.get("target_watermark"),
+        "edit_decision_count": planning.get("edit_decision_count", 0),
+        "edit_decision_evidence_request_count": planning.get("evidence_request_count", 0),
+        "edit_decision_invalid_count": planning.get("invalid_edit_decision_count", 0),
+        "edit_decision_watchdog_total": edit_watchdog.get("total_decisions", 0),
+        "edit_decision_watchdog_edits": edit_watchdog.get("edit_decisions", 0),
+        "edit_decision_watchdog_evidence": edit_watchdog.get("evidence_decisions", 0),
+        "edit_decision_watchdog_evidence_executed": edit_watchdog.get(
+            "evidence_executed", 0
+        ),
+        "edit_decision_watchdog_evidence_rejected": edit_watchdog.get(
+            "evidence_rejected_no_progress", 0
+        ),
+        "edit_decision_watchdog_no_progress_streak": edit_watchdog.get(
+            "no_progress_streak", 0
+        ),
         "fresh_fact_count": compiler.get("fresh_fact_count"),
         "stale_fact_count": compiler.get("stale_fact_count"),
         "read_calls": counts["read_file"],
@@ -249,6 +284,24 @@ def summarize(rows):
         "compressed_history_tokens",
         "repo_map_tokens",
         "raw_history_tokens",
+        "compiled_history_tokens",
+        "history_reduction_ratio",
+        "raw_model_visible_tokens",
+        "compiled_model_visible_tokens",
+        "context_tokens_reclaimed",
+        "context_reduction_ratio",
+        "provider_actual_input_tokens",
+        "hysteresis_steps_since_last_compression",
+        "hysteresis_compression_skipped_no_gain",
+        "edit_decision_count",
+        "edit_decision_evidence_request_count",
+        "edit_decision_invalid_count",
+        "edit_decision_watchdog_total",
+        "edit_decision_watchdog_edits",
+        "edit_decision_watchdog_evidence",
+        "edit_decision_watchdog_evidence_executed",
+        "edit_decision_watchdog_evidence_rejected",
+        "edit_decision_watchdog_no_progress_streak",
         "fresh_fact_count",
         "stale_fact_count",
     ):
@@ -256,4 +309,10 @@ def summarize(rows):
         summary[f"mean_{key}"] = _number(values)
         if key == "tool_steps":
             summary["median_tool_steps"] = _number(values, median)
+    thrash = [
+        bool(row.get("hysteresis_compression_thrashing_detected"))
+        for row in completed
+    ]
+    if thrash:
+        summary["thrash_detected_runs"] = sum(thrash)
     return summary

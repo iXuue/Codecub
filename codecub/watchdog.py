@@ -139,6 +139,7 @@ class ProgressWatchdog:
         action_error_loop_limit=DEFAULT_ACTION_ERROR_LOOP_LIMIT,
         recovery_window=DEFAULT_RECOVERY_WINDOW,
         semantic_read_overlap=DEFAULT_SEMANTIC_READ_OVERLAP,
+        file_hash_fn=None,
     ):
         self.window = int(window)
         self.no_progress_window_limit = int(no_progress_window_limit)
@@ -148,6 +149,10 @@ class ProgressWatchdog:
         self.action_error_loop_limit = int(action_error_loop_limit)
         self.recovery_window = int(recovery_window)
         self.semantic_read_overlap = float(semantic_read_overlap)
+        # Phase 2.6: 可选文件 hash 函数（由 runtime 注入）。启用后，同路径在
+        # mutation 之后（hash 变化）的 re-read 视为真实 progress（stale ->
+        # revalidation -> fresh），避免把“改完代码后的必要复读”误判为循环。
+        self.file_hash_fn = file_hash_fn
         maxlen = (
             max(
                 self.window,
@@ -179,6 +184,7 @@ class ProgressWatchdog:
         self._verification_loop_streak = 0
         self._action_error_streak = 0
         self._workspace_epoch = 0
+        self._file_hashes = {}
 
     # ------------------------------------------------------------------
     # 对外 API
@@ -278,6 +284,7 @@ class ProgressWatchdog:
             "recovery_success_count": self.recovery_success_count,
             "stuck_confirmed_count": self.stuck_confirmed_count,
             "stuck_pattern": self.current_pattern,
+            "file_hash_tracking": self.file_hash_fn is not None,
         }
 
     # ------------------------------------------------------------------
@@ -313,8 +320,20 @@ class ProgressWatchdog:
             path = canonical_path(args.get("path"))
             if path not in self._seen_files:
                 self._seen_files.add(path)
+                self._remember_file_hash(path)
                 signals.append(
                     ProgressSignal(PROGRESS_NEW_FILE, f"first read of {path}", step)
+                )
+                return signals
+            if self._file_changed_since_last_read(path):
+                # mutation 后同文件 hash 变化的 re-read：内容已变，复读是新证据。
+                self._remember_file_hash(path)
+                signals.append(
+                    ProgressSignal(
+                        PROGRESS_NEW_EVIDENCE,
+                        f"re-read of {path} after file change",
+                        step,
+                    )
                 )
                 return signals
             if self._is_fresh_read(path, args):
@@ -406,6 +425,29 @@ class ProgressWatchdog:
             if overlap >= self.semantic_read_overlap:
                 return False
         return True
+
+    def _file_changed_since_last_read(self, path):
+        """同路径文件内容 hash 相对上次 read 是否变化（Phase 2.6 fresh 判定）。"""
+        if self.file_hash_fn is None:
+            return False
+        previous = self._file_hashes.get(path)
+        if previous is None:
+            return False
+        try:
+            current = self.file_hash_fn(path)
+        except Exception:
+            return False
+        return bool(current) and current != previous
+
+    def _remember_file_hash(self, path):
+        if self.file_hash_fn is None:
+            return
+        try:
+            current = self.file_hash_fn(path)
+        except Exception:
+            return
+        if current:
+            self._file_hashes[path] = current
 
     def _track_streaks(self, event):
         """维护 verification / action-error 连续 streak。"""

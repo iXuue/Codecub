@@ -899,3 +899,154 @@ def test_native_compression_with_repo_map_does_not_crash():
     assert system_messages, "compiled native messages must keep a system preamble"
     text = system_messages[0]["content"]
     assert "Repository map" in text or "User task" in text
+
+
+# ===========================================================================
+# Phase 2.6 — Compression Hysteresis & 同口径 Token Metrics
+# ===========================================================================
+
+
+def test_hysteresis_does_not_recompress_same_span():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=2000, max_new_tokens=100)
+    )
+    history = _long_history(20)
+    _, meta1 = compiler.compile_text("t", WorkingState(), history)
+    assert meta1["compression_count"] == 1
+    # 同 span 再次 compile：不再每步重复压同一批 history。
+    _, meta2 = compiler.compile_text("t", WorkingState(), list(history))
+    assert meta2["compression_count"] == 1
+    snapshot = compiler.budget.hysteresis_snapshot(mode="legacy")
+    assert snapshot["compression_skipped_no_gain"] >= 1
+    assert snapshot["steps_since_last_compression"] >= 1
+
+
+def test_hysteresis_recompresses_after_new_entries():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=2000, max_new_tokens=100)
+    )
+    compiler.compile_text("t", WorkingState(), _long_history(20))
+    more = _long_history(20) + [
+        {
+            "role": "tool",
+            "name": "read_file",
+            "args": {"path": f"z{i}.py"},
+            "content": "X" * 600,
+        }
+        for i in range(4)
+    ]
+    _, meta = compiler.compile_text("t", WorkingState(), more)
+    assert meta["compression_count"] == 2
+    assert meta["hysteresis"]["steps_since_last_compression"] == 0
+
+
+def test_hysteresis_metadata_observable():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=3000, max_new_tokens=100)
+    )
+    _, meta = compiler.compile_text("t", WorkingState(), _long_history(30))
+    hysteresis = meta["hysteresis"]
+    assert hysteresis["high_watermark"] > hysteresis["target_watermark"]
+    assert "compression_skipped_no_gain" in hysteresis
+    assert "compression_thrashing_detected" in hysteresis
+    assert "last_compressed_span_fingerprint" in hysteresis
+    assert "steps_since_last_compression" in hysteresis
+    # legacy 别名：trigger_threshold == high_watermark。
+    assert meta["trigger_threshold"] == hysteresis["high_watermark"]
+
+
+def test_reset_run_state_clears_hysteresis_and_counts():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=2000, max_new_tokens=100)
+    )
+    compiler.compile_text("t", WorkingState(), _long_history(20))
+    assert compiler.compression_count >= 1
+    assert compiler.budget.hysteresis_snapshot()["last_compressed_history_len"] > 0
+    compiler.reset_run_state()
+    assert compiler.compression_count == 0
+    assert compiler.budget.hysteresis_snapshot()["last_compressed_history_len"] == 0
+    assert compiler.budget.hysteresis_snapshot()["compression_skipped_no_gain"] == 0
+    assert compiler.budget.hysteresis_snapshot()["steps_since_last_compression"] == 0
+
+
+def test_hysteresis_state_is_per_mode():
+    """legacy 与 native 两条管线的 hysteresis 状态互不污染。"""
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=2000, max_new_tokens=100)
+    )
+    compiler.compile_text("t", WorkingState(), _long_history(20))
+    legacy = compiler.budget.hysteresis_snapshot(mode="legacy")
+    native = compiler.budget.hysteresis_snapshot(mode="native")
+    assert legacy["last_compressed_history_len"] > 0
+    assert native["last_compressed_history_len"] == 0
+    assert legacy["steps_since_last_compression"] >= 0
+    # native 管线独立计数：跑 native 压缩不影响 legacy 的 span。
+    messages = [{"role": "system", "content": "s"}]
+    messages += _native_pair("c1", "read_file", {"path": "a.py"}, "A" * 3000)
+    compiler.compile_native("t", WorkingState(), messages)
+    assert compiler.budget.hysteresis_snapshot(mode="native")["last_compressed_history_len"] > 0
+    assert (
+        compiler.budget.hysteresis_snapshot(mode="legacy")["last_compressed_history_len"]
+        == legacy["last_compressed_history_len"]
+    )
+
+
+def test_token_metrics_same_caliber_legacy():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=3000, max_new_tokens=100)
+    )
+    history = _long_history(30)
+    text, meta = compiler.compile_text("t", WorkingState(), history)
+    raw = meta["raw_model_visible_tokens"]
+    compiled = meta["compiled_model_visible_tokens"]
+    assert raw > 0 and compiled > 0
+    # raw 与 compiled 覆盖同一范围：压缩后 raw >= compiled。
+    assert raw >= compiled
+    assert meta["context_tokens_reclaimed"] == raw - compiled
+    assert 0 <= meta["context_reduction_ratio"] <= 1
+    assert meta["compiled_history_tokens"] >= 0
+    assert 0 <= meta["history_reduction_ratio"] <= 1
+    assert text
+
+
+def test_token_metrics_same_caliber_native_no_compress():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=32000, max_new_tokens=512)
+    )
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    out, meta = compiler.compile_native("t", WorkingState(), messages)
+    assert meta["should_compress"] is False
+    # 未压缩：compiled == raw（修复 native 未压缩时 compiled 缺失的问题）。
+    assert meta["compiled_context_tokens"] == meta["candidate_context_tokens"]
+    assert meta["raw_model_visible_tokens"] == meta["compiled_model_visible_tokens"]
+    assert meta["context_tokens_reclaimed"] == 0
+    assert out == messages  # 原列表引用保持
+
+
+def test_token_metrics_same_caliber_native_compressed():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=20000, max_new_tokens=512)
+    )
+    messages = [{"role": "system", "content": "sys"}]
+    for index in range(6):
+        messages += _native_pair(
+            f"c{index}", "read_file", {"path": f"f{index}.py"}, "D" * 4000
+        )
+    out, meta = compiler.compile_native("t", WorkingState(), messages)
+    assert meta["should_compress"] is True
+    raw = meta["raw_model_visible_tokens"]
+    compiled = meta["compiled_model_visible_tokens"]
+    assert raw > 0 and compiled > 0
+    assert meta["context_tokens_reclaimed"] == max(0, raw - compiled)
+    assert meta["compiled_history_tokens"] >= 0
+    assert "provider_actual_input_tokens" in meta
+    assert "hysteresis" in meta
+    # 原子性保持：无 orphan tool message。
+    call_ids = set()
+    for message in out:
+        if message.get("tool_calls"):
+            for call in message["tool_calls"]:
+                call_ids.add(call["id"])
+    for message in out:
+        if message.get("role") == "tool":
+            assert message.get("tool_call_id") in call_ids, "orphan tool message"

@@ -27,6 +27,7 @@ from .context_compiler import (
     WorkingState,
 )
 from .code_index import CodeIndex
+from .edit_decision import EditDecisionWatchdog
 from .token_budget import resolve_prompt_budget, resolve_token_counter
 from .run_store import RunStore
 from .telemetry import aggregate_usage_records, build_usage_snapshot
@@ -68,8 +69,10 @@ RUNTIME_MODE_INTERACTIVE = "interactive"
 RUNTIME_MODE_EXPERIMENT = "experiment"
 STOP_REASON_STUCK_CONFIRMED = "stuck_confirmed"
 STOP_REASON_EMERGENCY_CAP_REACHED = "emergency_cap_reached"
-EDIT_EVIDENCE_RETRY_BUDGET = 2
-EDIT_DECISION_ATTEMPT_BUDGET = 4
+# Phase 2.6：取消小固定 edit-decision hard-stop
+# （EDIT_DECISION_ATTEMPT_BUDGET / EDIT_EVIDENCE_RETRY_BUDGET 已移除）。
+# 是否继续由 EditDecisionWatchdog 的“真实进展”决定；无进展由 ProgressWatchdog
+# 的 suspected -> recovery -> stuck_confirmed 状态机收尾。
 REPEATED_NO_PROGRESS_LIMIT = 5
 STOP_REASON_REPEATED_NO_PROGRESS = "repeated_no_progress"
 EXPLORATION_WARNING_THRESHOLD = 6
@@ -299,7 +302,10 @@ class Pico:
         self.current_run_usage = []
         self.current_run_source_reads = []
         self.current_planning = {}
-        self.watchdog = ProgressWatchdog()
+        self.watchdog = ProgressWatchdog(file_hash_fn=self._file_freshness)
+        self.edit_decision_watchdog = EditDecisionWatchdog(
+            file_hash_fn=self._file_freshness
+        )
         self.usage_store = UsageStore(self.root / ".codecub" / "usage")
         self.last_model_error = {}
         self.last_durable_promotions = []
@@ -497,6 +503,13 @@ class Pico:
             bucket.remove(item)
         bucket.append(item)
         del bucket[:-limit]
+
+    def _file_freshness(self, path):
+        """文件内容 hash（供 Watchdog / EditDecisionWatchdog 做 stale->fresh 判定）。"""
+        try:
+            return memorylib.file_freshness(path, self.root)
+        except Exception:
+            return None
 
     def build_tools(self):
         tools = toolkit.build_tool_registry(self)
@@ -1397,6 +1410,9 @@ class Pico:
             # Phase 2: Task-local Working State 生命周期 = 本次 ask。
             self.working_state = WorkingState()
             self.working_state.set_goal(user_message)
+        if self.context_compiler is not None:
+            # Phase 2.6: 压缩计数 / summary 栈 / hysteresis 状态同样 task-local。
+            self.context_compiler.reset_run_state()
         self.current_run_dir = self.run_store.start_run(task_state)
         self.emit_run_status(
             task_state,
@@ -1421,7 +1437,11 @@ class Pico:
         finalization_required = False
         finalization_rejections = 0
         # Phase 1: 每次 ask() 独立跟踪 stuck 状态，不跨 run 累积。
-        self.watchdog = ProgressWatchdog()
+        self.watchdog = ProgressWatchdog(file_hash_fn=self._file_freshness)
+        # Phase 2.6: edit-decision 进展跟踪同样 task-local。
+        self.edit_decision_watchdog = EditDecisionWatchdog(
+            file_hash_fn=self._file_freshness
+        )
         step_budget = self.effective_step_budget
         attempt_cap = (
             max(step_budget * 3, step_budget + 4)
@@ -1863,6 +1883,11 @@ class Pico:
                 and actual_tokens > 0
             ):
                 prompt_metadata["actual_input_tokens"] = actual_tokens
+                # Phase 2.6: provider 实际 input tokens（与 raw/compiled 估计同场对比）。
+                prompt_metadata["provider_actual_input_tokens"] = actual_tokens
+                compiler_meta = prompt_metadata.get("context_compiler")
+                if isinstance(compiler_meta, dict):
+                    compiler_meta["provider_actual_input_tokens"] = actual_tokens
                 prompt_metadata["token_estimation_error"] = (
                     abs(actual_tokens - estimated_tokens) / actual_tokens
                 )
@@ -1981,20 +2006,13 @@ class Pico:
                             decision = call.arguments.get("decision")
                             requested_name = call.arguments.get("tool")
                             requested_args = call.arguments.get("arguments")
-                        if (
-                            self.current_planning.get("edit_decision_count", 0)
-                            >= EDIT_DECISION_ATTEMPT_BUDGET
-                        ):
-                            return self.stop_model_error_run(
-                                task_state,
-                                RuntimeError("edit_decision_exhausted"),
-                                model_started_at,
-                                run_started_wall,
-                                run_started_at,
-                            )
+                        # Phase 2.6：取消小固定 hard-stop（edit_decision = 4）。
+                        # 是否继续由“真实进展”决定（EditDecisionWatchdog 分类 +
+                        # ProgressWatchdog suspected/recovery/confirmed 状态机）。
                         self.current_planning["edit_decision_count"] = (
                             self.current_planning.get("edit_decision_count", 0) + 1
                         )
+                        self.edit_decision_watchdog.record_decision(decision)
                         allowed = (
                             {"patch_file", "write_file"}
                             if decision == "edit"
@@ -2015,29 +2033,110 @@ class Pico:
                                 "retry",
                                 "Invalid edit decision; submit one allowed structured decision.",
                             )
-                        elif (
-                            decision == "need_evidence"
-                            and self.current_planning.get("evidence_request_count", 0)
-                            >= EDIT_EVIDENCE_RETRY_BUDGET
-                        ):
-                            # The evidence budget limits executed reads/searches,
-                            # not the model's opportunity to correct an over-budget
-                            # request.  Keep this decision attempt counted, reject
-                            # the request without running it, and reserve any
-                            # remaining bounded decision attempt for an edit.
-                            kind, payload = (
-                                "retry",
-                                "Evidence-request budget exhausted; do not request "
-                                "more evidence. Make the smallest justified edit now.",
+                        elif decision == "need_evidence":
+                            # 单次 need_evidence 仍只能使用受控 read/search/symbol 工具
+                            # （安全边界不变）；取消的是“第几次”的小固定上限。
+                            classification = (
+                                self.edit_decision_watchdog.classify_evidence_request(
+                                    requested_name, requested_args, task_state.tool_steps
+                                )
                             )
-                        else:
-                            if decision == "need_evidence":
+                            if classification.progress:
                                 self.current_planning["evidence_request_count"] = (
                                     self.current_planning.get(
                                         "evidence_request_count", 0
                                     )
                                     + 1
                                 )
+                                kind, payload = (
+                                    "tool",
+                                    {
+                                        "name": requested_name,
+                                        "args": requested_args,
+                                        "tool_call_id": call.id,
+                                        "edit_decision": decision,
+                                    },
+                                )
+                            else:
+                                # 重复 evidence 且无 workspace change / 文件 hash 未变：
+                                # 拒绝执行（不烧真实工具步），并把 no-progress 事件喂给主
+                                # Watchdog，使“重复 evidence”也能 suspected -> recovery
+                                # -> stuck_confirmed。
+                                self.edit_decision_watchdog.record_no_progress(
+                                    classification
+                                )
+                                self.emit_trace(
+                                    task_state,
+                                    "edit_decision_no_progress",
+                                    {
+                                        "tool": requested_name,
+                                        "reason": classification.reason,
+                                        "edit_decision_count": self.current_planning.get(
+                                            "edit_decision_count", 0
+                                        ),
+                                        "no_progress_streak": self.edit_decision_watchdog.no_progress_streak,
+                                    },
+                                )
+                                rejected_meta = {
+                                    "tool_status": "rejected",
+                                    "tool_error_code": "repeated_evidence",
+                                    "security_event_type": "",
+                                    "risk_level": "low",
+                                    "read_only": True,
+                                    "affected_paths": [],
+                                    "workspace_changed": False,
+                                    "diff_summary": [],
+                                }
+                                watchdog_decision = self._advance_watchdog(
+                                    task_state,
+                                    requested_name,
+                                    requested_args,
+                                    "rejected: repeated evidence request",
+                                    # 拒绝的事件没有真实工具执行，tool_steps 不前进；
+                                    # 用单调递增的 attempts 作为 watchdog step，
+                                    # 保证 recovery 窗口能正常计时。
+                                    task_state.attempts,
+                                    metadata=rejected_meta,
+                                )
+                                if watchdog_decision.suspected_now:
+                                    # 重复 evidence 触发 stuck suspected：注入 Recovery
+                                    # Turn（与工具执行路径一致），继续运行。
+                                    self.record(
+                                        {
+                                            "role": "assistant",
+                                            "content": RECOVERY_TURN_PROMPT,
+                                            "created_at": now(),
+                                        }
+                                    )
+                                    native_messages.append(
+                                        {"role": "user", "content": RECOVERY_TURN_PROMPT}
+                                    )
+                                    self.emit_run_status(
+                                        task_state,
+                                        "stuck_suspected",
+                                        "Recovery turn",
+                                        detail=watchdog_decision.stuck_pattern,
+                                        started_at=run_started_wall,
+                                        run_started_at=run_started_at,
+                                    )
+                                    self.run_store.write_task_state(task_state)
+                                    continue
+                                if watchdog_decision.confirmed_now:
+                                    return self.stop_stuck_confirmed_run(
+                                        task_state,
+                                        user_message,
+                                        run_started_wall,
+                                        run_started_at,
+                                    )
+                                kind, payload = (
+                                    "retry",
+                                    "Repeated evidence request: this read/search/symbol "
+                                    "repeats already-observed evidence without a workspace "
+                                    "change. Make the smallest justified edit now, or "
+                                    "request genuinely new evidence (new file, new range, "
+                                    "new symbol, new search, or a re-read after a file change).",
+                                )
+                        else:
                             kind, payload = (
                                 "tool",
                                 {
@@ -2069,6 +2168,12 @@ class Pico:
                                     "tool_call_id": call.id,
                                     "content": f"error: {payload}",
                                 }
+                            )
+                        else:
+                            # Phase 2.6: 拒绝原因要能被 native 模型看到（不保留
+                            # 未应答的 assistant tool call，因此补一条 user 消息）。
+                            native_messages.append(
+                                {"role": "user", "content": str(payload)}
                             )
                     elif not raw.raw_metadata.get("queued_native_call"):
                         native_messages.append(
@@ -2105,7 +2210,22 @@ class Pico:
                             },
                         )
                 else:
-                    kind, payload = "final", raw.text
+                    final_text = str(raw.text or "").strip()
+                    if not final_text:
+                        # Phase 2.6（Probe B/C 暴露）：native 路径与 legacy 一致，
+                        # 空 final 不算成功完成——拒绝并要求模型给出非空答案或工具
+                        # 调用，避免“completed 但 final_answer 为空”的误导记录。
+                        kind, payload = (
+                            "retry",
+                            Pico.retry_notice("model returned an empty final response"),
+                        )
+                        # 让 native 模型看到拒绝原因（空 final 没有未应答的
+                        # assistant tool call，直接补一条 user 消息）。
+                        native_messages.append(
+                            {"role": "user", "content": str(payload)}
+                        )
+                    else:
+                        kind, payload = "final", final_text
             else:
                 kind, payload = self.parse(raw)
             self.emit_trace(
@@ -2252,19 +2372,22 @@ class Pico:
                 ):
                     decision = payload["edit_decision"]
                     if decision == "need_evidence":
-                        remaining = max(
-                            0,
-                            EDIT_EVIDENCE_RETRY_BUDGET
-                            - self.current_planning["evidence_request_count"],
+                        # 真实执行的 evidence 登记进 EditDecisionWatchdog，
+                        # 供后续重复检测（同范围 / 同 search / 同 symbol）。
+                        self.edit_decision_watchdog.mark_evidence_executed(
+                            name, args, task_state.tool_steps
                         )
                         notice = (
-                            "Bounded edit decision recorded as need_evidence. "
-                            f"Remaining evidence requests: {remaining}. "
-                            "When the available evidence is sufficient, make the smallest justified edit."
+                            "Edit decision recorded as need_evidence and executed. "
+                            "Continue while each request adds genuinely new evidence "
+                            "(new file, new range, new symbol, new search, or a re-read "
+                            "after a file change); repeated evidence with no workspace "
+                            "change will be rejected. When the evidence is sufficient, "
+                            "make the smallest justified edit."
                         )
                     else:
                         notice = (
-                            "Bounded edit decision recorded as edit. "
+                            "Edit decision recorded as edit. "
                             "Run a focused verification command before finalizing."
                         )
                     native_messages.append({"role": "user", "content": notice})
@@ -2527,14 +2650,22 @@ class Pico:
         self.write_final_report(task_state)
         return final
 
-    def _advance_watchdog(self, task_state, name, args, result, step):
+    def _advance_watchdog(self, task_state, name, args, result, step, metadata=None):
         """把一次工具事件交给 Progress Watchdog，并发射 trace 事件。
 
         suspected_now 触发时由 ask() 负责注入 Recovery Turn 提示；本方法只做
         watchdog 推进与可观测性记录。返回 WatchdogDecision。
+
+        `metadata` 缺省使用 `_last_tool_result_metadata`（真实工具执行路径）；
+        也可显式传入（例如 EditDecisionWatchdog 拒绝重复 evidence 时合成的
+        rejected 事件，此时没有真实工具执行）。
         """
         decision = self.watchdog.record_tool_event(
-            name, args, self._last_tool_result_metadata, result, step
+            name,
+            args,
+            self._last_tool_result_metadata if metadata is None else metadata,
+            result,
+            step,
         )
         for signal in decision.progress_signals:
             self.emit_trace(
@@ -3240,6 +3371,7 @@ class Pico:
                 else int(self.emergency_cap or 0)
             ),
             "watchdog": self.watchdog.snapshot(),
+            "edit_decision_watchdog": self.edit_decision_watchdog.snapshot(),
             "prompt_metadata": self.last_prompt_metadata,
             "usage_summary": aggregate_usage_records(self.current_run_usage),
             "planning": {

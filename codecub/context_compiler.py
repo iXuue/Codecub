@@ -38,6 +38,7 @@ Working State 生命周期：Task Start → Task-local → Task Finish → archi
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -59,7 +60,20 @@ DEFAULT_SAFETY_MARGIN_TOKENS = 256
 DEFAULT_TOOL_SCHEMA_OVERHEAD_TOKENS = 800
 
 # 压缩触发阈值：estimated_candidate_input / usable_input_budget 达到该值才触发。
+# Phase 2.6 起由 hysteresis 的 high_watermark 取代（见下）；本常量保留为
+# 旧默认的文档化别名，避免破坏依赖 DEFAULT_COMPRESSION_TRIGGER_THRESHOLD 的旧代码。
 DEFAULT_COMPRESSION_TRIGGER_THRESHOLD = 0.75
+
+# Phase 2.6 — Compression Hysteresis：
+#   HIGH_WATERMARK -> compress -> TARGET_WATERMARK（留出 headroom）-> 重新涨到
+#   HIGH 才再次压缩。
+# 目标：不要再每步重复压同一批 history（Phase 2.5 Probe A 曾单 run 53 次压缩）。
+DEFAULT_COMPRESSION_HIGH_WATERMARK = 0.80
+DEFAULT_COMPRESSION_TARGET_WATERMARK = 0.55
+DEFAULT_COMPRESSION_MIN_RECLAIM_TOKENS = 128
+DEFAULT_COMPRESSION_MIN_RECLAIM_RATIO = 0.05
+# 距上次压缩至少新增多少条 history 才允许再次压缩（防止同批 history 每步重压）。
+DEFAULT_COMPRESSION_MIN_NEW_HISTORY_ENTRIES = 4
 
 # 各层在 usable budget 中的默认占比（compiled 各段再按实际内容收缩）。
 DEFAULT_LAYER_BUDGET_RATIOS = {
@@ -412,21 +426,68 @@ class WorkingState:
 
 
 @dataclass
+class _HysteresisState:
+    """单条编译管线（legacy / native）的 hysteresis 运行状态。
+
+    legacy 与 native 是两条独立管线，在同一 runtime 回合内都会跑（native 模式
+    下 legacy compile_text 仍会为 observability 执行），因此压缩节流状态必须
+    按管线隔离，避免两侧 history 长度口径互相污染。
+    """
+
+    steps_since_last_compression: int = 0
+    compression_skipped_no_gain: int = 0
+    compression_thrashing_detected: bool = False
+    last_compressed_history_len: int = 0
+    last_compressed_span_fingerprint: str = ""
+    last_compiled_context_tokens: Optional[int] = None
+    last_compression_compiled_tokens: Optional[int] = None
+
+
+HYSTERESIS_MODES = ("legacy", "native")
+
+
+@dataclass
 class ContextBudget:
-    """usable input budget 与压缩触发阈值。
+    """usable input budget 与压缩触发阈值（Phase 2.6 起带 Compression Hysteresis）。
 
     usable_input_budget = model_context_window - reserved_output_tokens
                           - tool_schema_overhead - safety_margin_tokens
     window 未知时使用 conservative fallback，并记录 budget_source。
+
+    压缩决策（hysteresis，per-mode）：
+        utilization >= high_watermark 且距上次压缩新增 history 达到门槛
+            -> compress -> 目标是把 model-visible 降到 target_watermark 以下
+        （留出 headroom）；此后要重新涨回 high_watermark 才再次压缩，
+        不再“每步重复压同一批 history”。
     """
 
     usable_input_budget: int
-    trigger_threshold: float = DEFAULT_COMPRESSION_TRIGGER_THRESHOLD
     budget_source: str = "configured"  # configured | fallback
     context_window: Optional[int] = None
     reserved_output_tokens: int = DEFAULT_RESERVED_OUTPUT_TOKENS
     tool_schema_overhead: int = DEFAULT_TOOL_SCHEMA_OVERHEAD_TOKENS
     safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS
+    # legacy 别名（已废弃）：显式传入时作为 high_watermark 使用；
+    # 未传入时保持与 high_watermark 一致，供旧脚本读 trigger_threshold。
+    trigger_threshold: Optional[float] = None
+    # Phase 2.6 hysteresis 参数。
+    high_watermark: float = DEFAULT_COMPRESSION_HIGH_WATERMARK
+    target_watermark: float = DEFAULT_COMPRESSION_TARGET_WATERMARK
+    min_reclaim_tokens: int = DEFAULT_COMPRESSION_MIN_RECLAIM_TOKENS
+    min_reclaim_ratio: float = DEFAULT_COMPRESSION_MIN_RECLAIM_RATIO
+    min_new_history_entries: int = DEFAULT_COMPRESSION_MIN_NEW_HISTORY_ENTRIES
+    # Phase 2.6 hysteresis 运行状态（task-local，按管线隔离；
+    # 由 compiler.reset_run_state() 经 reset_hysteresis() 清零）。
+    _hysteresis: dict = field(
+        default_factory=lambda: {mode: _HysteresisState() for mode in HYSTERESIS_MODES}
+    )
+
+    def __post_init__(self):
+        if self.trigger_threshold is not None:
+            # legacy 调用方（如 evaluator）显式传旧阈值：直接作为 high_watermark。
+            self.high_watermark = float(self.trigger_threshold)
+        else:
+            self.trigger_threshold = self.high_watermark
 
     @classmethod
     def resolve(
@@ -470,8 +531,97 @@ class ContextBudget:
             return 1.0
         return estimated_tokens / self.usable_input_budget
 
-    def should_compress(self, estimated_tokens):
-        return self.utilization(estimated_tokens) >= self.trigger_threshold
+    def _state(self, mode):
+        mode = str(mode or "legacy")
+        if mode not in self._hysteresis:
+            self._hysteresis[mode] = _HysteresisState()
+        return self._hysteresis[mode]
+
+    def should_compress(self, estimated_tokens, history_len=0, history_fingerprint="", mode="legacy"):
+        """Phase 2.6 hysteresis 压缩判定（per-mode）。
+
+        单 threshold（utilization >= 0.75 -> compress）升级为：
+          HIGH_WATERMARK -> compress -> TARGET_WATERMARK（headroom）-> 重新涨到
+          HIGH 才再次压缩；
+        并且距上次压缩新增 history 未达 min_new_history_entries（或压缩 span
+        指纹未变）时跳过（compression_skipped_no_gain），避免同批 history 每步重压。
+
+        说明：不设“compiled 超预算就无条件再压”的后门——对同一批 history 再压
+        不产生增益（compiled 并不会因此变小），只会空转；真正的新内容由
+        new_entries / span 指纹判断。
+        """
+        state = self._state(mode)
+        state.steps_since_last_compression += 1
+        if self.utilization(estimated_tokens) < self.high_watermark:
+            return False
+        if state.last_compressed_history_len:
+            new_entries = max(0, int(history_len or 0) - state.last_compressed_history_len)
+            if new_entries < self.min_new_history_entries:
+                state.compression_skipped_no_gain += 1
+                return False
+            if (
+                history_fingerprint
+                and state.last_compressed_span_fingerprint
+                and history_fingerprint == state.last_compressed_span_fingerprint
+            ):
+                # 完全同一批 history span：压缩无增益。
+                state.compression_skipped_no_gain += 1
+                return False
+        return True
+
+    def mark_compressed(self, history_len, history_fingerprint, compiled_tokens, estimated_tokens, mode="legacy"):
+        """一次压缩真实发生后的登记；返回本次压缩的回收统计（per-mode）。"""
+        state = self._state(mode)
+        state.steps_since_last_compression = 0
+        state.last_compressed_history_len = int(history_len or 0)
+        state.last_compressed_span_fingerprint = str(history_fingerprint or "")
+        state.last_compression_compiled_tokens = compiled_tokens
+        reclaimed = max(0, int(estimated_tokens or 0) - int(compiled_tokens or 0))
+        ratio = reclaimed / int(estimated_tokens) if estimated_tokens else 0.0
+        if (
+            compiled_tokens
+            and estimated_tokens
+            and (reclaimed < self.min_reclaim_tokens or ratio < self.min_reclaim_ratio)
+        ):
+            # 压缩跑了但几乎没回收：同一批 history 的压缩没有产生有效空间。
+            # （注意：native 模式下 recent floor 会保留整段 tool result，
+            #  compiled 常驻接近可用预算属于结构性现象，不作为 thrash 依据。）
+            state.compression_thrashing_detected = True
+        return {"reclaimed_tokens": reclaimed, "reduction_ratio": ratio}
+
+    def note_compiled(self, compiled_tokens, mode="legacy"):
+        """记录一次编译的 model-visible 大小（per-mode，供 observability）。"""
+        self._state(mode).last_compiled_context_tokens = compiled_tokens
+        return self
+
+    def reset_hysteresis(self, mode=None):
+        """task-local：每次 ask 开始清零（与 Working State 生命周期一致）。
+
+        mode=None 时重置全部管线。
+        """
+        if mode is None:
+            for name in list(self._hysteresis):
+                self._hysteresis[name] = _HysteresisState()
+            return self
+        self._hysteresis[str(mode)] = _HysteresisState()
+        return self
+
+    def hysteresis_snapshot(self, mode="legacy"):
+        state = self._state(mode)
+        return {
+            "high_watermark": self.high_watermark,
+            "target_watermark": self.target_watermark,
+            "min_reclaim_tokens": self.min_reclaim_tokens,
+            "min_reclaim_ratio": self.min_reclaim_ratio,
+            "min_new_history_entries": self.min_new_history_entries,
+            "steps_since_last_compression": state.steps_since_last_compression,
+            "compression_skipped_no_gain": state.compression_skipped_no_gain,
+            "compression_thrashing_detected": state.compression_thrashing_detected,
+            "last_compressed_history_len": state.last_compressed_history_len,
+            "last_compressed_span_fingerprint": state.last_compressed_span_fingerprint,
+            "last_compiled_context_tokens": state.last_compiled_context_tokens,
+            "last_compression_compiled_tokens": state.last_compression_compiled_tokens,
+        }
 
 
 REDACTED_VALUE = "<redacted>"
@@ -822,6 +972,44 @@ class ContextCompiler:
         self.compressed_summaries = []  # recursive condensation 栈
 
     # ------------------------------------------------------------------
+    # Task-local 生命周期
+    # ------------------------------------------------------------------
+
+    def reset_run_state(self):
+        """每次 ask() 开始时清零 task-local 状态（与 Working State 生命周期一致）。
+
+        清零项：压缩计数 / 压缩失败计数 / summary 栈 / 上一次编译产物 /
+        hysteresis 运行状态。不触碰 pinned/working state 之外的对象状态。
+        """
+        self.last_compile_metadata = {}
+        self.compression_count = 0
+        self.compression_failure_count = 0
+        self.compressed_summaries = []
+        self.last_native_messages = None
+        if self.budget is not None:
+            self.budget.reset_hysteresis()
+        return self
+
+    def _history_span_fingerprint(self, history):
+        """标识“会被压缩的 history span”（最旧的 1/3），用于跳过同批重复压缩。
+
+        新条目不断追加时，最旧 1/3 只在旧条目滚出该段时变化，因此能识别
+        “同一批旧 history 被反复重压”的情况（observability + exact-replay skip）。
+        """
+        if not history:
+            return ""
+        span = history[: max(1, len(history) // 3)]
+        parts = []
+        for item in span:
+            if item.get("role") == "tool":
+                parts.append(
+                    f"{item.get('name', '')}:{json.dumps(item.get('args', {}), sort_keys=True)}"
+                )
+            else:
+                parts.append(str(item.get("content", ""))[:60])
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+    # ------------------------------------------------------------------
     # 公共入口
     # ------------------------------------------------------------------
 
@@ -832,11 +1020,22 @@ class ContextCompiler:
         pinned_extra = pinned_extra or {}
         pinned = self._build_pinned(user_message, pinned_extra)
         estimated = self._estimate_candidate_tokens(pinned, working_state, history)
-        should_compress = self.budget.should_compress(estimated)
+        history_fingerprint = self._history_span_fingerprint(history)
+        over_high = self.budget.utilization(estimated) >= self.budget.high_watermark
+        should_compress = self.budget.should_compress(
+            estimated, len(history), history_fingerprint, mode="legacy"
+        )
         compressed_history = []
         recent_items = []
         if should_compress:
             self.compression_count += 1
+            compressed_history, recent_items = self._partition_history(
+                history, working_state
+            )
+        elif over_high:
+            # Phase 2.6 hysteresis skip：仍分区 + 压缩，保持 model-visible 有界
+            # （避免两次计次压缩之间上下文无界增长），但不计为一次 compression
+            # （不触发 checkpoint / 不重置 span / 不计数）。
             compressed_history, recent_items = self._partition_history(
                 history, working_state
             )
@@ -850,6 +1049,12 @@ class ContextCompiler:
             compressed_history_items=compressed_history,
             repo_map_items=repo_map_items,
         )
+        compiled_tokens = self._count(compiled.text)
+        self.budget.note_compiled(compiled_tokens, mode="legacy")
+        if should_compress:
+            self.budget.mark_compressed(
+                len(history), history_fingerprint, compiled_tokens, estimated, mode="legacy"
+            )
         self.last_compile_metadata = self._metadata(
             user_message=user_message,
             working_state=working_state,
@@ -877,8 +1082,16 @@ class ContextCompiler:
         pinned_extra = pinned_extra or {}
         pinned = self._build_pinned(user_message, pinned_extra)
         estimated = self._estimate_native_tokens(native_messages)
-        should_compress = self.budget.should_compress(estimated)
-        if not should_compress:
+        history_fingerprint = self._history_span_fingerprint(native_messages)
+        over_high = self.budget.utilization(estimated) >= self.budget.high_watermark
+        should_compress = self.budget.should_compress(
+            estimated, len(native_messages), history_fingerprint, mode="native"
+        )
+        if not should_compress and not over_high:
+            # 未超 HIGH：消息量小，无需压缩；返回原列表引用，保持 runtime 的
+            # 追加语义不变。
+            self.last_native_messages = native_messages
+            self.budget.note_compiled(estimated, mode="native")
             self.last_compile_metadata = self._metadata(
                 user_message=user_message,
                 working_state=working_state,
@@ -893,12 +1106,13 @@ class ContextCompiler:
                 compiled=None,
                 native_mode=True,
             )
-            # 未压缩时返回原列表引用，保持 runtime 的追加语义不变。
             return (
                 original_messages if original_messages is not None else native_messages,
                 self.last_compile_metadata,
             )
-        self.compression_count += 1
+        counted = should_compress
+        if counted:
+            self.compression_count += 1
         groups = self._group_native_messages(native_messages)
         recent_groups, older_groups = self._partition_native_groups(groups)
         compressed_history_items, older_raw = self._compress_older_groups(older_groups, working_state)
@@ -931,6 +1145,12 @@ class ContextCompiler:
             messages.append(group["message"])
             messages.extend(group.get("results", []))
         self.last_native_messages = messages
+        compiled_tokens = self._estimate_native_tokens(messages)
+        self.budget.note_compiled(compiled_tokens, mode="native")
+        if counted:
+            self.budget.mark_compressed(
+                len(native_messages), history_fingerprint, compiled_tokens, estimated, mode="native"
+            )
         self.last_compile_metadata = self._metadata(
             user_message=user_message,
             working_state=working_state,
@@ -940,7 +1160,7 @@ class ContextCompiler:
             compressed_history_items=compressed_history_items,
             repo_map_items=repo_map_items,
             repo_map_details=repo_map_details,
-            should_compress=True,
+            should_compress=counted,
             estimated_tokens=estimated,
             compiled=None,
             native_mode=True,
@@ -1121,7 +1341,13 @@ class ContextCompiler:
         ], raw_items
 
     def _partition_history(self, history, working_state):
-        """legacy：把 history 分为 older（可压缩）与 recent（原文）。"""
+        """legacy：把 history 分为 older（可压缩）与 recent（原文）。
+
+        Phase 2.6 修正：recent 必须受 recent_verbatim 层预算约束（至少保留
+        最新 1 条原文），超出部分进入 older 压缩；旧的 `or not older` 条件会让
+        整段 history 都留在 recent，导致 legacy “压缩” 空转（compiled ≈ raw，
+        同口径 metrics 暴露为 reclaimed=0）。
+        """
         budget_tokens = int(
             self.budget.usable_input_budget
             * self.layer_ratios.get("recent_verbatim", 0.38)
@@ -1131,7 +1357,7 @@ class ContextCompiler:
         used = 0
         for item in reversed(history):
             cost = self._count(self._render_history_item(item))
-            if used + cost <= budget_tokens or not older:
+            if used + cost <= budget_tokens or not recent:
                 recent.append(item)
                 used += cost
             else:
@@ -1247,11 +1473,57 @@ class ContextCompiler:
         should_compress = kwargs.get("should_compress", False)
         estimated = kwargs.get("estimated_tokens", 0)
         repo_map_details = kwargs.get("repo_map_details", {})
-        compiled_text = compiled.text if compiled is not None else ""
         if native_mode:
-            compiled_text = str(
-                self._estimate_native_tokens(getattr(self, "last_native_messages", []) or [])
+            compiled_tokens = self._estimate_native_tokens(
+                getattr(self, "last_native_messages", []) or []
             )
+        else:
+            compiled_tokens = self._count(compiled.text if compiled is not None else "")
+        pinned_tokens = sum(item.token_count(self.token_counter) for item in pinned)
+        working_state_tokens = self._count(working_state.to_text())
+        recent_verbatim_tokens = sum(
+            item.token_count(self.token_counter) for item in recent_items
+        )
+        compressed_history_tokens = sum(
+            item.token_count(self.token_counter) for item in compressed_history_items
+        )
+        repo_map_tokens = sum(
+            item.token_count(self.token_counter) for item in repo_map_items
+        )
+        # Phase 2.6 — 同口径 token metrics：raw / compiled 覆盖同一范围，ratio 才可算。
+        if native_mode:
+            raw_history_tokens = self._estimate_native_tokens(history)
+            compiled_history_tokens = self._estimate_native_tokens(
+                getattr(self, "last_native_messages", []) or []
+            )
+            raw_model_visible = raw_history_tokens
+            compiled_model_visible = compiled_history_tokens
+        else:
+            raw_history_tokens = (
+                self._count(
+                    "\n".join(self._render_history_item(item) for item in history)
+                )
+                if history
+                else 0
+            )
+            compiled_history_tokens = recent_verbatim_tokens + compressed_history_tokens
+            raw_model_visible = (
+                pinned_tokens + working_state_tokens + raw_history_tokens + repo_map_tokens
+            )
+            compiled_model_visible = compiled_tokens
+        context_reclaimed = max(0, raw_model_visible - compiled_model_visible)
+        context_reduction_ratio = (
+            context_reclaimed / raw_model_visible if raw_model_visible else 0.0
+        )
+        history_reclaimed = max(0, raw_history_tokens - compiled_history_tokens)
+        history_reduction_ratio = (
+            history_reclaimed / raw_history_tokens if raw_history_tokens else 0.0
+        )
+        hysteresis = (
+            self.budget.hysteresis_snapshot(mode="native" if native_mode else "legacy")
+            if self.budget is not None
+            else {}
+        )
         return {
             "compiler": "context_compiler",
             "native_mode": native_mode,
@@ -1260,25 +1532,32 @@ class ContextCompiler:
             "compression_failure_count": self.compression_failure_count,
             "should_compress": should_compress,
             "candidate_context_tokens": estimated,
-            "compiled_context_tokens": self._count(compiled_text),
-            "pinned_tokens": sum(item.token_count(self.token_counter) for item in pinned),
-            "working_state_tokens": self._count(working_state.to_text()),
-            "recent_verbatim_tokens": sum(item.token_count(self.token_counter) for item in recent_items),
-            "compressed_history_tokens": sum(item.token_count(self.token_counter) for item in compressed_history_items),
-            "repo_map_tokens": sum(item.token_count(self.token_counter) for item in repo_map_items),
-            "raw_history_tokens": (
-                self._count(
-                    "\n".join(self._render_history_item(item) for item in history)
-                )
-                if history
-                else 0
-            ),
+            "compiled_context_tokens": compiled_tokens,
+            "pinned_tokens": pinned_tokens,
+            "working_state_tokens": working_state_tokens,
+            "recent_verbatim_tokens": recent_verbatim_tokens,
+            "compressed_history_tokens": compressed_history_tokens,
+            "repo_map_tokens": repo_map_tokens,
+            "raw_history_tokens": raw_history_tokens,
+            "compiled_history_tokens": compiled_history_tokens,
+            "history_reduction_ratio": history_reduction_ratio,
+            "raw_model_visible_tokens": raw_model_visible,
+            "compiled_model_visible_tokens": compiled_model_visible,
+            "context_tokens_reclaimed": context_reclaimed,
+            "context_reduction_ratio": context_reduction_ratio,
+            "provider_actual_input_tokens": None,  # runtime 在拿到 usage 后回填
             "fresh_fact_count": len(working_state.fresh_facts()),
             "stale_fact_count": len(working_state.stale_facts()),
             "estimated": True,
-            "budget_source": self.budget.budget_source,
-            "usable_input_budget": self.budget.usable_input_budget,
-            "trigger_threshold": self.budget.trigger_threshold,
+            "budget_source": self.budget.budget_source if self.budget is not None else "",
+            "usable_input_budget": (
+                self.budget.usable_input_budget if self.budget is not None else None
+            ),
+            # legacy 别名：旧脚本读 trigger_threshold；实际决策用 high_watermark。
+            "trigger_threshold": (
+                self.budget.high_watermark if self.budget is not None else None
+            ),
+            "hysteresis": hysteresis,
             "repo_map_selection": repo_map_details,
             "user_request": user_message,
         }

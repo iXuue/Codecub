@@ -18,6 +18,7 @@ from codecub.watchdog import (
     PATTERN_ALTERNATING_LOOP,
     PATTERN_IDENTICAL_LOOP,
     PATTERN_VERIFICATION_LOOP,
+    PROGRESS_NEW_EVIDENCE,
     ProgressWatchdog,
     WATCHDOG_STATE_NORMAL,
     WATCHDOG_STATE_RECOVERY,
@@ -264,6 +265,55 @@ def test_workspace_change_resets_verification_loop():
         5,
     )
     assert not decision.suspected_now
+
+
+def test_rereread_after_file_change_is_progress(tmp_path):
+    """Phase 2.6: mutation 后同文件 hash 变化的 re-read 是真实 progress
+    （stale -> revalidation -> fresh），不应误判为循环。"""
+    from codecub.memory import file_freshness
+
+    target = tmp_path / "a.py"
+    target.write_text("alpha\n", encoding="utf-8")
+    watchdog = ProgressWatchdog(
+        file_hash_fn=lambda path: file_freshness(path, tmp_path)
+    )
+    first = watchdog.record_tool_event(
+        "read_file",
+        {"path": "a.py", "start": 1, "end": 200},
+        {"tool_status": "ok"},
+        "alpha",
+        1,
+    )
+    assert first.progress_signals  # 首次 read：progress
+    assert watchdog.no_progress_score == 0
+    # 文件内容变化后，同 range 复读 = 新证据。
+    target.write_text("beta\n", encoding="utf-8")
+    second = watchdog.record_tool_event(
+        "read_file",
+        {"path": "a.py", "start": 1, "end": 200},
+        {"tool_status": "ok"},
+        "beta",
+        2,
+    )
+    assert second.progress_signals
+    assert second.progress_signals[-1].kind == PROGRESS_NEW_EVIDENCE
+    assert watchdog.no_progress_score == 0
+    # 内容未再变化时的完全重复复读仍是 no progress。
+    third = watchdog.record_tool_event(
+        "read_file",
+        {"path": "a.py", "start": 1, "end": 200},
+        {"tool_status": "ok"},
+        "beta",
+        3,
+    )
+    assert not third.progress_signals
+    assert watchdog.no_progress_score == 1
+
+
+def test_file_hash_tracking_reported_in_snapshot(tmp_path):
+    watchdog = ProgressWatchdog(file_hash_fn=lambda path: "h")
+    assert watchdog.snapshot()["file_hash_tracking"] is True
+    assert ProgressWatchdog().snapshot()["file_hash_tracking"] is False
 
 
 def test_semantic_read_loop_detected():
