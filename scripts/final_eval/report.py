@@ -100,7 +100,6 @@ def build_report(output_root, stats, meta):
     mreads = ma.get("repeated_read_delta", {})
     mfirst = ma.get("first_relevant_source_delta", {})
     msteps = ma.get("tool_step_delta", {})
-    mtok = ma.get("input_token_delta", {})
     a(f"- Pass: FULL {full.get('pass_rate')} vs CONTEXT {context.get('pass_rate')}")
     a(f"- Repeated reads: FULL {full.get('mean_repeated_reads')} vs CONTEXT {context.get('mean_repeated_reads')}")
     a(f"- Search before relevant source: FULL {full.get('mean_search_before_relevant')} vs CONTEXT {context.get('mean_search_before_relevant')}")
