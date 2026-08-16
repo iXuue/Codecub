@@ -96,6 +96,8 @@ def extract_metrics(report, trace):
     planning = (report or {}).get("planning") or {}
     watchdog = (report or {}).get("watchdog") or {}
     edit_watchdog = (report or {}).get("edit_decision_watchdog") or {}
+    memory_v2 = (report or {}).get("memory_v2") or {}
+    memory_activity = (report or {}).get("memory_v2_activity") or {}
     latest_prompt = prompt_rows[-1] if prompt_rows else {}
     compiler = latest_prompt.get("context_compiler") or {}
     hysteresis = compiler.get("hysteresis") or {}
@@ -210,6 +212,30 @@ def extract_metrics(report, trace):
         "stale_memory_rejection_count": len(
             ((report or {}).get("prompt_metadata") or {}).get("stale_paths") or []
         ),
+        # Phase 3 — Memory 2.0 metrics（report["memory_v2"]）。
+        "memory_v2_enabled": bool(memory_v2),
+        "memory_candidate_count": memory_v2.get("candidate_count", 0),
+        "memory_candidate_rejected_count": memory_v2.get("candidate_rejected_count", 0),
+        "memory_candidate_promoted_count": memory_v2.get("candidate_promoted_count", 0),
+        "memory_duplicate_count": memory_v2.get("duplicate_count", 0),
+        "memory_superseded_count": memory_v2.get("superseded_count", 0),
+        "memory_conflict_count": memory_v2.get("conflict_count", 0),
+        "evidence_store_size": memory_v2.get("evidence_store_size"),
+        "durable_store_size": memory_v2.get("durable_store_size"),
+        "memory_retrieval_count": memory_v2.get("retrieval_count", 0),
+        "memory_retrieved_evidence_count": memory_v2.get("retrieved_evidence_count", 0),
+        "memory_retrieved_durable_count": memory_v2.get("retrieved_durable_count", 0),
+        "memory_stale_evidence_count": memory_v2.get("stale_evidence_count", 0),
+        "memory_revalidated_evidence_count": memory_v2.get("revalidated_evidence_count", 0),
+        "memory_retrieval_tokens": memory_v2.get("retrieval_tokens", 0),
+        "memory_injected_tokens": memory_v2.get("injected_tokens", 0),
+        "memory_stale_used_without_revalidation": memory_v2.get(
+            "stale_used_without_revalidation", 0
+        ),
+        "memory_guided_reread_count": memory_v2.get("memory_guided_reread_count", 0),
+        "memory_v2_promotions": memory_activity.get("promotions") or [],
+        "memory_v2_superseded": memory_activity.get("superseded") or [],
+        "memory_v2_conflicts": memory_activity.get("conflicts") or [],
     }
     for tool, field in TOOL_FIELDS.items():
         result[field] = counts[tool]
@@ -304,6 +330,23 @@ def summarize(rows):
         "edit_decision_watchdog_no_progress_streak",
         "fresh_fact_count",
         "stale_fact_count",
+        "memory_candidate_count",
+        "memory_candidate_rejected_count",
+        "memory_candidate_promoted_count",
+        "memory_duplicate_count",
+        "memory_superseded_count",
+        "memory_conflict_count",
+        "evidence_store_size",
+        "durable_store_size",
+        "memory_retrieval_count",
+        "memory_retrieved_evidence_count",
+        "memory_retrieved_durable_count",
+        "memory_stale_evidence_count",
+        "memory_revalidated_evidence_count",
+        "memory_retrieval_tokens",
+        "memory_injected_tokens",
+        "memory_stale_used_without_revalidation",
+        "memory_guided_reread_count",
     ):
         values = [row.get(key) for row in completed]
         summary[f"mean_{key}"] = _number(values)

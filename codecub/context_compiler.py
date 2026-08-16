@@ -1013,11 +1013,12 @@ class ContextCompiler:
     # 公共入口
     # ------------------------------------------------------------------
 
-    def compile_text(self, user_message, working_state=None, history=None, pinned_extra=None):
+    def compile_text(self, user_message, working_state=None, history=None, pinned_extra=None, memory_layer=None, memory_meta=None):
         """legacy text 模式：从 session history 编译文本 prompt。"""
         working_state = working_state or WorkingState()
         history = list(history or [])
         pinned_extra = pinned_extra or {}
+        memory_meta = memory_meta or {}
         pinned = self._build_pinned(user_message, pinned_extra)
         estimated = self._estimate_candidate_tokens(pinned, working_state, history)
         history_fingerprint = self._history_span_fingerprint(history)
@@ -1048,6 +1049,7 @@ class ContextCompiler:
             recent_items=recent_items,
             compressed_history_items=compressed_history,
             repo_map_items=repo_map_items,
+            memory_layer=memory_layer,
         )
         compiled_tokens = self._count(compiled.text)
         self.budget.note_compiled(compiled_tokens, mode="legacy")
@@ -1067,10 +1069,12 @@ class ContextCompiler:
             should_compress=should_compress,
             estimated_tokens=estimated,
             compiled=compiled,
+            memory_layer=memory_layer,
+            memory_meta=memory_meta,
         )
         return compiled.text, self.last_compile_metadata
 
-    def compile_native(self, user_message, working_state=None, native_messages=None, pinned_extra=None):
+    def compile_native(self, user_message, working_state=None, native_messages=None, pinned_extra=None, memory_layer=None, memory_meta=None):
         """native 模式：压缩 native_messages，保持 assistant.tool_calls + tool result 原子性。
 
         返回 (messages, metadata)；messages 始终以合法 native 顺序：
@@ -1080,6 +1084,7 @@ class ContextCompiler:
         original_messages = native_messages
         native_messages = list(native_messages or [])
         pinned_extra = pinned_extra or {}
+        memory_meta = memory_meta or {}
         pinned = self._build_pinned(user_message, pinned_extra)
         estimated = self._estimate_native_tokens(native_messages)
         history_fingerprint = self._history_span_fingerprint(native_messages)
@@ -1105,6 +1110,8 @@ class ContextCompiler:
                 estimated_tokens=estimated,
                 compiled=None,
                 native_mode=True,
+                memory_layer=memory_layer,
+                memory_meta=memory_meta,
             )
             return (
                 original_messages if original_messages is not None else native_messages,
@@ -1117,16 +1124,19 @@ class ContextCompiler:
         recent_groups, older_groups = self._partition_native_groups(groups)
         compressed_history_items, older_raw = self._compress_older_groups(older_groups, working_state)
         repo_map_items, repo_map_details = self._build_repo_map(user_message, working_state)
-        # 组装消息：system(pinned + working state + compressed) + recent groups
+        # 组装消息：system(pinned + working state + memory + compressed) + recent groups
         messages = []
         pinned_text = self._render_pinned(pinned)
         working_text = working_state.to_text()
         summary_text = self._render_compressed_items(compressed_history_items)
+        memory_text = str(memory_layer or "").strip()
         preamble_parts = []
         if pinned_text:
             preamble_parts.append(pinned_text)
         if working_text.strip():
             preamble_parts.append(working_text)
+        if memory_text:
+            preamble_parts.append(memory_text)
         if summary_text.strip():
             preamble_parts.append(summary_text)
         if repo_map_items:
@@ -1165,6 +1175,8 @@ class ContextCompiler:
             compiled=None,
             native_mode=True,
             older_raw_entries=len(older_raw),
+            memory_layer=memory_layer,
+            memory_meta=memory_meta,
         )
         return messages, self.last_compile_metadata
 
@@ -1407,7 +1419,7 @@ class ContextCompiler:
     # 组装与估算
     # ------------------------------------------------------------------
 
-    def _assemble(self, pinned, working_state, recent_items, compressed_history_items, repo_map_items):
+    def _assemble(self, pinned, working_state, recent_items, compressed_history_items, repo_map_items, memory_layer=None):
         parts = []
         pinned_text = self._render_pinned(pinned)
         if pinned_text:
@@ -1415,6 +1427,9 @@ class ContextCompiler:
         working_text = working_state.to_text()
         if working_text.strip():
             parts.append(working_text)
+        memory_text = str(memory_layer or "").strip()
+        if memory_text:
+            parts.append(memory_text)
         if compressed_history_items:
             parts.append(self._render_compressed_items(compressed_history_items))
         if repo_map_items:
@@ -1473,6 +1488,9 @@ class ContextCompiler:
         should_compress = kwargs.get("should_compress", False)
         estimated = kwargs.get("estimated_tokens", 0)
         repo_map_details = kwargs.get("repo_map_details", {})
+        memory_layer = kwargs.get("memory_layer", None)
+        memory_meta = kwargs.get("memory_meta", {}) or {}
+        memory_text = str(memory_layer or "").strip()
         if native_mode:
             compiled_tokens = self._estimate_native_tokens(
                 getattr(self, "last_native_messages", []) or []
@@ -1559,6 +1577,13 @@ class ContextCompiler:
             ),
             "hysteresis": hysteresis,
             "repo_map_selection": repo_map_details,
+            # Phase 3: bounded Retrieved Memory layer.
+            "memory_layer_rendered": bool(memory_text),
+            "memory_tokens": self._count(memory_text) if memory_text else 0,
+            "memory_evidence_count": int(memory_meta.get("evidence_count", 0)),
+            "memory_durable_count": int(memory_meta.get("durable_count", 0)),
+            "memory_stale_count": int(memory_meta.get("stale_count", 0)),
+            "memory_token_budget": memory_meta.get("token_budget"),
             "user_request": user_message,
         }
 

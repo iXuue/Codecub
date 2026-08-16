@@ -789,14 +789,17 @@ def test_memory_recall_debug_text_explains_relevant_memory(tmp_path):
     file_path = tmp_path / "sample.txt"
     file_path.write_text("alpha\n", encoding="utf-8")
     agent = build_agent(tmp_path, [])
-    agent.memory.set_file_summary("sample.txt", "alpha")
-    agent.memory.remember_file("sample.txt")
+    # Phase 3: /memory recall 的 debug 视图反映 Memory 2.0 检索。
+    agent.record_memory_v2_evidence(
+        "read_file", {"path": "sample.txt", "start": 1, "end": 5}, "sample.txt: alpha"
+    )
 
     view = agent.memory_recall_debug_text("what did sample.txt contain?")
 
-    assert view.startswith("Relevant memory debug:\n")
-    assert "Selected:\n1. sample.txt: alpha" in view
-    assert "reason: path_match" in view
+    assert view.startswith("Memory 2.0 retrieval debug:\n")
+    assert "query: what did sample.txt contain?" in view
+    assert "sample.txt" in view
+    assert "[FRESH]" in view
 
 
 def test_agent_retries_after_empty_model_output(tmp_path):

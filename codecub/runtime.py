@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import memory as memorylib
+from .memory_v2 import MemoryV2
 from .context_manager import ContextManager
 from .context_compiler import (
     ContextBudget,
@@ -58,6 +59,12 @@ DEFAULT_SHELL_ENV_ALLOWLIST = (
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "relevant_memory": True,
+    # Phase 3: Memory 2.0（Evidence Store + Durable Memory + Bounded Retrieval）。
+    # memory_v2 是 master 开关；evidence_memory / durable_memory 是子开关。
+    # memory=False 仍表示“完全 Memory OFF”（兼容旧实验的 memory_off 变体）。
+    "memory_v2": True,
+    "evidence_memory": True,
+    "durable_memory": True,
     "context_reduction": True,
     "context_compiler": True,
     "prompt_cache": True,
@@ -284,6 +291,14 @@ class Pico:
             workspace_root=self.root,
         )
         self.session["memory"] = self.memory.to_dict()
+        # Phase 3: Memory 2.0（Evidence Store + Durable Memory + Retriever）。
+        # 与 legacy LayeredMemory 并存：v2 是新的记忆体系，v1 保留为兼容适配器。
+        self.memory_v2 = MemoryV2(
+            self.root,
+            token_counter=self.token_counter,
+            trace=self.memory_v2_trace,
+        )
+        self.memory_v2.migrate_legacy(self.session.get("memory"))
         self.code_index = CodeIndex(self.root)
         self.code_index.refresh()
         self.tools = self.build_tools()
@@ -316,6 +331,13 @@ class Pico:
             "workspace_changed": False,
             "prefix_changed": False,
         }
+        # Phase 3: Memory 2.0 run-local state。
+        self._current_memory_result = None
+        self._memory_retrieval_signature = ""
+        self.last_memory_v2_promotions = []
+        self.last_memory_v2_rejections = []
+        self.last_memory_v2_superseded = []
+        self.last_memory_v2_conflicts = []
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
@@ -394,6 +416,12 @@ class Pico:
     def evaluate_resume_state(self):
         previous_resume_state = dict(self.session.get("resume_state", {}) or {})
         invalidated = self.invalidate_stale_memory()
+        # Phase 3: Evidence freshness 对照 live workspace 重算（stale/missing）。
+        if self.memory_v2_enabled():
+            try:
+                self.memory_v2.refresh_freshness()
+            except Exception:
+                pass
         checkpoint = self.current_checkpoint()
         status = CHECKPOINT_NONE_STATUS
         stale_paths = list(invalidated)
@@ -568,7 +596,13 @@ class Pico:
             checkpoint_text = ""
         if checkpoint_text:
             extras["pinned:checkpoint"] = checkpoint_text
-        if self.feature_enabled("memory") and self.feature_enabled("relevant_memory"):
+        # Phase 3: memory_v2 ON 时检索走 Context Compiler 的 bounded memory layer，
+        # 这里不再注入 v1 relevant-memory，避免两套记忆同时进 Prompt。
+        if (
+            not self.memory_v2_enabled()
+            and self.feature_enabled("memory")
+            and self.feature_enabled("relevant_memory")
+        ):
             try:
                 notes = self.memory.retrieval_candidates(
                     str(user_message or ""), limit=3
@@ -736,6 +770,29 @@ class Pico:
         return "\n".join(lines)
 
     def memory_recall_debug_text(self, query):
+        if self.memory_v2_enabled():
+            try:
+                result = self.memory_v2.retrieve(query, force=True)
+                lines = ["Memory 2.0 retrieval debug:"]
+                lines.append(f"query: {result.query[:200]}")
+                lines.append(
+                    f"budget: evidence_top_k={result.evidence_top_k} "
+                    f"durable_top_k={result.durable_top_k} "
+                    f"token_budget={result.token_budget}"
+                )
+                lines.append(f"stale_count: {result.stale_count}")
+                lines.append(f"missing_count: {result.missing_count}")
+                lines.append("Selected:")
+                if not result.items:
+                    lines.append("- none")
+                for index, item in enumerate(result.items, start=1):
+                    lines.append(f"{index}. [{item.marker}] {item.text}")
+                    lines.append(
+                        f"   kind: {item.kind}  score: {item.score:.1f}  reason: {item.reason}"
+                    )
+                return "\n".join(lines)
+            except Exception:
+                pass
         return self.memory.retrieval_debug_view(query)
 
     def history_text(self):
@@ -768,6 +825,100 @@ class Pico:
 
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
+
+    # ------------------------------------------------------------------
+    # Phase 3: Memory 2.0 helpers
+    # ------------------------------------------------------------------
+
+    def memory_v2_enabled(self):
+        """Memory 2.0 master switch；`memory=False` 仍是完全 Memory OFF。"""
+        return bool(
+            self.feature_enabled("memory") and self.feature_enabled("memory_v2")
+        )
+
+    def memory_v2_trace(self, event, payload=None):
+        """MemoryV2 的 trace 回调；无当前 run 时静默跳过。"""
+        task_state = getattr(self, "current_task_state", None)
+        if task_state is not None:
+            self.emit_trace(task_state, event, payload or {})
+
+    def _memory_signature(self):
+        ws = self.working_state or WorkingState()
+        blockers = "|".join(
+            str(item.get("text", "")) for item in (ws.blockers or [])
+        )
+        symbols = "|".join(
+            f"{item.get('path', '')}:{item.get('name', '')}"
+            for item in (ws.relevant_symbols or [])
+        )
+        files = "|".join(str(path) for path in (ws.changed_files or []))
+        return f"{blockers}||{symbols}||{files}"
+
+    def _refresh_memory_retrieval(self, user_message, force=False):
+        """Retrieval trigger：task start / blocker 变化 / recovery turn。"""
+        if not self.memory_v2_enabled():
+            self._current_memory_result = None
+            return None
+        try:
+            result = self.memory_v2.retrieve(
+                user_message, self.working_state, force=force
+            )
+        except Exception:
+            result = None
+        self._current_memory_result = result
+        self._memory_retrieval_signature = self._memory_signature()
+        return result
+
+    def _memory_layer(self):
+        """Context Compiler 的 bounded memory layer（文本 + 元数据）。"""
+        if not self.memory_v2_enabled():
+            return "", {}
+        result = getattr(self, "_current_memory_result", None)
+        if result is None or not result.items:
+            return "", {}
+        return result.render(), {
+            "evidence_count": len(result.evidence_items),
+            "durable_count": len(result.durable_items),
+            "stale_count": result.stale_count,
+            "token_budget": result.token_budget,
+        }
+
+    def record_memory_v2_evidence(self, name, args, result):
+        """客观工具事件 → Evidence Store（read/symbol/outline/references/verification）。"""
+        if not self.memory_v2_enabled() or not self.feature_enabled(
+            "evidence_memory"
+        ):
+            return []
+        try:
+            created = self.memory_v2.record_tool_evidence(
+                name,
+                args,
+                result,
+                metadata=self._last_tool_result_metadata,
+            )
+            if name == "read_file":
+                self.memory_v2.note_read(str(args.get("path") or ""))
+            return created
+        except Exception:
+            return []
+
+    def extract_memory_v2(self, user_message, final_answer):
+        """Run 结束：Extraction → Consolidation → Persist（Memory 2.0 管线）。"""
+        if not self.memory_v2_enabled() or not self.feature_enabled("durable_memory"):
+            return None
+        run_id = (
+            self.current_task_state.run_id if self.current_task_state is not None else ""
+        )
+        promoted, rejections, superseded, conflicts, _duplicates = (
+            self.memory_v2.extract_and_persist(
+                self.working_state, user_message, final_answer, run_id=run_id
+            )
+        )
+        self.last_memory_v2_promotions = list(promoted)
+        self.last_memory_v2_rejections = list(rejections)
+        self.last_memory_v2_superseded = list(superseded)
+        self.last_memory_v2_conflicts = list(conflicts)
+        return promoted, rejections, superseded, conflicts
 
     def prompt(self, user_message):
         prompt, _ = self._build_prompt_and_metadata(user_message)
@@ -900,6 +1051,42 @@ class Pico:
                         "visible": bool(marker and marker in prompt),
                     }
                 )
+        # Phase 3: memory_v2 ON 时，legacy relevant_memory 兼容块反映 v2 检索结果，
+        # 保持旧 metrics 脚本（selected_count / rendered_notes 等）可继续读取。
+        if self.memory_v2_enabled() and getattr(self, "_current_memory_result", None):
+            result = self._current_memory_result
+            rendered_notes = []
+            for item in result.items:
+                rendered_notes.append(
+                    {
+                        "text": item.text,
+                        "kind": item.kind,
+                        "marker": item.marker,
+                        "source": item.path or item.topic or "",
+                        "reason": item.reason,
+                        "score": item.score,
+                        "status": item.status,
+                    }
+                )
+            metadata["relevant_memory"] = {
+                "limit": result.evidence_top_k + result.durable_top_k,
+                "selected_count": len(result.items),
+                "selected_notes": [item.text for item in result.items],
+                "selected_sources": [
+                    item.path or item.topic for item in result.items
+                ],
+                "selected_kinds": [item.kind for item in result.items],
+                "selected_reasons": [item.reason for item in result.items],
+                "selected_scores": [round(item.score, 1) for item in result.items],
+                "selected_matches": [],
+                "selected_durable_count": len(result.durable_items),
+                "raw_chars": result.total_tokens,
+                "rendered_chars": result.total_tokens,
+                "rendered_notes": rendered_notes,
+                "rendered_count": len(rendered_notes),
+                "stale_count": result.stale_count,
+                "missing_count": result.missing_count,
+            }
         metadata.update(
             {
                 "prompt_chars": len(prompt),
@@ -1014,11 +1201,14 @@ class Pico:
                 )
             self.working_state.refresh_fact_freshness(self.root)
             stale_count = len(self.working_state.stale_facts())
+            memory_layer, memory_meta = self._memory_layer()
             prompt, metadata = self.context_compiler.compile_text(
                 user_message,
                 working_state=self.working_state,
                 history=self.session.get("history", []),
                 pinned_extra=self._pinned_extra(user_message),
+                memory_layer=memory_layer,
+                memory_meta=memory_meta,
             )
             self._add_legacy_metadata_compat(metadata, prompt, user_message)
             if task_state is not None:
@@ -1207,6 +1397,25 @@ class Pico:
             file_freshness = memorylib.file_freshness(path, self.root)
             freshness[path] = file_freshness
             key_files.append({"path": path, "freshness": file_freshness})
+        # Phase 3: Working State（权威 task-local 真相）+ Evidence Store 路径
+        # 也进入 checkpoint key_files，保证 resume 时能检测源码漂移。
+        if self.memory_v2_enabled():
+            ws_paths = []
+            ws_paths.extend(str(p) for p in (self.working_state.changed_files or []))
+            for item in (self.working_state.relevant_symbols or []):
+                path = str(item.get("path", "") or "")
+                if path and path not in ws_paths:
+                    ws_paths.append(path)
+            for record in self.memory_v2.evidence_store.latest_records():
+                path = str(record.get("path", "") or "")
+                if path and path not in ws_paths:
+                    ws_paths.append(path)
+            for path in ws_paths:
+                if any(item["path"] == path for item in key_files):
+                    continue
+                file_freshness = memorylib.file_freshness(path, self.root)
+                freshness[path] = file_freshness
+                key_files.append({"path": path, "freshness": file_freshness})
         checkpoint = {
             "checkpoint_id": checkpoint_id,
             "parent_checkpoint_id": current.get("checkpoint_id", "") if current else "",
@@ -1413,6 +1622,13 @@ class Pico:
         if self.context_compiler is not None:
             # Phase 2.6: 压缩计数 / summary 栈 / hysteresis 状态同样 task-local。
             self.context_compiler.reset_run_state()
+        if self.memory_v2_enabled():
+            # Phase 3: Memory 2.0 run-local 状态清零；task-start retrieval 在
+            # run_started trace 之后执行（保持事件顺序契约）。
+            self.memory_v2.reset_run_state()
+            self.memory_v2.set_run_context(
+                task_id=task_state.task_id, run_id=task_state.run_id
+            )
         self.current_run_dir = self.run_store.start_run(task_state)
         self.emit_run_status(
             task_state,
@@ -1429,6 +1645,9 @@ class Pico:
                 "user_request": clip(user_message, 300),
             },
         )
+        # Phase 3: task-start retrieval（run_started 之后，保持 trace 顺序）。
+        if self.memory_v2_enabled():
+            self._refresh_memory_retrieval(user_message, force=True)
 
         tool_steps = 0
         attempts = 0
@@ -1791,11 +2010,14 @@ class Pico:
                         # 原样返回，超预算时保持 assistant/tool 原子组压缩）。
                         if self.context_compiler is not None:
                             self.working_state.refresh_fact_freshness(self.root)
+                            memory_layer, memory_meta = self._memory_layer()
                             compiled_native, compiler_meta = self.context_compiler.compile_native(
                                 user_message,
                                 working_state=self.working_state,
                                 native_messages=native_messages,
                                 pinned_extra=self._pinned_extra(user_message),
+                                memory_layer=memory_layer,
+                                memory_meta=memory_meta,
                             )
                             if compiler_meta.get("should_compress"):
                                 self.emit_trace(
@@ -2361,6 +2583,12 @@ class Pico:
                             ),
                         },
                     )
+                # Phase 3: blocker / relevant-symbol / changed-file 实质变化时
+                # 重新 retrieval（避免每 tool step 全库检索）。
+                if self.memory_v2_enabled() and (
+                    self._memory_signature() != self._memory_retrieval_signature
+                ):
+                    self._refresh_memory_retrieval(user_message)
                 # A native assistant tool-call message must be followed by a
                 # tool result for every call before any user message.  Providers
                 # can return a batch despite advertising no parallel support;
@@ -2436,6 +2664,9 @@ class Pico:
                         native_messages.append(
                             {"role": "user", "content": RECOVERY_TURN_PROMPT}
                         )
+                    # Phase 3: recovery turn 是 retrieval trigger。
+                    if self.memory_v2_enabled():
+                        self._refresh_memory_retrieval(user_message)
                     self.emit_run_status(
                         task_state,
                         "stuck_suspected",
@@ -2546,6 +2777,7 @@ class Pico:
         task_state.stop("finalization_failed", final_answer=final)
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.promote_durable_memory(user_message, final)
+        self.extract_memory_v2(user_message, final)
         self.run_store.write_task_state(task_state)
         self.emit_run_finished(task_state, final, run_started_at)
         self.emit_run_status(
@@ -2560,6 +2792,12 @@ class Pico:
         return final
 
     def write_final_report(self, task_state):
+        # Phase 3: run 结束时的 stale-revalidation 记账（在 report 生成前）。
+        if self.memory_v2_enabled():
+            try:
+                self.memory_v2.finalize_run()
+            except Exception:
+                pass
         self.run_store.write_report(
             task_state, self.redact_artifact(self.build_report(task_state))
         )
@@ -2599,6 +2837,7 @@ class Pico:
         self.record({"role": "assistant", "content": final, "created_at": now()})
         task_state.finish_success(final)
         self.promote_durable_memory(user_message, final)
+        self.extract_memory_v2(user_message, final)
         checkpoint = self.create_checkpoint(
             task_state, user_message, trigger="run_finished"
         )
@@ -2634,6 +2873,7 @@ class Pico:
             task_state.stop_step_limit(final)
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.promote_durable_memory(user_message, final)
+        self.extract_memory_v2(user_message, final)
         self.run_store.write_task_state(task_state)
         trigger = task_state.stop_reason or "run_stopped"
         checkpoint = self.create_checkpoint(task_state, user_message, trigger=trigger)
@@ -2744,6 +2984,7 @@ class Pico:
         task_state.stop(STOP_REASON_STUCK_CONFIRMED, final_answer=final)
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.promote_durable_memory(user_message, final)
+        self.extract_memory_v2(user_message, final)
         self.run_store.write_task_state(task_state)
         checkpoint = self.create_checkpoint(
             task_state, user_message, trigger=STOP_REASON_STUCK_CONFIRMED
@@ -2779,6 +3020,7 @@ class Pico:
         task_state.stop(STOP_REASON_EMERGENCY_CAP_REACHED, final_answer=final)
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.promote_durable_memory(user_message, final)
+        self.extract_memory_v2(user_message, final)
         self.run_store.write_task_state(task_state)
         self.emit_trace(
             task_state,
@@ -2929,6 +3171,8 @@ class Pico:
                 self._last_tool_result_metadata["code_index_refresh"] = (
                     self.code_index.refresh(affected_paths)
                 )
+            # Phase 3: 客观工具事件 → Evidence Store。
+            self.record_memory_v2_evidence(name, args, result)
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return result
         except Exception as exc:
@@ -3396,6 +3640,19 @@ class Pico:
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
+            "memory_v2": self.memory_v2.metrics() if self.memory_v2_enabled() else {},
+            "memory_migration": (
+                self.memory_v2.last_migration.to_dict()
+                if self.memory_v2_enabled()
+                and getattr(self.memory_v2, "last_migration", None) is not None
+                else None
+            ),
+            "memory_v2_activity": {
+                "promotions": list(self.last_memory_v2_promotions),
+                "rejections": list(self.last_memory_v2_rejections),
+                "superseded": list(self.last_memory_v2_superseded),
+                "conflicts": list(self.last_memory_v2_conflicts),
+            },
             "redacted_env": self.detected_secret_env_summary(),
         }
 
@@ -3592,6 +3849,8 @@ class Pico:
         self.memory = memorylib.LayeredMemory(
             self.session["memory"], workspace_root=self.root
         )
+        if self.memory_v2_enabled():
+            self.memory_v2.reset_run_state()
         self.session_store.save(self.session)
 
     def path(self, raw_path):
