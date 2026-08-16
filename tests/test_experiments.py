@@ -62,7 +62,7 @@ def deterministic_runner(tmp_path):
 
 
 def test_experiment_suites_have_requested_task_counts():
-    assert len(tasks_for_suite("real-agent")) == 11
+    assert len(tasks_for_suite("real-agent")) == 12
     assert len(tasks_for_suite("development")) == 3
     assert len(tasks_for_suite("context")) == 8
     assert len(tasks_for_suite("memory")) == 8

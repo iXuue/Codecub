@@ -189,6 +189,35 @@ RECOVERY_TASKS = (
 )
 
 
+# Formal holdout tasks are independent from _COMMON and were not used by the
+# native-runtime development probes. Prompts disclose behavioral symptoms only.
+_FORMAL_HOLDOUT = (
+    ("token_nonpositive_guard", "input-validation", "Empty prompt budgets are no longer handled safely. Restore the clipping guard so non-positive limits never return source text.", "codecub/token_budget.py", "    if budget <= 0:", "    if budget < 0:"),
+    ("token_reserve_accounting", "configuration-regression", "Configured context windows are allowing generation to consume the reserved safety margin. Correct the prompt-budget calculation.", "codecub/token_budget.py", "    return max(0, int(context_window) - int(max_new_tokens) - int(safety_margin_tokens))", "    return max(0, int(context_window) - int(max_new_tokens))"),
+    ("context_window_boolean_rejection", "api-contract", "A boolean provider value is being accepted as a context-window size. Restore strict positive-integer validation.", "codecub/model_capabilities.py", "    if value is None or isinstance(value, bool):", "    if value is None:"),
+    ("async_symbol_classification", "code-understanding-repair", "The persisted code index labels asynchronous methods as ordinary functions. Restore the distinct async symbol classification.", "codecub/code_index.py", "        self._function(node, \"async_function\", \"async_method\")", "        self._function(node, \"async_function\", \"method\")"),
+    ("symbol_index_storage_location", "persistence-bug", "Symbol-index state is written under an incompatible filename, preventing subsequent reuse. Restore the canonical persisted index location.", "codecub/code_index.py", "        self.path = self.index_dir / \"python_symbols.json\"", "        self.path = self.index_dir / \"symbols.json\""),
+    ("usage_private_payload_redaction", "privacy-regression", "Usage snapshots are exposing provider-native diagnostic payloads. Restore the redaction boundary before session persistence.", "codecub/telemetry/contracts.py", "PRIVATE_USAGE_FIELDS = {\"raw_usage\", \"provider_native_metrics\"}", "PRIVATE_USAGE_FIELDS = {\"raw_usage\"}"),
+    ("usage_negative_counter_normalization", "metrics-bug", "Malformed provider counters can reduce aggregate usage totals. Restore non-negative normalization before aggregation.", "codecub/telemetry/aggregation.py", "        return max(0, int(value))", "        return int(value)"),
+    ("session_usage_identifier_guard", "persistence-bug", "Session usage records with a missing usage identity are being persisted. Restore the guard that keeps usage snapshots deduplicable.", "codecub/usage_store.py", "        if not session_id or not record.get(\"usage_id\"):", "        if not session_id and not record.get(\"usage_id\"):"),
+    ("app_cancel_command_contract", "api-contract", "The local-app protocol no longer accepts a valid run cancellation command. Restore the command contract without broadening unknown-command acceptance.", "codecub/app_protocol.py", "    \"cancel_run\",", "    \"cancel\","),
+    ("app_event_wire_format", "serialization-regression", "Protocol events are no longer emitted as compact ASCII-safe JSON lines. Restore the wire-format behavior.", "codecub/app_protocol.py", "    return json.dumps(event, ensure_ascii=True, separators=(\",\", \":\")) + \"\\n\"", "    return json.dumps(event) + \"\\n\""),
+    ("canonical_path_casefold", "cross-platform-path-bug", "Equivalent workspace paths with different casing are treated as distinct. Restore canonical path normalization for repeat detection.", "codecub/task_policy.py", "    return posixpath.normpath(str(path or \"\").replace(\"\\\\\", \"/\")).casefold()", "    return str(path or \"\").replace(\"\\\\\", \"/\").casefold()"),
+    ("atomic_run_artifact_replace", "recovery-adjacent", "Run-artifact persistence can leave stale files after interruption. Restore the atomic replacement operation used for completed writes.", "codecub/run_store.py", "        Path(temp_name).replace(path)", "        Path(temp_name).rename(path)"),
+)
+
+REAL_AGENT_TASKS = tuple(ExperimentTask(*row, requires_workspace_change=True) for row in _FORMAL_HOLDOUT)
+_ABLATION_HOLDOUT = _FORMAL_HOLDOUT[:8]
+CONTEXT_TASKS = tuple(ExperimentTask(*row, step_budget=24, phases=("seed_history", "investigate", "repair", "verify"), requires_workspace_change=True) for row in _ABLATION_HOLDOUT)
+MEMORY_TASKS = tuple(ExperimentTask(*row, step_budget=24, phases=("phase1_architecture", "distractor_work", "phase2_repair", "verify"), requires_workspace_change=True) for row in _ABLATION_HOLDOUT)
+RECOVERY_TASKS = (
+    replace(ExperimentTask(*_FORMAL_HOLDOUT[0]), id="invalid_patch_failure", fault="invalid_patch", requires_workspace_change=True),
+    replace(ExperimentTask(*_FORMAL_HOLDOUT[1]), id="concurrent_file_mutation", fault="concurrent_mutation", requires_workspace_change=True),
+    replace(ExperimentTask(*_FORMAL_HOLDOUT[4]), id="stale_memory_freshness", fault="stale_memory", requires_workspace_change=True),
+    replace(ExperimentTask(*_FORMAL_HOLDOUT[7]), id="workspace_resume_mismatch", fault="workspace_mismatch", requires_workspace_change=True),
+    replace(ExperimentTask(*_FORMAL_HOLDOUT[10]), id="unsafe_path_access", fault="unsafe_path", requires_workspace_change=True),
+)
+
 def tasks_for_suite(suite):
     suites = {
         "development": DEVELOPMENT_TASKS,

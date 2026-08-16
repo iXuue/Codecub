@@ -417,7 +417,17 @@ class ExperimentRunner:
             raise ValueError(
                 f"task {task.id} is stale: expected {expected} baseline fragment occurrence(s) in {task.path}, found {count}"
             )
-        return {"path": path, "text": text, "baseline_occurrences": count}
+        mutation_count = text.count(task.mutation)
+        if mutation_count:
+            raise ValueError(
+                f"task {task.id} is stale: fixture already contains mutation fragment {mutation_count} time(s)"
+            )
+        return {
+            "path": path,
+            "text": text,
+            "baseline_occurrences": count,
+            "mutation_occurrences": mutation_count,
+        }
 
     def apply_mutation(self, task, workspace, *, preflight=None):
         preflight = preflight or self.preflight_task(task, workspace)
@@ -543,7 +553,7 @@ class ExperimentRunner:
             )
 
     def verify(self, task, workspace):
-        code = f"from pathlib import Path; text=Path({task.path!r}).read_text(encoding='utf-8'); assert text.count({task.baseline!r}) == 1"
+        code = f"from pathlib import Path; text=Path({task.path!r}).read_text(encoding='utf-8'); assert text.count({task.baseline!r}) == 1; assert text.count({task.mutation!r}) == 0"
         return subprocess.run(
             [sys.executable, "-c", code], cwd=workspace, capture_output=True, text=True
         )
