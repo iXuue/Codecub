@@ -137,6 +137,59 @@ DEVELOPMENT_TASKS = (
     replace(ExperimentTask(*_COMMON[4]), metadata={"evaluation_role": "development"}, requires_workspace_change=True),
 )
 
+# Phase 2.5 — Development-only Long-Horizon Context Probes.
+# 明确标记 evaluation_role=development，绝不混入正式 Pass Rate。
+# 复用 _COMMON 的 mutation（不新增 mutation），但 prompt 要求跨模块调查 /
+# 多轮 edit / freshness revalidation，制造真实 Coding Context 压力以触发
+# Context Compiler 压缩。prompt 不泄露 patch。
+_PROBE_A_PROMPT = (
+    "Investigate why normal sessions no longer retain working memory. "
+    "Trace the complete path from runtime feature flags through the memory "
+    "layer to persistence, and restore the intended default behavior without "
+    "changing the public API."
+)
+_PROBE_B_PROMPT = (
+    "Prompt construction unexpectedly skips its reduction path by default. "
+    "Understand how the context manager assigns reduction priority across "
+    "sections, restore the intended behavior, then verify the reduction "
+    "tests pass and re-check the flag is honored at every request site."
+)
+_PROBE_C_PROMPT = (
+    "Prompt construction no longer reduces context by default. Confirm the "
+    "feature-flag wiring in the runtime, apply the smallest justified fix, "
+    "then re-check the flag is honored at every request site before finalizing."
+)
+
+DEVELOPMENT_PROBES = (
+    replace(
+        ExperimentTask(*_COMMON[0]),
+        id="probe_a_context_continuity",
+        prompt=_PROBE_A_PROMPT,
+        step_budget=40,
+        phases=("investigate", "repair", "verify"),
+        metadata={"evaluation_role": "development", "probe": "A", "probe_kind": "compression_continuity"},
+        requires_workspace_change=True,
+    ),
+    replace(
+        ExperimentTask(*_COMMON[2]),
+        id="probe_b_recursive_continuity",
+        prompt=_PROBE_B_PROMPT,
+        step_budget=48,
+        phases=("investigate", "repair", "verify", "reverify"),
+        metadata={"evaluation_role": "development", "probe": "B", "probe_kind": "recursive_compression"},
+        requires_workspace_change=True,
+    ),
+    replace(
+        ExperimentTask(*_COMMON[1]),
+        id="probe_c_freshness_after_mutation",
+        prompt=_PROBE_C_PROMPT,
+        step_budget=40,
+        phases=("investigate", "repair", "verify"),
+        metadata={"evaluation_role": "development", "probe": "C", "probe_kind": "freshness"},
+        requires_workspace_change=True,
+    ),
+)
+
 REAL_AGENT_TASKS = tuple(ExperimentTask(*row, requires_workspace_change=True) for row in _COMMON[1:])
 
 # 长链路 task 复用现实 mutation，但显式要求先理解多个模块并注入同等历史。

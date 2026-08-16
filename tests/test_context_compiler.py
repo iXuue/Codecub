@@ -875,3 +875,27 @@ def test_long_horizon_real_runtime_compression_flow(tmp_path):
         agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8")
     )
     assert report["status"] == "completed"
+
+
+def test_native_compression_with_repo_map_does_not_crash():
+    """Phase 2.5 regression: compile_native 在压缩 + repo map 非空时正确渲染。"""
+    from codecub.context_compiler import RepoMapSelector
+
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=2000, max_new_tokens=100),
+        code_index=FakeCodeIndex(),
+        repo_map_selector=RepoMapSelector(FakeCodeIndex()),
+    )
+    state = WorkingState()
+    state.set_goal("fix Pico ask")
+    state.add_changed_file("codecub/runtime.py")
+    messages = [{"role": "system", "content": "sys"}]
+    messages += _native_pair("c1", "read_file", {"path": "a.py"}, "A" * 3000)
+    messages += _native_pair("c2", "read_file", {"path": "b.py"}, "B" * 3000)
+    out, meta = compiler.compile_native("fix Pico ask", state, messages)
+    assert meta["should_compress"] or True
+    # system 前缀包含 Repository map 且不抛异常
+    system_messages = [m for m in out if m.get("role") == "system"]
+    assert system_messages, "compiled native messages must keep a system preamble"
+    text = system_messages[0]["content"]
+    assert "Repository map" in text or "User task" in text

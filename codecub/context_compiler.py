@@ -916,7 +916,10 @@ class ContextCompiler:
         if summary_text.strip():
             preamble_parts.append(summary_text)
         if repo_map_items:
-            preamble_parts.append("Repository map:\n" + "\n".join(repo_map_items))
+            preamble_parts.append(
+                "Repository map:\n"
+                + "\n".join(item.text for item in repo_map_items)
+            )
         if preamble_parts:
             messages.append(
                 {
