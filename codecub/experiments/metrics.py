@@ -95,6 +95,8 @@ def extract_metrics(report, trace):
         seen_searches.add(signature)
     planning = (report or {}).get("planning") or {}
     watchdog = (report or {}).get("watchdog") or {}
+    latest_prompt = prompt_rows[-1] if prompt_rows else {}
+    compiler = latest_prompt.get("context_compiler") or {}
     result = {
         "attempts": (report or {}).get("attempts"),
         "tool_steps": (report or {}).get("tool_steps"),
@@ -105,6 +107,19 @@ def extract_metrics(report, trace):
         "stuck_recovery_count": watchdog.get("recovery_turn_count", 0),
         "stuck_recovery_success_count": watchdog.get("recovery_success_count", 0),
         "stuck_confirmed_count": watchdog.get("stuck_confirmed_count", 0),
+        "context_compile_count": compiler.get("context_compile_count"),
+        "compression_count": compiler.get("compression_count", 0),
+        "compression_failure_count": compiler.get("compression_failure_count", 0),
+        "candidate_context_tokens": compiler.get("candidate_context_tokens"),
+        "compiled_context_tokens": compiler.get("compiled_context_tokens"),
+        "pinned_tokens": compiler.get("pinned_tokens"),
+        "working_state_tokens": compiler.get("working_state_tokens"),
+        "recent_verbatim_tokens": compiler.get("recent_verbatim_tokens"),
+        "compressed_history_tokens": compiler.get("compressed_history_tokens"),
+        "repo_map_tokens": compiler.get("repo_map_tokens"),
+        "raw_history_tokens": compiler.get("raw_history_tokens"),
+        "fresh_fact_count": compiler.get("fresh_fact_count"),
+        "stale_fact_count": compiler.get("stale_fact_count"),
         "read_calls": counts["read_file"],
         "unique_read_files": unique_reads,
         "repeated_read_calls": repeat_count,
@@ -224,6 +239,18 @@ def summarize(rows):
         "stuck_recovery_count",
         "stuck_recovery_success_count",
         "stuck_confirmed_count",
+        "compression_count",
+        "compression_failure_count",
+        "candidate_context_tokens",
+        "compiled_context_tokens",
+        "pinned_tokens",
+        "working_state_tokens",
+        "recent_verbatim_tokens",
+        "compressed_history_tokens",
+        "repo_map_tokens",
+        "raw_history_tokens",
+        "fresh_fact_count",
+        "stale_fact_count",
     ):
         values = [row.get(key) for row in completed]
         summary[f"mean_{key}"] = _number(values)

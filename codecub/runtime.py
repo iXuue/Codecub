@@ -17,6 +17,15 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
+from .context_compiler import (
+    ContextBudget,
+    ContextCompiler,
+    HistoryCondenser,
+    PINNED_PROJECT_RULES,
+    PINNED_RUNTIME_MODE,
+    PINNED_SAFETY,
+    WorkingState,
+)
 from .code_index import CodeIndex
 from .token_budget import resolve_prompt_budget, resolve_token_counter
 from .run_store import RunStore
@@ -49,6 +58,7 @@ DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "relevant_memory": True,
     "context_reduction": True,
+    "context_compiler": True,
     "prompt_cache": True,
 }
 DEFAULT_MAX_STEPS = 80
@@ -277,6 +287,9 @@ class Pico:
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
+        # Phase 2: Context Compiler（task-local Working State + 分层 Context）。
+        self.working_state = WorkingState()
+        self.context_compiler = self.build_context_compiler()
         self.resume_state = self.evaluate_resume_state()
         self.session_path = self.session_store.save(self.session)
         self.current_task_state = None
@@ -492,6 +505,68 @@ class Pico:
         return {
             name: tool for name, tool in tools.items() if name in self.allowed_tools
         }
+
+    def build_context_compiler(self):
+        """Phase 2: 装配 Context Compiler。
+
+        feature flag `context_compiler` 关闭时返回 None，走旧 ContextManager。
+        Condenser 默认 deterministic（不消费主模型 outputs），保证确定性测试
+        稳定；真实 probe 阶段可注入 LLM condenser。
+        """
+        if not self.feature_enabled("context_compiler"):
+            return None
+        budget = ContextBudget.resolve(
+            context_window=self.context_window,
+            max_new_tokens=self.max_new_tokens,
+            safety_margin_tokens=self.safety_margin_tokens,
+        )
+        condenser = HistoryCondenser(
+            model_client=None,
+            redact_fn=self.redact_text,
+            token_counter=self.token_counter,
+        )
+        return ContextCompiler(
+            token_counter=self.token_counter,
+            budget=budget,
+            condenser=condenser,
+            code_index=self.code_index,
+            redact_fn=self.redact_text,
+            workspace_root=self.root,
+        )
+
+    def _pinned_extra(self, user_message=None):
+        extras = {
+            PINNED_PROJECT_RULES: self.prefix,
+            PINNED_SAFETY: (
+                f"Approval policy: {self.approval_policy}; read_only: {self.read_only}"
+            ),
+            PINNED_RUNTIME_MODE: (
+                f"runtime_mode: {self.runtime_mode}; "
+                f"effective_step_budget: {self.effective_step_budget}; "
+                f"emergency_cap: {self.emergency_cap}"
+            ),
+        }
+        ledger_text = self.evidence_ledger_text()
+        if ledger_text:
+            extras["pinned:evidence-ledger"] = ledger_text
+        try:
+            checkpoint_text = str(self.render_checkpoint_text() or "").strip()
+        except Exception:
+            checkpoint_text = ""
+        if checkpoint_text:
+            extras["pinned:checkpoint"] = checkpoint_text
+        if self.feature_enabled("memory") and self.feature_enabled("relevant_memory"):
+            try:
+                notes = self.memory.retrieval_candidates(
+                    str(user_message or ""), limit=3
+                )
+            except Exception:
+                notes = []
+            if notes:
+                lines = ["Relevant memory:"]
+                lines.extend(f"- {str(note.get('text', ''))}" for note in notes)
+                extras["pinned:relevant-memory"] = "\n".join(lines)
+        return extras
 
     def tool_signature(self):
         payload = []
@@ -790,7 +865,116 @@ class Pico:
         _, metadata = self._build_prompt_and_metadata(user_message)
         return metadata
 
-    def _build_prompt_and_metadata(self, user_message, status_callback=None):
+    def _add_legacy_metadata_compat(self, metadata, prompt, user_message):
+        """Context Compiler 产出兼容旧 ContextManager 的 metadata 字段。
+
+        旧 metrics / read_guard / 实验分析脚本依赖这些字段；字段语义与
+        旧实现保持一致，避免破坏 Phase 1 及更早的分析链路。
+        """
+        unit = "tokens" if self.token_counter is not None else "chars"
+        estimated = metadata.get("compiled_context_tokens") or 0
+        evidence_entries = []
+        if hasattr(self, "evidence_ledger_entries"):
+            for entry in self.evidence_ledger_entries():
+                marker = str(entry.get("marker", ""))
+                evidence_entries.append(
+                    {
+                        "path": str(entry.get("path", "")),
+                        "start": int(entry.get("start", 1)),
+                        "end": int(entry.get("end", 200)),
+                        "freshness": str(entry.get("freshness", "")),
+                        "last_read_step": entry.get("last_read_step"),
+                        "visible": bool(marker and marker in prompt),
+                    }
+                )
+        metadata.update(
+            {
+                "prompt_chars": len(prompt),
+                "prompt_budget_chars": self.context_manager.total_budget,
+                "prompt_over_budget": False,
+                "budget_mode": "token" if self.token_counter is not None else "char",
+                "budget_unit": unit,
+                "estimated_prompt_tokens": estimated,
+                "prompt_tokens": estimated,
+                "section_order": [
+                    "prefix",
+                    "memory",
+                    "relevant_memory",
+                    "history",
+                    "current_request",
+                ],
+                "section_budgets": {
+                    "prefix": None,
+                    "memory": None,
+                    "relevant_memory": None,
+                    "history": None,
+                    "current_request": None,
+                },
+                "sections": {
+                    "pinned": {
+                        "raw_chars": 0,
+                        "budget_chars": None,
+                        "rendered_chars": metadata.get("pinned_tokens", 0),
+                    },
+                    "working_state": {
+                        "raw_chars": 0,
+                        "budget_chars": None,
+                        "rendered_chars": metadata.get("working_state_tokens", 0),
+                    },
+                    "recent_verbatim": {
+                        "raw_chars": 0,
+                        "budget_chars": None,
+                        "rendered_chars": metadata.get("recent_verbatim_tokens", 0),
+                    },
+                    "compressed_history": {
+                        "raw_chars": 0,
+                        "budget_chars": None,
+                        "rendered_chars": metadata.get("compressed_history_tokens", 0),
+                    },
+                },
+                "inspected_evidence": {
+                    "entry_count": len(evidence_entries),
+                    "visible_entry_count": sum(
+                        1 for entry in evidence_entries if entry["visible"]
+                    ),
+                    "entries": evidence_entries,
+                },
+                "budget_reductions": [],
+                "reduction_order": [],
+                "relevant_memory": {
+                    "limit": 3,
+                    "selected_count": 0,
+                    "selected_notes": [],
+                    "selected_sources": [],
+                    "selected_kinds": [],
+                    "selected_reasons": [],
+                    "selected_scores": [],
+                    "selected_matches": [],
+                    "selected_durable_count": 0,
+                    "raw_chars": 0,
+                    "rendered_chars": 0,
+                    "rendered_notes": [],
+                    "rendered_count": 0,
+                },
+                "history": {
+                    "raw_chars": metadata.get("raw_history_tokens", 0),
+                    "rendered_chars": metadata.get("recent_verbatim_tokens", 0),
+                    "older_entries_count": 0,
+                    "collapsed_duplicate_reads": 0,
+                    "reused_file_summary_count": 0,
+                    "summarized_tool_count": 0,
+                },
+                "current_request": {
+                    "text": str(user_message),
+                    "raw_chars": len(str(user_message)),
+                    "rendered_chars": len(str(user_message)),
+                    "section_chars": len(str(user_message)),
+                },
+            }
+        )
+        return metadata
+
+    def _build_prompt_and_metadata(self, user_message, status_callback=None, task_state=None):
         if status_callback is not None:
             status_callback(
                 "checking_workspace", "Checking repository state", str(self.root)
@@ -801,7 +985,88 @@ class Pico:
         self.resume_state = self.evaluate_resume_state()
         if status_callback is not None:
             status_callback("building_prompt", "Building prompt", "")
-        prompt, metadata = self.context_manager.build(user_message)
+        # Phase 2: Interactive/默认路径走 Context Compiler（Pinned + Working State +
+        # Recent Verbatim + Compressed History + Repo Map）；旧 ContextManager 作为
+        # legacy adapter（feature flag 关闭时使用）。
+        if self.context_compiler is not None:
+            if task_state is not None:
+                self.emit_trace(
+                    task_state,
+                    "context_compile_started",
+                    {
+                        "step": task_state.tool_steps,
+                        "history_entries": len(self.session.get("history", [])),
+                        "working_state_facts": len(self.working_state.known_facts),
+                    },
+                )
+            self.working_state.refresh_fact_freshness(self.root)
+            stale_count = len(self.working_state.stale_facts())
+            prompt, metadata = self.context_compiler.compile_text(
+                user_message,
+                working_state=self.working_state,
+                history=self.session.get("history", []),
+                pinned_extra=self._pinned_extra(user_message),
+            )
+            self._add_legacy_metadata_compat(metadata, prompt, user_message)
+            if task_state is not None:
+                if stale_count:
+                    self.emit_trace(
+                        task_state,
+                        "context_fact_stale",
+                        {"stale_fact_count": stale_count, "step": task_state.tool_steps},
+                    )
+                if metadata.get("should_compress"):
+                    self.emit_trace(
+                        task_state,
+                        "compression_triggered",
+                        {
+                            "mode": "legacy",
+                            "estimated_tokens": metadata.get(
+                                "candidate_context_tokens"
+                            ),
+                            "usable_input_budget": metadata.get("usable_input_budget"),
+                            "compression_count": metadata.get("compression_count"),
+                        },
+                    )
+                    self.emit_trace(
+                        task_state,
+                        "compression_started",
+                        {"mode": "legacy"},
+                    )
+                    self.emit_trace(
+                        task_state,
+                        "history_span_compacted",
+                        {
+                            "raw_history_tokens": metadata.get(
+                                "raw_history_tokens"
+                            ),
+                            "compressed_history_tokens": metadata.get(
+                                "compressed_history_tokens"
+                            ),
+                        },
+                    )
+                if metadata.get("repo_map_selection", {}).get("selected_files"):
+                    self.emit_trace(
+                        task_state,
+                        "repo_map_selected",
+                        {
+                            "selected_files": metadata["repo_map_selection"][
+                                "selected_files"
+                            ],
+                            "estimated_tokens": metadata["repo_map_selection"].get(
+                                "estimated_tokens"
+                            ),
+                        },
+                    )
+                self.emit_trace(
+                    task_state,
+                    "context_compile_finished",
+                    {
+                        "compilation_metadata": metadata,
+                    },
+                )
+        else:
+            prompt, metadata = self.context_manager.build(user_message)
         available_prompt_tokens = resolve_prompt_budget(
             self.context_window, self.max_new_tokens, self.safety_margin_tokens
         )
@@ -1128,6 +1393,10 @@ class Pico:
         self.current_run_usage = []
         self.current_run_source_reads = []
         self.current_planning = self.new_planning_state()
+        if self.working_state is not None:
+            # Phase 2: Task-local Working State 生命周期 = 本次 ask。
+            self.working_state = WorkingState()
+            self.working_state.set_goal(user_message)
         self.current_run_dir = self.run_store.start_run(task_state)
         self.emit_run_status(
             task_state,
@@ -1277,7 +1546,9 @@ class Pico:
                 )
 
             prompt, prompt_metadata = self._build_prompt_and_metadata(
-                user_message, status_callback=emit_context_status
+                user_message,
+                status_callback=emit_context_status,
+                task_state=task_state,
             )
             if native_mode:
                 prompt_metadata["model_protocol"] = "native_tools"
@@ -1340,8 +1611,16 @@ class Pico:
                         "trigger": "workspace_mismatch",
                     },
                 )
-            # 当 prompt 预算被削减（上下文压缩）时，也会创建检查点
-            if prompt_metadata.get("budget_reductions"):
+            # 当 prompt 预算被削减（旧 context_reduction 或 Phase 2 Compiler 压缩）时，
+            # 也会创建检查点，保证 resume 不变量。
+            compiler_compression = False
+            if self.context_compiler is not None:
+                current_count = self.context_compiler.compression_count
+                compiler_compression = current_count > getattr(
+                    self, "_last_compiler_compression_count", 0
+                )
+                self._last_compiler_compression_count = current_count
+            if prompt_metadata.get("budget_reductions") or compiler_compression:
                 checkpoint = self.create_checkpoint(
                     task_state, user_message, trigger="context_reduction"
                 )
@@ -1488,6 +1767,60 @@ class Pico:
                     if pending_native_calls:
                         raw = pending_native_calls.pop(0)
                     else:
+                        # Phase 2: native 消息经 Context Compiler 编译（不压缩时
+                        # 原样返回，超预算时保持 assistant/tool 原子组压缩）。
+                        if self.context_compiler is not None:
+                            self.working_state.refresh_fact_freshness(self.root)
+                            compiled_native, compiler_meta = self.context_compiler.compile_native(
+                                user_message,
+                                working_state=self.working_state,
+                                native_messages=native_messages,
+                                pinned_extra=self._pinned_extra(user_message),
+                            )
+                            if compiler_meta.get("should_compress"):
+                                self.emit_trace(
+                                    task_state,
+                                    "compression_triggered",
+                                    {
+                                        "mode": "native",
+                                        "estimated_tokens": compiler_meta.get(
+                                            "candidate_context_tokens"
+                                        ),
+                                        "usable_input_budget": compiler_meta.get(
+                                            "usable_input_budget"
+                                        ),
+                                        "compression_count": compiler_meta.get(
+                                            "compression_count"
+                                        ),
+                                    },
+                                )
+                                self.emit_trace(
+                                    task_state,
+                                    "compression_started",
+                                    {"mode": "native"},
+                                )
+                                self.emit_trace(
+                                    task_state,
+                                    "compression_finished",
+                                    {
+                                        "mode": "native",
+                                        "compiled_tokens": compiler_meta.get(
+                                            "compiled_context_tokens"
+                                        ),
+                                        "compression_count": compiler_meta.get(
+                                            "compression_count"
+                                        ),
+                                    },
+                                )
+                            native_messages = compiled_native
+                            prompt_metadata.update(
+                                {
+                                    "context_compiler": compiler_meta,
+                                    "compression_count": compiler_meta.get(
+                                        "compression_count", 0
+                                    ),
+                                }
+                            )
                         raw = self.model_client.complete_with_tools(
                             native_messages,
                             native_tools,
@@ -1886,6 +2219,28 @@ class Pico:
                 semantic_repeat = self.update_planning_state(
                     name, args, self._last_tool_result_metadata, task_state.tool_steps
                 )
+                if self.working_state is not None:
+                    self.working_state.update_from_tool_event(
+                        name,
+                        args,
+                        self._last_tool_result_metadata,
+                        result,
+                        task_state.tool_steps,
+                        self.root,
+                    )
+                    self.emit_trace(
+                        task_state,
+                        "working_state_updated",
+                        {
+                            "step": task_state.tool_steps,
+                            "changed_files": list(self.working_state.changed_files),
+                            "verification_status": (
+                                self.working_state.verification[-1].get("status", "")
+                                if self.working_state.verification
+                                else ""
+                            ),
+                        },
+                    )
                 # A native assistant tool-call message must be followed by a
                 # tool result for every call before any user message.  Providers
                 # can return a batch despite advertising no parallel support;

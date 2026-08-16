@@ -364,6 +364,16 @@ def _apply_task_setup(agent, task, fixture_copy_root):
                 {"prefix": 120, "memory": 120, "relevant_memory": 120, "history": 160},
             )
         )
+        # Phase 2 兼容：Context Compiler 启用时，把显式总预算同步到 compiler，
+        # 保证 context_reduction checkpoint 语义在 compiler 路径下依然成立。
+        if getattr(agent, "context_compiler", None) is not None:
+            from codecub.context_compiler import ContextBudget
+
+            agent.context_compiler.budget = ContextBudget(
+                usable_input_budget=int(setup.get("total_budget", 900)),
+                trigger_threshold=0.5,
+                budget_source="explicit",
+            )
         return
 
     if kind == "freshness_mismatch":
