@@ -464,9 +464,9 @@ def test_metrics_failure_writes_redacted_infrastructure_record(tmp_path, monkeyp
     assert row["status"] == "infrastructure_error"
     assert row["failure_stage"] == "metrics_collection"
     assert row["error_type"] == "RuntimeError"
-    assert Path(row["runtime_artifacts"]["workspace"]).name.endswith(
-        "flag_memory_default-0"
-    )
+    assert Path(row["runtime_artifacts"]["workspace"]).name == runner.workspace_path(
+        "development-default-flag_memory_default-0"
+    ).name
     assert secret not in row["error_message"]
     assert secret not in debug_text
     assert "<redacted>" in debug_text

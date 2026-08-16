@@ -1,6 +1,7 @@
 """统一的真实模型实验 runner。"""
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -144,6 +145,11 @@ class ExperimentRunner:
     def planned_run_id(self, task, repeat_index):
         return f"{self.config.suite}-{self.config.variant}-{task.id}-{repeat_index}"
 
+    def workspace_path(self, run_id):
+        """Keep runtime artifact paths below Windows' legacy path-length limit."""
+        digest = hashlib.sha256(str(run_id).encode("utf-8")).hexdigest()[:16]
+        return self.run_root / "workspaces" / f"run-{digest}"
+
     def existing_ids(self):
         if not self.runs_path.exists():
             return set()
@@ -204,7 +210,7 @@ class ExperimentRunner:
     def run_one(self, task, repeat_index, run_id):
         started = utc_now()
         started_clock = time.monotonic()
-        workspace = self.run_root / "workspaces" / run_id
+        workspace = self.workspace_path(run_id)
         record = self._base_record(task, repeat_index, run_id, started, workspace)
         failure_stage = "workspace_setup"
         try:
