@@ -226,7 +226,9 @@ def main(argv=None):
     if args.reuse_seeds:
         seed_rows_path = seeds_dir / "seed_rows.json"
         if seed_rows_path.exists():
-            loaded = json.loads(seed_rows_path.read_text(encoding="utf-8"))
+            loaded = json.loads(
+                seed_rows_path.read_text(encoding="utf-8-sig")
+            )
             usable = all(
                 Path(s.get("memory_dir", "")).exists()
                 for s in loaded
