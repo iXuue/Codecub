@@ -1,0 +1,57 @@
+{
+  "groups": [
+    {
+      "aggregation_key": "276f557f0f7ff20e",
+      "cache": {
+        "comparability": "provider_specific",
+        "mode": "provider_managed",
+        "ratio_definition": "cached_input_tokens / input_tokens",
+        "read_ratio": 0.25990685381851,
+        "read_tokens": 16128,
+        "uncached_input_tokens": 45925,
+        "write_tokens": null
+      },
+      "calculation_channels": {
+        "cache": "deepseek_responses_cache_usage",
+        "context": "deepseek_responses_usage",
+        "cost": "deepseek_official_pricing_unavailable"
+      },
+      "connection": {
+        "api_operator": "deepseek",
+        "connection_profile_id": "deepseek-official",
+        "connection_type": "direct",
+        "endpoint_kind": "responses",
+        "endpoint_verification_status": "verified",
+        "model": "deepseek-v4-flash",
+        "model_vendor": "deepseek",
+        "protocol": "responses",
+        "response_schema": "deepseek-chat",
+        "usage_schema_verification_status": "verified"
+      },
+      "context": {
+        "context_window": null,
+        "count_quality": "operator_reported",
+        "count_source": "relay_response",
+        "latest_actual_input_tokens": 2650,
+        "latest_utilization_ratio": null,
+        "peak_actual_input_tokens": 2935,
+        "peak_utilization_ratio": null,
+        "total_actual_input_tokens": 62053,
+        "window_source": "unavailable"
+      },
+      "cost": [],
+      "output": {
+        "output_tokens": 6714,
+        "reasoning_tokens": 5897
+      },
+      "request_count": 24,
+      "warnings": []
+    }
+  ],
+  "last_usage_id": "real-agent-default-context_priority-0-request-24",
+  "revision": 24,
+  "run_id": "",
+  "schema_version": 2,
+  "scope": "session",
+  "session_id": "20260814-163239-514a87"
+}

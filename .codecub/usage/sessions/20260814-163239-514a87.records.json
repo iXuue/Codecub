@@ -1,0 +1,1394 @@
+[
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 1176,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 1176,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 1952,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 106,
+      "reasoning_tokens": 74,
+      "total_tokens": 1282
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:32:45.568094+00:00",
+    "request_index": 1,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-1",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 1415,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 1415,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 2344,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 204,
+      "reasoning_tokens": 171,
+      "total_tokens": 1619
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:32:48.365408+00:00",
+    "request_index": 2,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-2",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 1760,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 1760,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 1687,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 103,
+      "reasoning_tokens": 54,
+      "total_tokens": 1863
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:32:50.457061+00:00",
+    "request_index": 3,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-3",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1664,
+      "uncached_input_tokens": 477,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2141,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 1718,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 133,
+      "reasoning_tokens": 107,
+      "total_tokens": 2274
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:32:52.727519+00:00",
+    "request_index": 4,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-4",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 2536,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2536,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 1217,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 78,
+      "reasoning_tokens": 46,
+      "total_tokens": 2614
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:32:54.409233+00:00",
+    "request_index": 5,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-5",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 2432,
+      "uncached_input_tokens": 497,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2929,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 4328,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 480,
+      "reasoning_tokens": 448,
+      "total_tokens": 3409
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:32:59.128496+00:00",
+    "request_index": 6,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-6",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 2907,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2907,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 2125,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 160,
+      "reasoning_tokens": 128,
+      "total_tokens": 3067
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:01.606923+00:00",
+    "request_index": 7,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-7",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 896,
+      "uncached_input_tokens": 2039,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2935,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 2858,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 253,
+      "reasoning_tokens": 221,
+      "total_tokens": 3188
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:04.818770+00:00",
+    "request_index": 8,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-8",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 896,
+      "uncached_input_tokens": 1975,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2871,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 1577,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 123,
+      "reasoning_tokens": 89,
+      "total_tokens": 2994
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:06.823709+00:00",
+    "request_index": 9,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-9",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 2865,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2865,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 2125,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 179,
+      "reasoning_tokens": 140,
+      "total_tokens": 3044
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:09.396639+00:00",
+    "request_index": 10,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-10",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 2822,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2822,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 921,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 56,
+      "reasoning_tokens": 23,
+      "total_tokens": 2878
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:10.776042+00:00",
+    "request_index": 11,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-11",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 2869,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2869,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 7703,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 865,
+      "reasoning_tokens": 833,
+      "total_tokens": 3734
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:18.938587+00:00",
+    "request_index": 12,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-12",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 2910,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2910,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 4046,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 412,
+      "reasoning_tokens": 379,
+      "total_tokens": 3322
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:23.386281+00:00",
+    "request_index": 13,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-13",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1857,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2881,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 1235,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 82,
+      "reasoning_tokens": 50,
+      "total_tokens": 2963
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:25.143438+00:00",
+    "request_index": 14,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-14",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1879,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2903,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 6296,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 645,
+      "reasoning_tokens": 612,
+      "total_tokens": 3548
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:31.917514+00:00",
+    "request_index": 15,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-15",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1806,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2830,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 3375,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 348,
+      "reasoning_tokens": 316,
+      "total_tokens": 3178
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:35.733698+00:00",
+    "request_index": 16,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-16",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1721,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2745,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 3562,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 368,
+      "reasoning_tokens": 335,
+      "total_tokens": 3113
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:39.673093+00:00",
+    "request_index": 17,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-17",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1640,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2664,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 3672,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 391,
+      "reasoning_tokens": 359,
+      "total_tokens": 3055
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:43.816524+00:00",
+    "request_index": 18,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-18",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1642,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2666,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 2875,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 275,
+      "reasoning_tokens": 243,
+      "total_tokens": 2941
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:47.150137+00:00",
+    "request_index": 19,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-19",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1546,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2570,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 1530,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 122,
+      "reasoning_tokens": 90,
+      "total_tokens": 2692
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:49.157277+00:00",
+    "request_index": 20,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-20",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1660,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2684,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 5155,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 536,
+      "reasoning_tokens": 481,
+      "total_tokens": 3220
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:54.784634+00:00",
+    "request_index": 21,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-21",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 0,
+      "uncached_input_tokens": 2656,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2656,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 2171,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 212,
+      "reasoning_tokens": 180,
+      "total_tokens": 2868
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:33:57.402876+00:00",
+    "request_index": 22,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-22",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1644,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2668,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 3406,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 337,
+      "reasoning_tokens": 304,
+      "total_tokens": 3005
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:34:01.246779+00:00",
+    "request_index": 23,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-23",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  },
+  {
+    "api_operator": "deepseek",
+    "cache": {
+      "comparability": "provider_specific",
+      "mode": "provider_managed",
+      "ratio_definition": "cached_input_tokens / input_tokens",
+      "read_tokens": 1024,
+      "uncached_input_tokens": 1626,
+      "write_tokens": null
+    },
+    "calculation_channels": {
+      "cache": "deepseek_responses_cache_usage",
+      "context": "deepseek_responses_usage",
+      "cost": "deepseek_official_pricing_unavailable"
+    },
+    "connection_profile_id": "deepseek-official",
+    "connection_type": "direct",
+    "context": {
+      "actual_input_tokens": 2650,
+      "context_window": null,
+      "count_quality": "operator_reported",
+      "count_source": "relay_response",
+      "window_source": "unavailable"
+    },
+    "cost": {
+      "cash_equivalent_cost": null,
+      "operator_billed_cost": null,
+      "operator_metered_cost": null,
+      "quality": "unavailable",
+      "upstream_reference_cost": null
+    },
+    "duration_ms": 2312,
+    "endpoint_kind": "responses",
+    "endpoint_verification_status": "verified",
+    "model": "deepseek-v4-flash",
+    "model_vendor": "deepseek",
+    "output": {
+      "output_tokens": 246,
+      "reasoning_tokens": 214,
+      "total_tokens": 2896
+    },
+    "protocol": "responses",
+    "provenance": {
+      "quality": "unverified",
+      "source": "relay_response"
+    },
+    "recorded_at": "2026-08-14T08:34:04.008227+00:00",
+    "request_index": 24,
+    "response_schema": "deepseek-chat",
+    "run_id": "real-agent-default-context_priority-0",
+    "schema_version": 2,
+    "session_id": "20260814-163239-514a87",
+    "status": "completed",
+    "turn_id": "task_20260814-163243-fea4eb",
+    "usage_id": "real-agent-default-context_priority-0-request-24",
+    "usage_schema_verification_status": "verified",
+    "warnings": []
+  }
+]
