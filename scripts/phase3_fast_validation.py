@@ -426,9 +426,11 @@ class FastValidationRunner:
         row["repeated_read_calls"] = repeats
         row["unique_read_files"] = unique
         # Memory hit: an evidence record for the target path was delivered (used).
+        # Check ALL records (a delivered seed record may later be superseded by
+        # the model's own re-read — that is correct stale-revalidation behavior).
         memory_hit = False
         if variant == "on":
-            for record in agent.memory_v2.evidence_store.latest_records():
+            for record in agent.memory_v2.evidence_store.records:
                 if record["path"] == task.path and record.get("last_used_at"):
                     memory_hit = True
                     break
