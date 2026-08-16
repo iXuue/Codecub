@@ -98,7 +98,6 @@ def build_report(output_root, stats, meta):
     a("")
     mpass = ma.get("pass_delta", {})
     mreads = ma.get("repeated_read_delta", {})
-    msearch = ma.get("search_before_delta", {})
     mfirst = ma.get("first_relevant_source_delta", {})
     msteps = ma.get("tool_step_delta", {})
     mtok = ma.get("input_token_delta", {})
