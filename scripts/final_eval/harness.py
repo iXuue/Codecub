@@ -364,8 +364,24 @@ def is_provider_error(exc):
     )
 
 
-def run_agent(agent, prompt, fault=None, retry=True):
-    """Run one ask() with optional harness fault injection and one provider retry."""
+def is_infra_transient(exc):
+    """Intermittent local infrastructure failures (Windows file locks,
+    antivirus temp scans) — NOT model/verifier outcomes, NOT product bugs.
+    A single retry is allowed; if it repeats, the run is recorded as an
+    infrastructure failure (spec §69 discipline)."""
+    return isinstance(exc, PermissionError) or (
+        isinstance(exc, OSError) and "Access is denied" in str(exc)
+    )
+
+
+def run_agent(agent, prompt, fault=None, rebuild=None, retry=True):
+    """Run one ask() with optional fault injection and one rebuild+retry.
+
+    `rebuild` is a zero-arg callable returning a FRESH agent (fresh workspace)
+    used when a provider/infra transient occurs mid-run, so the retry starts
+    from the original task state. Never retries model/verifier/step-limit
+    outcomes (spec §42-§43).
+    """
     retry_count = 0
     while True:
         try:
@@ -374,16 +390,13 @@ def run_agent(agent, prompt, fault=None, retry=True):
             answer = agent.ask(prompt)
             return answer, retry_count
         except Exception as exc:  # noqa: BLE001
-            if retry and retry_count < 1 and is_provider_error(exc):
+            if retry and retry_count < 1 and rebuild is not None and (
+                is_provider_error(exc) or is_infra_transient(exc)
+            ):
                 retry_count += 1
-                print(f"    [provider transient] {exc}; retrying once")
+                print(f"    [transient {type(exc).__name__}] {exc}; rebuilding workspace + retrying once")
                 time.sleep(5)
-                agent = build_agent(
-                    Path(agent.root),
-                    None,
-                    agent.feature_flags,
-                    agent.max_steps or STEP_BUDGET,
-                )
+                agent = rebuild()
                 continue
             raise
 

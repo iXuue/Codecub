@@ -55,14 +55,27 @@ def output_root():
     return REPO_ROOT / "artifacts" / "final-eval"
 
 
-def run_seed(task, seed_ws, flags, max_steps=16):
-    """Session A predecessor run (memory ON). Returns seed memory source dir."""
+def run_seed(task, seed_ws, flags, persist_dir=None, max_steps=16):
+    """Session A predecessor run (memory ON). Returns seed memory source dir.
+
+    When `persist_dir` is given, the produced memory store is copied to
+    persist_dir/<task_id>/memory-v2/ so a later generation can reuse the exact
+    seed snapshot (identical conditions for FULL / CONTEXT_ONLY pairs).
+    """
     agent = build_agent(
         seed_ws, task, flags, max_steps=max_steps, requires_workspace_change=False
     )
     answer, retries = run_agent(agent, task.seed_prompt)
     v2 = agent.memory_v2
     memory_dir = seed_ws / ".codecub" / "memory" / "v2"
+    if persist_dir is not None:
+        target = Path(persist_dir) / task.task_id / "memory-v2"
+        target.mkdir(parents=True, exist_ok=True)
+        if memory_dir.exists():
+            for path in memory_dir.iterdir():
+                if path.is_file():
+                    shutil.copy2(path, target / path.name)
+        memory_dir = target
     return {
         "task_id": task.task_id,
         "answer": str(answer)[:400],
@@ -89,24 +102,31 @@ def run_one(entry, root, output, seed_rows, all_rows, dry_run=False):
     repeat = entry["repeat"]
     flags = VARIANT_FLAGS[variant]
     ws = variant_workspace(root, task.task_id, variant, repeat)
-    extract_frozen_tree(ws)
-    prune_workspace(ws)
-    # fresh fixture: no seed memory unless this task is memory-seeded
     seed_entry = next(
         (s for s in seed_rows if s.get("task_id") == task.task_id), None
     )
-    if seed_entry and seed_entry.get("memory_dir"):
-        copy_seed_memory(seed_entry["memory_dir"], ws)
-    from .harness import apply_mutation
 
-    apply_mutation(ws, task)
-    agent = build_agent(ws, task, flags, max_steps=task.step_budget)
+    def build_fresh():
+        import shutil as _shutil
+
+        if ws.exists():
+            _shutil.rmtree(ws, ignore_errors=True)
+        extract_frozen_tree(ws)
+        prune_workspace(ws)
+        if seed_entry and seed_entry.get("memory_dir"):
+            copy_seed_memory(seed_entry["memory_dir"], ws)
+        from .harness import apply_mutation
+
+        apply_mutation(ws, task)
+        return build_agent(ws, task, flags, max_steps=task.step_budget)
+
+    agent = build_fresh()
     started = time.monotonic()
     if dry_run:
         answer = "<dry-run>"
         retries = 0
     else:
-        answer, retries = run_agent(agent, task.prompt)
+        answer, retries = run_agent(agent, task.prompt, rebuild=build_fresh)
     duration_ms = int((time.monotonic() - started) * 1000)
     row = extract_run_metrics(agent, task, variant, repeat, "main", ws)
     row["run_id"] = f"main-{entry['run_index']}-{uuid.uuid4().hex[:6]}"
@@ -128,14 +148,22 @@ def run_one(entry, root, output, seed_rows, all_rows, dry_run=False):
 
 def run_stress_one(task, fault, repeat, root, output, all_rows):
     ws = variant_workspace(root, task.task_id, "stress", repeat)
-    extract_frozen_tree(ws)
-    prune_workspace(ws)
-    from .harness import apply_mutation
 
-    apply_mutation(ws, task)
-    agent = build_agent(ws, task, VARIANT_FLAGS[V_FULL], max_steps=task.step_budget)
+    def build_fresh():
+        import shutil as _shutil
+
+        if ws.exists():
+            _shutil.rmtree(ws, ignore_errors=True)
+        extract_frozen_tree(ws)
+        prune_workspace(ws)
+        from .harness import apply_mutation
+
+        apply_mutation(ws, task)
+        return build_agent(ws, task, VARIANT_FLAGS[V_FULL], max_steps=task.step_budget)
+
+    agent = build_fresh()
     started = time.monotonic()
-    answer, retries = run_agent(agent, task.prompt, fault=fault)
+    answer, retries = run_agent(agent, task.prompt, fault=fault, rebuild=build_fresh)
     duration_ms = int((time.monotonic() - started) * 1000)
     row = extract_run_metrics(agent, task, V_FULL, repeat, "stress", ws)
     row["run_id"] = f"stress-{task.task_id}-{fault}-{repeat}-{uuid.uuid4().hex[:6]}"
@@ -159,6 +187,8 @@ def main(argv=None):
     parser.add_argument("--phase", choices=("preflight", "run", "stats", "all"), default="all")
     parser.add_argument("--dry-run", action="store_true", help="plumbing check (no API)")
     parser.add_argument("--limit", type=int, default=0, help="run only the first N schedule entries (smoke test)")
+    parser.add_argument("--reuse-seeds", action="store_true",
+                        help="reuse persisted seed memory from output/runs/seeds instead of re-running Session A")
     args = parser.parse_args(argv)
 
     output = output_root()
@@ -192,9 +222,26 @@ def main(argv=None):
     # Precompute seed workspace roots per memory-seeded task (Session A).
     seeds_dir = output / "runs" / "seeds"
     seeds_dir.mkdir(parents=True, exist_ok=True)
+    seed_rows = []
+    if args.reuse_seeds:
+        seed_rows_path = seeds_dir / "seed_rows.json"
+        if seed_rows_path.exists():
+            loaded = json.loads(seed_rows_path.read_text(encoding="utf-8"))
+            usable = all(
+                Path(s.get("memory_dir", "")).exists()
+                for s in loaded
+                if s.get("task_id") in MEMORY_SEEDED_TASK_IDS
+            )
+            if usable:
+                seed_rows = loaded
+                print(f"== Reusing {len(seed_rows)} persisted Session A seeds ==")
+            else:
+                print("== Persisted seed memory missing; re-running seeds ==")
     seeds_root = work_root / "seeds"
     for task in FINAL_HOLDOUT_V1:
         if task.task_id not in MEMORY_SEEDED_TASK_IDS:
+            continue
+        if any(s.get("task_id") == task.task_id for s in seed_rows):
             continue
         seed_ws = seeds_root / task.task_id
         extract_frozen_tree(seed_ws)
@@ -214,7 +261,9 @@ def main(argv=None):
             )
             continue
         print(f"== Seed (Session A): {task.task_id} ==")
-        seed_rows.append(run_seed(task, seed_ws, VARIANT_FLAGS[V_FULL]))
+        seed_rows.append(
+            run_seed(task, seed_ws, VARIANT_FLAGS[V_FULL], persist_dir=seeds_dir)
+        )
         (seeds_dir / f"{task.task_id}.json").write_text(
             json.dumps(seed_rows[-1], ensure_ascii=False, indent=2), encoding="utf-8"
         )
