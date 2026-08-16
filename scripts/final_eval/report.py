@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from .tasks import PRODUCT_FROZEN_SHA, GENERATION_ID
@@ -52,10 +51,10 @@ def build_report(output_root, stats, meta):
     a("")
     a(f"- Product SHA: `{PRODUCT_FROZEN_SHA}`")
     a(f"- Harness SHA: `{meta.get('harness_sha')}`")
-    a(f"- Provider: deepseek | Model: deepseek-v4-flash | Protocol: native_tools")
-    a(f"- Temperature: 0.2 | Top-P: 0.9 | Max New Tokens: 1024 | Prompt Cache: false")
-    a(f"- Step Budget: 80 (runtime_mode=experiment, all variants identical)")
-    a(f"- Task Count: 10 (6 standard + 4 long-horizon) | Repeats: 2")
+    a("- Provider: deepseek | Model: deepseek-v4-flash | Protocol: native_tools")
+    a("- Temperature: 0.2 | Top-P: 0.9 | Max New Tokens: 1024 | Prompt Cache: false")
+    a("- Step Budget: 80 (runtime_mode=experiment, all variants identical)")
+    a("- Task Count: 10 (6 standard + 4 long-horizon) | Repeats: 2")
     a("")
     a("## 3. Fresh Holdout")
     a("")
@@ -140,7 +139,7 @@ def build_report(output_root, stats, meta):
     a("")
     a("## 9. Statistical Analysis")
     a("")
-    a(f"- Paired units: task_id x repeat_index (20 units per ablation)")
+    a("- Paired units: task_id x repeat_index (20 units per ablation)")
     a(f"- Bootstrap: {stats.get('bootstrap', {}).get('n')} resamples, seed {stats.get('bootstrap', {}).get('seed')}")
     a("- CIs: 95% percentile bootstrap on paired deltas")
     a(f"- McNemar: context {ca.get('mcnemar')}; memory {ma.get('mcnemar')}")
@@ -154,7 +153,7 @@ def build_report(output_root, stats, meta):
     a("")
     a("## 11. Failure Analysis")
     a("")
-    a(f"- Model failure (stop reasons): see variant stop_reason distributions")
+    a("- Model failure (stop reasons): see variant stop_reason distributions")
     a(f"- Context failure: {meta.get('context_failure_note', '-')}")
     a(f"- Memory failure: {meta.get('memory_failure_note', '-')}")
     a(f"- Runtime failure: {meta.get('runtime_failure_note', '-')}")
