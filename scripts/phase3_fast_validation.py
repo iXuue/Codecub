@@ -146,6 +146,13 @@ IGNORED_NAMES = {
     "docs", "scripts", "desktop",
 }
 
+# Benchmark answer keys: the experiment task definitions contain the exact
+# baseline/mutation fragments for every task. A faithful fixture must not
+# include them, or the model can "solve" the task by reading the harness.
+EXTRA_EXCLUDE_PATHS = {
+    "codecub/experiments/tasks.py",
+}
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
@@ -164,6 +171,10 @@ def copy_workspace(src, dst, keep_codecub=False):
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dst, ignore=ignore)
+    for relative in EXTRA_EXCLUDE_PATHS:
+        target = dst / relative
+        if target.exists():
+            target.unlink()
 
 
 def copy_seed_memory(src_fixture, dst_fixture):
