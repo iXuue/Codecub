@@ -209,7 +209,11 @@ class MemoryExtractor:
         return candidates
 
     def extract_from_evidence(self, evidence_store, run_id=""):
-        """Fresh verification evidence from this run → validated workflow."""
+        """Fresh verification evidence from this run → validated workflow.
+
+        Only test/build-like commands qualify (spec §20: 瞬时 shell output 不
+        该进 Durable；`dir`/`ls` 等成功命令不是长期知识)。
+        """
         candidates = []
         for record in evidence_store.latest_records() if evidence_store else []:
             if record.get("kind") != "verification_result":
@@ -218,6 +222,8 @@ class MemoryExtractor:
                 continue
             summary = str(record.get("summary") or "").strip()
             if not summary:
+                continue
+            if not TEST_COMMAND_PATTERN.search(summary):
                 continue
             candidates.append(
                 MemoryCandidate(
@@ -230,7 +236,7 @@ class MemoryExtractor:
                             "path": record.get("path"),
                         }
                     ],
-                    reason_to_remember="verified command recorded as evidence",
+                    reason_to_remember="verified test/build command recorded as evidence",
                     freshness_dependency="none",
                     source_evidence_ids=[record.get("evidence_id") or ""],
                     source_task_id=self.task_id,

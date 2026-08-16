@@ -308,7 +308,7 @@ class FastValidationRunner:
             ]
         else:
             agent = self._build_agent(
-                workspace, task, flags, max_steps=12, requires_workspace_change=False
+                workspace, task, flags, max_steps=16, requires_workspace_change=False
             )
         answer, report, trace, duration_ms = self._run_agent(agent, seed_prompt)
         v2 = agent.memory_v2

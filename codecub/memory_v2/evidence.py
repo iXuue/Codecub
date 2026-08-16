@@ -281,10 +281,10 @@ class EvidenceStore:
                     )
         elif name == "symbol_search":
             query = str(args.get("query") or "").strip()
-            if query and not secretlib.contains_secret(query):
+            if query and canonical not in (".", "") and not secretlib.contains_secret(query):
                 created.append(
                     self.add_evidence(
-                        path=canonical or ".",
+                        path=canonical,
                         kind="symbol_location",
                         summary=f"symbol search '{query}' matched definitions",
                         symbol=query,
@@ -296,7 +296,7 @@ class EvidenceStore:
                     )
                 )
         elif name == "file_outline":
-            if canonical:
+            if canonical and canonical not in (".", ""):
                 created.append(
                     self.add_evidence(
                         path=canonical,
@@ -311,10 +311,10 @@ class EvidenceStore:
                 )
         elif name == "find_references":
             symbol = str(args.get("symbol") or "").strip()
-            if symbol:
+            if symbol and canonical not in (".", ""):
                 created.append(
                     self.add_evidence(
-                        path=canonical or ".",
+                        path=canonical,
                         kind="architecture_anchor",
                         summary=f"references searched for '{symbol}'",
                         symbol=symbol,
