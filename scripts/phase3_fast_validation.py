@@ -178,13 +178,32 @@ def copy_workspace(src, dst, keep_codecub=False):
 
 
 def copy_seed_memory(src_fixture, dst_fixture):
-    """Carry over a previously produced seed memory into a clean fixture."""
-    src_codecub = Path(src_fixture) / ".codecub"
-    if not src_codecub.exists():
-        raise ValueError(f"seed workspace has no .codecub: {src_fixture}")
-    dst_codecub = Path(dst_fixture) / ".codecub"
-    dst_codecub.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src_codecub, dst_codecub, dirs_exist_ok=True)
+    """Carry over a previously produced seed memory into a clean fixture.
+
+    Only the Memory 2.0 stores (.codecub/memory/v2) are copied — NEVER the
+    seed's session history / runs / usage (spec §66: Session B must not
+    receive Session A's history).
+    """
+    src_v2 = Path(src_fixture) / ".codecub" / "memory" / "v2"
+    if not src_v2.exists():
+        raise ValueError(f"seed workspace has no v2 memory store: {src_v2}")
+    dst_v2 = Path(dst_fixture) / ".codecub" / "memory" / "v2"
+    dst_v2.mkdir(parents=True, exist_ok=True)
+    for path in src_v2.iterdir():
+        if path.is_file():
+            shutil.copy2(path, dst_v2 / path.name)
+
+
+def make_isolated_workspaces(root, task_id):
+    """Return (fixture, off_ws, on_ws) with no sibling relationships:
+    each workspace lives in its own parent directory, so `dir ..` from a
+    running agent can never reach the fixture or the other variant, and the
+    workspace root is outside the source repository (no git discovery).
+    """
+    fixture = root / f"{task_id}" / "fixture"
+    off_ws = root / f"{task_id}-off" / "workspace"
+    on_ws = root / f"{task_id}-on" / "workspace"
+    return fixture, off_ws, on_ws
 
 
 class FastValidationRunner:
@@ -446,11 +465,20 @@ class FastValidationRunner:
     # ------------------------------------------------------------------
 
     def run(self):
+        # Workspaces live outside the source repository (system temp), so a
+        # running agent cannot discover the parent repo's .git or reach the
+        # fixture/other-variant via `..`.
+        import tempfile
+
+        workspace_root = Path(
+            tempfile.mkdtemp(prefix="codecub-fv-")
+        )
         for task in self.tasks:
             task_root = self.output_root / task.id
             task_root.mkdir(parents=True, exist_ok=True)
-            # 1) Fresh fixture workspace (no docs/scripts/desktop — see IGNORED_NAMES).
-            fixture = task_root / "fixture"
+            # 1) Fresh fixture workspace (no docs/scripts/desktop — see
+            #    IGNORED_NAMES; no task-definition answer keys).
+            fixture, off_ws, on_ws = make_isolated_workspaces(workspace_root, task.id)
             copy_workspace(REPO_ROOT, fixture, keep_codecub=False)
             self.preflight_task(task, fixture)
             order = str(task.metadata.get("seed_mutation_order") or "before")
@@ -472,12 +500,16 @@ class FastValidationRunner:
             if order == "after":
                 self.apply_mutation(task, fixture)
             self._write_json(task_root / "seed.json", seed_row)
-            # 3) Variant workspaces: identical seeded state, fresh Session B.
-            for variant in ("off", "on"):
-                ws = task_root / f"session-b-{variant}"
+            # 3) Variant workspaces: identical seeded memory, fresh Session B.
+            #    Each workspace is isolated (own parent dir); the fixture is
+            #    deleted afterwards so no diff source exists.
+            for variant, ws in (("off", off_ws), ("on", on_ws)):
                 copy_workspace(fixture, ws, keep_codecub=True)
+            shutil.rmtree(fixture, ignore_errors=True)
+            for variant, ws in (("off", off_ws), ("on", on_ws)):
                 row = self.run_session_b(task, ws, variant)
                 row["run_id"] = f"{task.id}-{variant}-{uuid.uuid4().hex[:6]}"
+                row["workspace"] = str(ws)
                 self.rows.append(row)
                 self._write_json(task_root / f"session-b-{variant}.json", row)
                 print(
