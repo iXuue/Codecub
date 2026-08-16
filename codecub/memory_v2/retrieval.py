@@ -394,6 +394,8 @@ class MemoryRetriever:
                 suppressed += 1
                 continue
             location = f"{path}:{symbol}" if path and symbol else path
+            if not location:
+                location = "(verified command)"
             text = f"{location} — {summary}"
             if status == STATUS_STALE:
                 stale_count += 1

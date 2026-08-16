@@ -17,6 +17,7 @@ records when the cap is exceeded).
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,12 @@ STATUS_MISSING = "missing"
 STATUS_SUPERSEDED = "superseded"
 VALID_STATUSES = frozenset(
     {STATUS_FRESH, STATUS_STALE, STATUS_MISSING, STATUS_SUPERSEDED}
+)
+
+_TEST_COMMAND_PATTERN = re.compile(
+    r"(?i)(pytest|python\s+-m\s+pytest|uv\s+run|npm\s+test|yarn\s+test|"
+    r"make\s+test|make\s+build|tox\s+-e|pdm\s+run|poetry\s+run|"
+    r"python\s+test|nosetests|unittest)"
 )
 
 EVIDENCE_KINDS = frozenset(
@@ -328,10 +335,14 @@ class EvidenceStore:
         elif name == "run_shell":
             command = str(args.get("command") or "").strip()
             status = str(metadata.get("tool_status") or "").strip()
-            if command and status == "ok":
+            if (
+                command
+                and status == "ok"
+                and _TEST_COMMAND_PATTERN.search(command)
+            ):
                 created.append(
                     self.add_evidence(
-                        path=".",
+                        path="",
                         kind="verification_result",
                         summary=f"command succeeded: {_clip(command, 120)}",
                         task_id=task_id,
@@ -352,13 +363,16 @@ class EvidenceStore:
         """Add one record; same (path, symbol, kind) supersedes the older one.
 
         Returns the new EvidenceRecord (or None when rejected, e.g. outside
-        workspace or secret-bearing).
+        workspace or secret-bearing). Empty/root paths are allowed only as
+        "no file location" (e.g. verified command records).
         """
-        canonical = self.canonical_path(path)
-        if not canonical:
-            return None
-        if canonical.startswith(".."):
-            return None
+        raw_path = str(path or "").strip()
+        if raw_path in ("", "."):
+            canonical = ""
+        else:
+            canonical = self.canonical_path(raw_path)
+            if not canonical or canonical == "." or canonical.startswith(".."):
+                return None
         summary = str(summary or "").strip()
         if not summary or secretlib.contains_secret(summary):
             return None
@@ -368,7 +382,9 @@ class EvidenceStore:
             path=canonical,
             kind=kind,
             summary=summary,
-            source_hash=file_freshness(canonical, self.workspace_root) or "",
+            source_hash=(
+                file_freshness(canonical, self.workspace_root) if canonical else ""
+            ),
             project_id=self.project_id,
             **kwargs,
         )
@@ -405,6 +421,9 @@ class EvidenceStore:
         missing = []
         for record in self.records:
             if record["status"] == STATUS_SUPERSEDED:
+                continue
+            if not record.get("path"):
+                # No file location (e.g. verified command): never stale/missing.
                 continue
             current = file_freshness(record["path"], self.workspace_root)
             if current is None:
