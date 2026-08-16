@@ -23,8 +23,11 @@ from codecub import (
     build_welcome,
 )
 from codecub.cli import HELP_DETAILS, build_arg_parser, decode_cwd_arg
+from codecub.connections.presets import DEEPSEEK_OFFICIAL
 from codecub.experiments.tasks import tasks_for_suite
 from codecub import task_policy
+from codecub.models import ModelResponse, ToolCall
+from codecub.tools import native_tool_definitions
 
 
 def build_workspace(tmp_path):
@@ -66,18 +69,425 @@ def test_allowed_tools_filter_prompt_visibility_but_runtime_still_rejects(tmp_pa
     assert agent.run_tool("list_files", {"path": "."}).startswith("error: unknown tool")
 
 
+def test_shell_environment_blocks_git_discovery_above_workspace(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    assert agent.shell_env()["GIT_DIR"] == os.devnull
+
+
+def test_canonical_tool_specs_render_native_schema_without_drift(tmp_path):
+    agent = build_agent(tmp_path, [], allowed_tools=("read_file", "patch_file"))
+    definitions = native_tool_definitions(agent.tools)
+    patch = next(
+        item for item in definitions if item["function"]["name"] == "patch_file"
+    )
+    assert patch["function"]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "old_text": {"type": "string"},
+            "new_text": {"type": "string"},
+        },
+        "required": ["path", "old_text", "new_text"],
+        "additionalProperties": False,
+    }
+
+
+def test_native_tool_protocol_uses_structured_calls_and_runtime_validation(tmp_path):
+    class NativeClient:
+        supports_native_tools = True
+        supports_prompt_cache = False
+        model = "native-test"
+        last_completion_metadata = {}
+
+        def __init__(self):
+            self.requests = []
+            self.responses = [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "search",
+                            "search",
+                            {"pattern": "old", "path": "target.py"},
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "search",
+                            "search",
+                            {"pattern": "old", "path": "target.py"},
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "call-1",
+                            "patch_file",
+                            {
+                                "path": "target.py",
+                                "old_text": "old = 1",
+                                "new_text": "new = 1",
+                            },
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "verify-1",
+                            "run_shell",
+                            {"command": "python -c \"print('verified')\""},
+                        ),
+                    )
+                ),
+                ModelResponse(text="Done."),
+            ]
+
+        def complete_with_tools(
+            self, messages, tools, max_new_tokens, tool_choice="auto"
+        ):
+            self.requests.append((messages, tools, tool_choice))
+            return self.responses.pop(0)
+
+    (tmp_path / "target.py").write_text("old = 1\n", encoding="utf-8")
+    client = NativeClient()
+    agent = MiniAgent(
+        model_client=client,
+        workspace=WorkspaceContext.build(tmp_path),
+        session_store=SessionStore(tmp_path / ".codecub" / "sessions"),
+        approval_policy="auto",
+        allowed_tools=("patch_file", "run_shell"),
+        requires_workspace_change=True,
+    )
+    assert agent.ask("Update target.py") == "Done."
+    assert (tmp_path / "target.py").read_text(encoding="utf-8") == "new = 1\n"
+    assert client.requests[0][2] == "auto"
+    assert {tool["function"]["name"] for tool in client.requests[0][1]} == {
+        "patch_file",
+        "run_shell",
+    }
+    assert "<tool>" not in client.requests[0][0][0]["content"]
+    assert {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "patched target.py",
+    } in client.requests[0][0]
+
+
+def test_native_multi_tool_batch_is_sequential_and_preserves_each_call_id(tmp_path):
+    class NativeClient:
+        supports_native_tools = True
+        supports_prompt_cache = False
+        model = "native-test"
+        last_completion_metadata = {}
+
+        def __init__(self):
+            self.requests = []
+            self.responses = [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "read-1",
+                            "read_file",
+                            {"path": "a.txt", "start": 1, "end": 1},
+                        ),
+                        ToolCall(
+                            "read-2",
+                            "read_file",
+                            {"path": "b.txt", "start": 1, "end": 1},
+                        ),
+                    )
+                ),
+                ModelResponse(text="Done."),
+            ]
+
+        def complete_with_tools(
+            self, messages, tools, max_new_tokens, tool_choice="auto"
+        ):
+            self.requests.append(messages)
+            return self.responses.pop(0)
+
+    (tmp_path / "a.txt").write_text("a\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("b\n", encoding="utf-8")
+    client = NativeClient()
+    agent = MiniAgent(
+        client,
+        WorkspaceContext.build(tmp_path),
+        SessionStore(tmp_path / ".codecub" / "sessions"),
+        approval_policy="auto",
+    )
+    assert agent.ask("Inspect files") == "Done."
+    tool_messages = [item for item in client.requests[-1] if item.get("role") == "tool"]
+    assert [item["tool_call_id"] for item in tool_messages] == ["read-1", "read-2"]
+
+
+def test_native_edit_decision_batch_keeps_tool_results_contiguous(tmp_path):
+    class NativeClient:
+        supports_native_tools = True
+        supports_prompt_cache = False
+        model = "native-no-tool-choice"
+        last_completion_metadata = {}
+        connection_profile = type("Profile", (), {"supports_tool_choice": False})()
+
+        def __init__(self):
+            self.requests = []
+            self.responses = [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall("read-1", "read_file", {"path": "a.py", "start": 1, "end": 1}),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall("read-2", "read_file", {"path": "b.py", "start": 1, "end": 1}),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall("search", "search", {"path": ".", "pattern": "old"}),
+                        ToolCall("read-3", "read_file", {"path": "a.py", "start": 1, "end": 1}),
+                    )
+                ),
+                ModelResponse(text="Done."),
+            ]
+
+        def complete_with_tools(self, messages, tools, max_new_tokens, tool_choice=None):
+            self.requests.append(messages)
+            return self.responses.pop(0)
+
+    (tmp_path / "a.py").write_text("old = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("old = 2\n", encoding="utf-8")
+    client = NativeClient()
+    agent = MiniAgent(
+        client,
+        WorkspaceContext.build(tmp_path),
+        SessionStore(tmp_path / ".codecub" / "sessions"),
+        approval_policy="auto",
+        requires_workspace_change=True,
+    )
+
+    assert agent.ask("Repair the implementation") == "Done."
+    batch = next(
+        index
+        for index, item in enumerate(client.requests[-1])
+        if item.get("role") == "assistant" and item.get("tool_calls")
+        and [call["id"] for call in item["tool_calls"]] == ["search", "read-3"]
+    )
+    assert [item["role"] for item in client.requests[-1][batch + 1 : batch + 3]] == [
+        "tool",
+        "tool",
+    ]
+
+
+def test_native_edit_decision_transitions_from_evidence_to_patch_and_verification(
+    tmp_path,
+):
+    class NativeClient:
+        supports_native_tools = True
+        supports_prompt_cache = False
+        model = "native-test"
+        last_completion_metadata = {}
+
+        def __init__(self):
+            self.requests = []
+            self.responses = [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "read",
+                            "read_file",
+                            {"path": "target.py", "start": 1, "end": 5},
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "decision",
+                            "submit_edit_decision",
+                            {
+                                "decision": "edit",
+                                "tool": "patch_file",
+                                "arguments": {
+                                    "path": "target.py",
+                                    "old_text": "old = 1",
+                                    "new_text": "new = 1",
+                                },
+                            },
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "verify",
+                            "read_file",
+                            {"path": "target.py", "start": 1, "end": 5},
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "verify-shell",
+                            "run_shell",
+                            {"command": "python -c \"print('verified')\""},
+                        ),
+                    )
+                ),
+                ModelResponse(text="Done."),
+            ]
+
+        def complete_with_tools(
+            self, messages, tools, max_new_tokens, tool_choice="auto"
+        ):
+            self.requests.append((messages, tools, tool_choice))
+            return self.responses.pop(0)
+
+    (tmp_path / "target.py").write_text("old = 1\n", encoding="utf-8")
+    client = NativeClient()
+    agent = MiniAgent(
+        client,
+        WorkspaceContext.build(tmp_path),
+        SessionStore(tmp_path / ".codecub" / "sessions"),
+        approval_policy="auto",
+        requires_workspace_change=True,
+    )
+    assert agent.ask("Repair target.py") == "Done."
+    assert (tmp_path / "target.py").read_text(encoding="utf-8") == "new = 1\n"
+    assert client.requests[1][2] == "auto"
+    assert [item["function"]["name"] for item in client.requests[1][1]] == [
+        "submit_edit_decision"
+    ]
+    report = json.loads(
+        next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["planning"]["edit_decision_count"] == 1
+    assert report["planning"]["workspace_change_count"] == 1
+
+
+def test_native_edit_decision_keeps_real_tools_when_tool_choice_is_unsupported(
+    tmp_path,
+):
+    class NativeClient:
+        supports_native_tools = True
+        supports_prompt_cache = False
+        model = "native-no-tool-choice"
+        last_completion_metadata = {}
+        connection_profile = type("Profile", (), {"supports_tool_choice": False})()
+
+        def __init__(self):
+            self.requests = []
+            self.responses = [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "search",
+                            "search",
+                            {"pattern": "old", "path": "target.py"},
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "read",
+                            "read_file",
+                            {"path": "target.py", "start": 1, "end": 5},
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "read-second",
+                            "read_file",
+                            {"path": "target.py", "start": 1, "end": 1},
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "patch",
+                            "patch_file",
+                            {
+                                "path": "target.py",
+                                "old_text": "old = 1",
+                                "new_text": "new = 1",
+                            },
+                        ),
+                    )
+                ),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "verify",
+                            "run_shell",
+                            {"command": "python -c \"print('verified')\""},
+                        ),
+                    )
+                ),
+                ModelResponse(text="Done."),
+            ]
+
+        def complete_with_tools(
+            self, messages, tools, max_new_tokens, tool_choice="auto"
+        ):
+            self.requests.append((messages, tools, tool_choice))
+            return self.responses.pop(0)
+
+    (tmp_path / "target.py").write_text("old = 1\n", encoding="utf-8")
+    client = NativeClient()
+    agent = MiniAgent(
+        client,
+        WorkspaceContext.build(tmp_path),
+        SessionStore(tmp_path / ".codecub" / "sessions"),
+        approval_policy="auto",
+        requires_workspace_change=True,
+    )
+
+    assert agent.ask("Repair target.py") == "Done."
+    assert (tmp_path / "target.py").read_text(encoding="utf-8") == "new = 1\n"
+    decision_tools = {
+        item["function"]["name"] for item in client.requests[3][1]
+    }
+    assert {"patch_file", "read_file"} <= decision_tools
+    assert "submit_edit_decision" not in decision_tools
+    assert client.requests[3][2] is None
+    report = json.loads(
+        next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["planning"]["edit_decision_count"] == 1
+    assert report["planning"]["workspace_change_count"] == 1
+
+
 def test_semantic_repeat_helpers_distinguish_overlap_and_fresh_ranges():
     first = {"path": "A.py", "start": 1, "end": 200}
     overlapping = {"path": "./a.py", "start": 20, "end": 200}
     next_page = {"path": "a.py", "start": 201, "end": 400}
 
     assert task_policy.is_semantic_repeat("read_file", overlapping, "read_file", first)
-    assert not task_policy.is_semantic_repeat("read_file", next_page, "read_file", first)
-    assert task_policy.is_semantic_repeat(
-        "search", {"path": "./codecub", "pattern": "Feature   Flags"},
-        "search", {"path": "codecub", "pattern": "feature flags"},
+    assert not task_policy.is_semantic_repeat(
+        "read_file", next_page, "read_file", first
     )
-    assert task_policy.normalize_shell_command({"command": "  PYTHON   -m pytest  -q "}) == "python -m pytest -q"
+    assert task_policy.is_semantic_repeat(
+        "search",
+        {"path": "./codecub", "pattern": "Feature   Flags"},
+        "search",
+        {"path": "codecub", "pattern": "feature flags"},
+    )
+    assert (
+        task_policy.normalize_shell_command({"command": "  PYTHON   -m pytest  -q "})
+        == "python -m pytest -q"
+    )
 
 
 def test_exploration_warning_is_generic_and_patch_resets_counter(tmp_path):
@@ -94,10 +504,18 @@ def test_exploration_warning_is_generic_and_patch_resets_counter(tmp_path):
     assert agent.ask("Repair the file") == "Done."
     trace = [
         json.loads(line)
-        for line in (tmp_path / ".codecub" / "runs").glob("*/trace.jsonl").__next__().read_text(encoding="utf-8").splitlines()
+        for line in (tmp_path / ".codecub" / "runs")
+        .glob("*/trace.jsonl")
+        .__next__()
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
     warning = next(event for event in trace if event["event"] == "exploration_warning")
-    report = json.loads(next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(encoding="utf-8"))
+    report = json.loads(
+        next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(
+            encoding="utf-8"
+        )
+    )
 
     assert "runtime.py" not in json.dumps(warning)
     assert report["planning"]["first_action_step"] == 7
@@ -122,7 +540,11 @@ def test_modification_contract_tracks_change_epochs_and_shell_verification(tmp_p
 
     assert "requires an actual workspace modification" in agent.prefix
     assert agent.ask("Repair the workspace") == "Done."
-    report = json.loads(next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(encoding="utf-8"))
+    report = json.loads(
+        next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(
+            encoding="utf-8"
+        )
+    )
     planning = report["planning"]
     assert planning["workspace_change_count"] == 2
     assert planning["first_workspace_change_step"] == 1
@@ -148,8 +570,14 @@ def test_implementation_warning_requires_contract_and_two_shells(tmp_path):
 
     agent.ask("Repair the workspace")
     trace_path = next((tmp_path / ".codecub" / "runs").glob("*/trace.jsonl"))
-    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
-    report = json.loads(next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(encoding="utf-8"))
+    events = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    report = json.loads(
+        next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(
+            encoding="utf-8"
+        )
+    )
     assert sum(event["event"] == "implementation_warning" for event in events) == 1
     assert report["planning"]["verification_before_first_action"] == 2
     assert report["planning"]["implementation_warning_count"] == 1
@@ -162,7 +590,9 @@ def test_implementation_warning_requires_contract_and_two_shells(tmp_path):
     assert ordinary.maybe_emit_implementation_warning(None) is False
 
 
-def test_evidence_ledger_marks_visible_overlap_as_avoidable_and_softly_reminds(tmp_path):
+def test_evidence_ledger_marks_visible_overlap_as_avoidable_and_softly_reminds(
+    tmp_path,
+):
     (tmp_path / "evidence.py").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
     agent = build_agent(
         tmp_path,
@@ -175,16 +605,28 @@ def test_evidence_ledger_marks_visible_overlap_as_avoidable_and_softly_reminds(t
 
     assert agent.ask("Inspect evidence.py") == "Done."
     run_dir = next((tmp_path / ".codecub" / "runs").glob("*"))
-    trace = [json.loads(line) for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
-    reads = [event for event in trace if event["event"] == "tool_executed" and event["name"] == "read_file"]
+    trace = [
+        json.loads(line)
+        for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    reads = [
+        event
+        for event in trace
+        if event["event"] == "tool_executed" and event["name"] == "read_file"
+    ]
     report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
 
     assert reads[1]["read_evidence_classification"] == "avoidable_repeated_read"
     assert "substantially overlaps source code" in reads[1]["result"]
-    assert "evidence.py" not in reads[1]["result"].split("Runtime notice:", 1)[1].split("\n", 1)[0]
+    assert (
+        "evidence.py"
+        not in reads[1]["result"].split("Runtime notice:", 1)[1].split("\n", 1)[0]
+    )
     assert report["planning"]["avoidable_repeated_read_calls"] == 1
     assert report["planning"]["evidence_evicted_reread_calls"] == 0
-    prompts = [event["prompt_metadata"] for event in trace if event["event"] == "prompt_built"]
+    prompts = [
+        event["prompt_metadata"] for event in trace if event["event"] == "prompt_built"
+    ]
     assert prompts[1]["inspected_evidence"]["visible_entry_count"] == 1
 
 
@@ -192,14 +634,27 @@ def test_evidence_ledger_distinguishes_eviction_freshness_and_new_ranges(tmp_pat
     (tmp_path / "evidence.py").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
     agent = build_agent(tmp_path, [])
     agent.current_planning = agent.new_planning_state()
-    agent.record_read_evidence({"path": "evidence.py", "start": 1, "end": 3}, "# evidence.py\n1: alpha", 1)
+    agent.record_read_evidence(
+        {"path": "evidence.py", "start": 1, "end": 3}, "# evidence.py\n1: alpha", 1
+    )
     entry = agent.evidence_ledger_entries()[0]
-    agent.last_prompt_metadata = {"inspected_evidence": {"entries": [{**entry, "visible": False}]}}
+    agent.last_prompt_metadata = {
+        "inspected_evidence": {"entries": [{**entry, "visible": False}]}
+    }
 
-    assert agent.assess_read_evidence({"path": "evidence.py", "start": 1, "end": 3})[0] == "evidence_evicted_reread"
-    assert agent.assess_read_evidence({"path": "evidence.py", "start": 4, "end": 6})[0] == "new"
+    assert (
+        agent.assess_read_evidence({"path": "evidence.py", "start": 1, "end": 3})[0]
+        == "evidence_evicted_reread"
+    )
+    assert (
+        agent.assess_read_evidence({"path": "evidence.py", "start": 4, "end": 6})[0]
+        == "new"
+    )
     (tmp_path / "evidence.py").write_text("changed\n", encoding="utf-8")
-    assert agent.assess_read_evidence({"path": "evidence.py", "start": 1, "end": 3})[0] == "new"
+    assert (
+        agent.assess_read_evidence({"path": "evidence.py", "start": 1, "end": 3})[0]
+        == "new"
+    )
 
 
 def test_evidence_ledger_is_bounded_and_redacts_compact_hints(tmp_path):
@@ -233,7 +688,10 @@ def test_agent_runs_tool_then_final(tmp_path):
     answer = agent.ask("Inspect hello.txt")
 
     assert answer == "Read the file successfully."
-    assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
+    assert any(
+        item["role"] == "tool" and item["name"] == "read_file"
+        for item in agent.session["history"]
+    )
     assert "hello.txt" in agent.session["memory"]["files"]
 
 
@@ -284,7 +742,9 @@ def test_agent_only_stores_reusable_epistemic_notes(tmp_path):
     assert "deploy key is red" in prompt
 
 
-def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling(tmp_path):
+def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling(
+    tmp_path,
+):
     file_path = tmp_path / "sample.txt"
     file_path.write_text("alpha\n", encoding="utf-8")
     agent = build_agent(tmp_path, [])
@@ -293,7 +753,9 @@ def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling
     agent.memory.remember_file("./sample.txt")
     assert agent.memory.to_dict()["file_summaries"]["sample.txt"]["freshness"]
 
-    assert "file_summaries: available for sample.txt" in agent.memory.render_memory_text()
+    assert (
+        "file_summaries: available for sample.txt" in agent.memory.render_memory_text()
+    )
     assert "sample.txt: alpha" not in agent.memory.render_memory_text()
     assert "sample.txt: alpha" in agent.memory.retrieval_view("sample.txt")
     file_path.write_text("beta\n", encoding="utf-8")
@@ -338,23 +800,36 @@ def test_agent_retries_after_empty_model_output(tmp_path):
     answer = agent.ask("Do the task")
 
     assert answer == "Recovered after retry."
-    notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
+    notices = [
+        item["content"]
+        for item in agent.session["history"]
+        if item["role"] == "assistant"
+    ]
     assert any("empty response" in item for item in notices)
 
 
 def test_agent_retries_when_model_omits_required_protocol_tags(tmp_path):
     agent = build_agent(
         tmp_path,
-        ["unstructured planning text", "<final>Recovered after protocol retry.</final>"],
+        [
+            "unstructured planning text",
+            "<final>Recovered after protocol retry.</final>",
+        ],
     )
 
     assert agent.ask("Do the task") == "Recovered after protocol retry."
-    notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
+    notices = [
+        item["content"]
+        for item in agent.session["history"]
+        if item["role"] == "assistant"
+    ]
     assert any("missing required <tool> or <final> tags" in item for item in notices)
 
 
 def test_code_explanation_requires_a_source_read_before_final(tmp_path):
-    (tmp_path / "implementation.py").write_text("def remember():\n    return True\n", encoding="utf-8")
+    (tmp_path / "implementation.py").write_text(
+        "def remember():\n    return True\n", encoding="utf-8"
+    )
     agent = build_agent(
         tmp_path,
         [
@@ -364,13 +839,24 @@ def test_code_explanation_requires_a_source_read_before_final(tmp_path):
         ],
     )
 
-    assert agent.ask("这个代码上下文记忆怎么做的？") == "The implementation is in implementation.py."
-    assert any("no source-file evidence" in item["content"] for item in agent.session["history"] if item["role"] == "assistant")
+    assert (
+        agent.ask("这个代码上下文记忆怎么做的？")
+        == "The implementation is in implementation.py."
+    )
+    assert any(
+        "no source-file evidence" in item["content"]
+        for item in agent.session["history"]
+        if item["role"] == "assistant"
+    )
 
 
 def test_code_explanation_forces_final_after_research_budget(tmp_path):
-    (tmp_path / "implementation.py").write_text("def remember():\n    return True\n", encoding="utf-8")
-    reads = ['<tool>{"name":"read_file","args":{"path":"implementation.py","start":1,"end":2}}</tool>']
+    (tmp_path / "implementation.py").write_text(
+        "def remember():\n    return True\n", encoding="utf-8"
+    )
+    reads = [
+        '<tool>{"name":"read_file","args":{"path":"implementation.py","start":1,"end":2}}</tool>'
+    ]
     reads.extend(
         f'<tool>{{"name":"search","args":{{"path":".","pattern":"remember{index}"}}}}</tool>'
         for index in range(5)
@@ -379,7 +865,11 @@ def test_code_explanation_forces_final_after_research_budget(tmp_path):
 
     assert agent.ask("这个代码上下文记忆怎么做的？") == "Evidence-based answer."
     assert sum(item["role"] == "tool" for item in agent.session["history"]) == 6
-    assert any("research budget is exhausted" in item["content"] for item in agent.session["history"] if item["role"] == "assistant")
+    assert any(
+        "research budget is exhausted" in item["content"]
+        for item in agent.session["history"]
+        if item["role"] == "assistant"
+    )
 
 
 def test_agent_retries_after_malformed_tool_payload(tmp_path):
@@ -396,8 +886,15 @@ def test_agent_retries_after_malformed_tool_payload(tmp_path):
     answer = agent.ask("Inspect hello.txt")
 
     assert answer == "Recovered after malformed tool output."
-    assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
-    notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
+    assert any(
+        item["role"] == "tool" and item["name"] == "read_file"
+        for item in agent.session["history"]
+    )
+    notices = [
+        item["content"]
+        for item in agent.session["history"]
+        if item["role"] == "assistant"
+    ]
     assert any("valid <tool> call" in item for item in notices)
 
 
@@ -487,7 +984,9 @@ def test_patch_file_replaces_exact_match(tmp_path):
 def test_patch_contract_parser_and_rejections_preserve_multiline_arguments(tmp_path):
     agent = build_agent(tmp_path, [], allowed_tools=("read_file", "patch_file"))
     target = tmp_path / "sample.py"
-    target.write_text("alpha = '<&>'\nbeta = 1\nalpha = '<&>'\nbeta = 1\n", encoding="utf-8")
+    target.write_text(
+        "alpha = '<&>'\nbeta = 1\nalpha = '<&>'\nbeta = 1\n", encoding="utf-8"
+    )
     xml = (
         '<tool name="patch_file" path="sample.py"><old_text>alpha = \'<&>\'\nbeta = 1\n'
         "</old_text><new_text>alpha = 'fixed'\nbeta = 2\n</new_text></tool>"
@@ -495,17 +994,30 @@ def test_patch_contract_parser_and_rejections_preserve_multiline_arguments(tmp_p
     parsed = MiniAgent.parse(xml)
     assert parsed == (
         "tool",
-        {"name": "patch_file", "args": {"path": "sample.py", "old_text": "alpha = '<&>'\nbeta = 1\n", "new_text": "alpha = 'fixed'\nbeta = 2\n"}},
+        {
+            "name": "patch_file",
+            "args": {
+                "path": "sample.py",
+                "old_text": "alpha = '<&>'\nbeta = 1\n",
+                "new_text": "alpha = 'fixed'\nbeta = 2\n",
+            },
+        },
     )
-    assert "occur exactly once, found 2" in agent.run_tool("patch_file", parsed[1]["args"])
+    assert "occur exactly once, found 2" in agent.run_tool(
+        "patch_file", parsed[1]["args"]
+    )
     assert "occur exactly once, found 0" in agent.run_tool(
         "patch_file", {"path": "sample.py", "old_text": "missing", "new_text": "x"}
     )
-    assert "missing new_text" in agent.run_tool("patch_file", {"path": "sample.py", "old_text": "beta = 1"})
+    assert "missing new_text" in agent.run_tool(
+        "patch_file", {"path": "sample.py", "old_text": "beta = 1"}
+    )
     assert "path escapes workspace" in agent.run_tool(
         "patch_file", {"path": "../outside.py", "old_text": "x", "new_text": "y"}
     )
-    assert agent.run_tool("write_file", {"path": "blocked.py", "content": "x"}).startswith("error: unknown tool")
+    assert agent.run_tool(
+        "write_file", {"path": "blocked.py", "content": "x"}
+    ).startswith("error: unknown tool")
     json_call = (
         '<tool>{"name":"patch_file","args":{"path":"sample.py",'
         '"old_text":"alpha = \'<&>\'\\nbeta = 1\\n",'
@@ -528,30 +1040,55 @@ def test_patch_contract_prompt_and_read_only_feedback_are_consistent(tmp_path):
         "patch_file", {"path": "sample.txt", "old_text": "old", "new_text": "new"}
     )
     assert result == "error: approval denied for patch_file"
-    assert read_only._last_tool_result_metadata["security_event_type"] == "read_only_block"
+    assert (
+        read_only._last_tool_result_metadata["security_event_type"] == "read_only_block"
+    )
 
 
 def test_workspace_change_prompt_contract_is_explicit_and_scoped(tmp_path):
     modify_agent = build_agent(tmp_path, [], requires_workspace_change=True)
     inspect_agent = build_agent(tmp_path, [], requires_workspace_change=False)
 
-    assert "Analysis, repository inspection, and test execution alone do not complete it." in modify_agent.prefix
+    assert (
+        "Analysis, repository inspection, and test execution alone do not complete it."
+        in modify_agent.prefix
+    )
     assert "actual workspace modification" in modify_agent.prefix
     assert "actual workspace modification" not in inspect_agent.prefix
 
 
-def test_action_readiness_transitions_after_source_evidence_and_workspace_change(tmp_path):
+def test_action_readiness_transitions_after_source_evidence_and_workspace_change(
+    tmp_path,
+):
     agent = build_agent(tmp_path, [], requires_workspace_change=True)
     agent.current_planning = agent.new_planning_state()
 
-    agent.update_planning_state("search", {"path": ".", "pattern": "target"}, {"tool_status": "ok"}, 1)
+    agent.update_planning_state(
+        "search", {"path": ".", "pattern": "target"}, {"tool_status": "ok"}, 1
+    )
     assert agent.current_planning["action_readiness"] == "evidence_gathering"
-    agent.update_planning_state("read_file", {"path": "module.py", "start": 1, "end": 20}, {"tool_status": "ok"}, 2)
+    agent.update_planning_state(
+        "read_file",
+        {"path": "module.py", "start": 1, "end": 20},
+        {"tool_status": "ok"},
+        2,
+    )
     assert agent.current_planning["action_readiness"] == "action_expected"
     assert "inspected relevant source evidence" in agent.action_readiness_text()
-    agent.update_planning_state("run_shell", {"command": "python -m pytest"}, {"tool_status": "ok"}, 3)
+    agent.update_planning_state(
+        "run_shell", {"command": "python -m pytest"}, {"tool_status": "ok"}, 3
+    )
     assert agent.current_planning["action_readiness"] == "action_expected"
-    agent.update_planning_state("patch_file", {}, {"tool_status": "ok", "workspace_changed": True}, 4)
+    agent.update_planning_state(
+        "patch_file", {}, {"tool_status": "ok", "workspace_changed": True}, 4
+    )
+    assert agent.current_planning["action_readiness"] == "action_taken"
+    agent.update_planning_state(
+        "read_file",
+        {"path": "module.py", "start": 21, "end": 40},
+        {"tool_status": "ok"},
+        5,
+    )
     assert agent.current_planning["action_readiness"] == "action_taken"
     assert agent.current_planning["action_readiness_transitions"] == [
         {"state": "unknown", "tool_step": 0},
@@ -562,10 +1099,17 @@ def test_action_readiness_transitions_after_source_evidence_and_workspace_change
 
 
 def test_tool_patch_contract_is_visible_and_executes_in_a_fresh_workspace(tmp_path):
-    task = next(task for task in tasks_for_suite("development") if task.id == "tool_patch_contract")
+    task = next(
+        task
+        for task in tasks_for_suite("development")
+        if task.id == "tool_patch_contract"
+    )
     target = tmp_path / task.path
     target.parent.mkdir(parents=True)
-    target.write_text(f"def guarded_patch(count):\n{task.mutation}\n        return True\n", encoding="utf-8")
+    target.write_text(
+        f"def guarded_patch(count):\n{task.mutation}\n        return True\n",
+        encoding="utf-8",
+    )
     agent = build_agent(
         tmp_path,
         [
@@ -580,17 +1124,29 @@ def test_tool_patch_contract_is_visible_and_executes_in_a_fresh_workspace(tmp_pa
     assert task.requires_workspace_change is True
     assert "patch_file(path: str, old_text: str, new_text: str)" in agent.prefix
     assert "<old_text>return -1</old_text>" in agent.prefix
-    assert agent.run_tool("write_file", {"path": "blocked.py", "content": "x"}).startswith("error: unknown tool")
+    assert agent.run_tool(
+        "write_file", {"path": "blocked.py", "content": "x"}
+    ).startswith("error: unknown tool")
     assert agent.ask(task.prompt) == "Done."
 
-    report = json.loads(next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(encoding="utf-8"))
+    report = json.loads(
+        next((tmp_path / ".codecub" / "runs").glob("*/report.json")).read_text(
+            encoding="utf-8"
+        )
+    )
     assert target.read_text(encoding="utf-8").count(task.baseline) == 1
     assert report["planning"]["workspace_change_count"] == 1
     assert report["planning"]["first_action_step"] == 2
     assert not report["planning"]["evidence_ledger"]
     assert MiniAgent.parse(
         '<tool name="patch_file" path="sample.py"><old_text>old</old_text><new_text>new</new_text></tool>'
-    ) == ("tool", {"name": "patch_file", "args": {"path": "sample.py", "old_text": "old", "new_text": "new"}})
+    ) == (
+        "tool",
+        {
+            "name": "patch_file",
+            "args": {"path": "sample.py", "old_text": "old", "new_text": "new"},
+        },
+    )
 
 
 def test_invalid_risky_tool_does_not_prompt_for_approval(tmp_path):
@@ -620,7 +1176,15 @@ def test_list_files_hides_internal_agent_state(tmp_path):
 def test_repeated_identical_tool_call_is_rejected(tmp_path):
     agent = build_agent(tmp_path, [])
     for index in range(4):
-        agent.record({"role": "tool", "name": "list_files", "args": {}, "content": "(empty)", "created_at": str(index)})
+        agent.record(
+            {
+                "role": "tool",
+                "name": "list_files",
+                "args": {},
+                "content": "(empty)",
+                "created_at": str(index),
+            }
+        )
 
     result = agent.run_tool("list_files", {})
 
@@ -633,8 +1197,18 @@ def test_repeated_identical_tool_call_is_rejected(tmp_path):
 def test_repeated_identical_tool_call_does_not_count_previous_user_turn(tmp_path):
     agent = build_agent(tmp_path, [])
     for index in range(4):
-        agent.record({"role": "tool", "name": "list_files", "args": {}, "content": "(empty)", "created_at": str(index)})
-    agent.record({"role": "user", "content": "new request", "created_at": "after-previous-run"})
+        agent.record(
+            {
+                "role": "tool",
+                "name": "list_files",
+                "args": {},
+                "content": "(empty)",
+                "created_at": str(index),
+            }
+        )
+    agent.record(
+        {"role": "user", "content": "new request", "created_at": "after-previous-run"}
+    )
 
     result = agent.run_tool("list_files", {})
 
@@ -657,26 +1231,50 @@ def test_agent_stops_after_five_repeated_no_progress_tool_calls(tmp_path):
 
     answer = agent.ask("Inspect the repository")
 
-    assert answer == "Stopped after the same no-progress tool action repeated 5 times: list_files."
-    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
+    assert (
+        answer
+        == "Stopped after the same no-progress tool action repeated 5 times: list_files."
+    )
+    report = json.loads(
+        agent.run_store.report_path(agent.current_task_state).read_text(
+            encoding="utf-8"
+        )
+    )
     trace_events = [
         json.loads(line)
-        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+        for line in agent.run_store.trace_path(agent.current_task_state)
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
 
     assert report["status"] == "stopped"
     assert report["stop_reason"] == "repeated_no_progress"
     assert report["tool_steps"] == 5
     assert report["task_state"]["final_answer"] == answer
-    assert any(event["event"] == "repeated_no_progress" and event["limit"] == 5 for event in trace_events)
     assert any(
-        event["event"] == "tool_executed" and event.get("tool_error_code") == "repeated_identical_call"
+        event["event"] == "repeated_no_progress" and event["limit"] == 5
+        for event in trace_events
+    )
+    assert any(
+        event["event"] == "tool_executed"
+        and event.get("tool_error_code") == "repeated_identical_call"
         for event in trace_events
     )
 
 
 def test_welcome_screen_keeps_box_shape_for_long_paths(tmp_path):
-    deep = tmp_path / "very" / "long" / "path" / "for" / "the" / "mini" / "agent" / "welcome" / "screen"
+    deep = (
+        tmp_path
+        / "very"
+        / "long"
+        / "path"
+        / "for"
+        / "the"
+        / "mini"
+        / "agent"
+        / "welcome"
+        / "screen"
+    )
     deep.mkdir(parents=True)
     agent = build_agent(deep, [])
 
@@ -896,11 +1494,11 @@ def test_openai_compatible_client_extracts_text_from_event_stream_deltas():
 
         def read(self):
             return (
-                'event: response.output_text.delta\n'
+                "event: response.output_text.delta\n"
                 'data: {"type":"response.output_text.delta","delta":"<final>"}\n'
-                'event: response.output_text.delta\n'
+                "event: response.output_text.delta\n"
                 'data: {"type":"response.output_text.delta","delta":"OK"}\n'
-                'event: response.output_text.done\n'
+                "event: response.output_text.done\n"
                 'data: {"type":"response.output_text.done","text":"<final>OK</final>"}\n'
                 "data: [DONE]\n"
             ).encode("utf-8")
@@ -991,9 +1589,49 @@ def test_openai_compatible_client_falls_back_to_chat_completions_when_responses_
         "stream": False,
         "temperature": 0.2,
     }
-    assert client.last_completion_metadata["input_tokens"] == 10
-    assert client.last_completion_metadata["output_tokens"] == 3
-    assert client.last_completion_metadata["total_tokens"] == 13
+
+
+def test_deepseek_native_tools_omit_unsupported_tool_choice():
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"choices": [{"message": {"content": "done"}, "finish_reason": "stop"}]}
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        api_key="sk-test",
+        temperature=None,
+        timeout=30,
+        connection_profile=DEEPSEEK_OFFICIAL,
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete_with_tools(
+            [{"role": "user", "content": "inspect the workspace"}],
+            [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+            42,
+            tool_choice=None,
+        )
+
+    assert result.text == "done"
+    assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert "tool_choice" not in captured["body"]
+    assert captured["body"]["parallel_tool_calls"] is False
 
 
 def test_openai_compatible_stream_falls_back_to_chat_completions_when_responses_endpoint_is_missing():
@@ -1219,16 +1857,21 @@ def test_build_agent_uses_openai_provider_and_model_override(tmp_path):
         },
         clear=False,
     ):
-        with patch(
-            "codecub.cli.OllamaModelClient",
-            side_effect=AssertionError("ollama client should not be used"),
-        ), patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
+        with (
+            patch(
+                "codecub.cli.OllamaModelClient",
+                side_effect=AssertionError("ollama client should not be used"),
+            ),
+            patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai,
+        ):
             fake_client = mock_openai.return_value
             agent = mini_pkg.build_agent(args)
 
     mock_openai.assert_called_once()
     assert mock_openai.call_args.kwargs["model"] == "override-model"
-    assert mock_openai.call_args.kwargs["base_url"] == "https://www.right.codes/codex/v1"
+    assert (
+        mock_openai.call_args.kwargs["base_url"] == "https://www.right.codes/codex/v1"
+    )
     assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
     assert agent.model_client is fake_client
 
@@ -1240,14 +1883,18 @@ def test_build_arg_parser_leaves_provider_unset_for_env_default(tmp_path):
 
 
 def test_build_arg_parser_accepts_anthropic_provider(tmp_path):
-    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "anthropic"])
+    args = mini_pkg.build_arg_parser().parse_args(
+        ["--cwd", str(tmp_path), "--provider", "anthropic"]
+    )
 
     assert args.provider == "anthropic"
 
 
 def test_build_arg_parser_accepts_hosted_provider_presets(tmp_path):
     for provider in ("deepseek", "kimi", "minimax"):
-        args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", provider])
+        args = mini_pkg.build_arg_parser().parse_args(
+            ["--cwd", str(tmp_path), "--provider", provider]
+        )
 
         assert args.provider == provider
 
@@ -1276,7 +1923,9 @@ def test_main_dispatches_to_app_mode_without_welcome(monkeypatch, capsys):
 
     def fake_run_app_mode(args):
         called["app_mode"] = args.app_mode
-        print('{"type":"session_started","timestamp":"2026-06-11T00:00:00Z","session_id":"s","run_id":"","payload":{}}')
+        print(
+            '{"type":"session_started","timestamp":"2026-06-11T00:00:00Z","session_id":"s","run_id":"","payload":{}}'
+        )
         return 0
 
     monkeypatch.setattr(cli, "run_app_mode", fake_run_app_mode)
@@ -1310,8 +1959,12 @@ def test_main_interactive_cli_shows_activity_stream(monkeypatch, capsys):
 
         def ask(self, message):
             assert message == "change ui"
-            self.event_handler("run_status", {"phase": "building_context"}, self, object())
-            self.event_handler("run_status", {"phase": "model_streaming"}, self, object())
+            self.event_handler(
+                "run_status", {"phase": "building_context"}, self, object()
+            )
+            self.event_handler(
+                "run_status", {"phase": "model_streaming"}, self, object()
+            )
             self.event_handler("assistant_delta", {"text": "done"}, self, object())
             return "done"
 
@@ -1366,25 +2019,34 @@ def test_build_agent_uses_anthropic_provider_and_openai_key_fallback(tmp_path):
         },
         clear=True,
     ):
-        with patch(
-            "codecub.cli.OllamaModelClient",
-            side_effect=AssertionError("ollama client should not be used"),
-        ), patch(
-            "codecub.cli.OpenAICompatibleModelClient",
-            side_effect=AssertionError("openai client should not be used"),
-        ), patch("codecub.cli.AnthropicCompatibleModelClient") as mock_anthropic:
+        with (
+            patch(
+                "codecub.cli.OllamaModelClient",
+                side_effect=AssertionError("ollama client should not be used"),
+            ),
+            patch(
+                "codecub.cli.OpenAICompatibleModelClient",
+                side_effect=AssertionError("openai client should not be used"),
+            ),
+            patch("codecub.cli.AnthropicCompatibleModelClient") as mock_anthropic,
+        ):
             fake_client = mock_anthropic.return_value
             agent = mini_pkg.build_agent(args)
 
     mock_anthropic.assert_called_once()
     assert mock_anthropic.call_args.kwargs["model"] == "claude-sonnet-4-5-20250929"
-    assert mock_anthropic.call_args.kwargs["base_url"] == "https://www.right.codes/claude/v1"
+    assert (
+        mock_anthropic.call_args.kwargs["base_url"]
+        == "https://www.right.codes/claude/v1"
+    )
     assert mock_anthropic.call_args.kwargs["api_key"] == "sk-openai-fallback"
     assert agent.model_client is fake_client
 
 
 def test_build_agent_uses_anthropic_default_model_when_env_is_missing(tmp_path):
-    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "anthropic"])
+    args = mini_pkg.build_arg_parser().parse_args(
+        ["--cwd", str(tmp_path), "--provider", "anthropic"]
+    )
 
     with patch.dict(
         os.environ,
@@ -1410,16 +2072,21 @@ def test_build_agent_uses_openai_provider_by_default(tmp_path):
         },
         clear=False,
     ):
-        with patch(
-            "codecub.cli.OllamaModelClient",
-            side_effect=AssertionError("ollama client should not be used"),
-        ), patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
+        with (
+            patch(
+                "codecub.cli.OllamaModelClient",
+                side_effect=AssertionError("ollama client should not be used"),
+            ),
+            patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai,
+        ):
             fake_client = mock_openai.return_value
             agent = mini_pkg.build_agent(args)
 
     mock_openai.assert_called_once()
     assert mock_openai.call_args.kwargs["model"] == "qwen-flash"
-    assert mock_openai.call_args.kwargs["base_url"] == "https://www.right.codes/codex/v1"
+    assert (
+        mock_openai.call_args.kwargs["base_url"] == "https://www.right.codes/codex/v1"
+    )
     assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
     assert agent.model_client is fake_client
 
@@ -1532,7 +2199,9 @@ def test_deepseek_uses_current_official_default_model_when_unset(tmp_path):
         "DEEPSEEK_API_KEY=sk-deepseek-env\n",
         encoding="utf-8",
     )
-    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "deepseek"])
+    args = mini_pkg.build_arg_parser().parse_args(
+        ["--cwd", str(tmp_path), "--provider", "deepseek"]
+    )
 
     with patch.dict(os.environ, {}, clear=True):
         with patch("codecub.cli.OpenAICompatibleModelClient") as mock_openai:
@@ -1705,11 +2374,21 @@ def test_ask_traces_context_steps_before_model_request(tmp_path):
     assert agent.ask("Inspect the repository", run_id="run-context-steps") == "Done."
 
     trace_path = tmp_path / ".codecub" / "runs" / "run-context-steps" / "trace.jsonl"
-    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    trace_events = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
     event_names = [event["event"] for event in trace_events]
-    context_phases = [event["phase"] for event in trace_events if event["event"] == "context_step_started"]
+    context_phases = [
+        event["phase"]
+        for event in trace_events
+        if event["event"] == "context_step_started"
+    ]
 
-    assert context_phases[:3] == ["checking_workspace", "loading_memory", "building_prompt"]
+    assert context_phases[:3] == [
+        "checking_workspace",
+        "loading_memory",
+        "building_prompt",
+    ]
     assert event_names.index("context_step_started") < event_names.index("prompt_built")
     assert event_names.index("prompt_built") < event_names.index("model_requested")
 
@@ -1726,14 +2405,19 @@ def test_ask_rejects_external_run_id_that_escapes_run_directory(tmp_path):
 
 def test_ask_stops_and_persists_report_when_canceled_before_model_request(tmp_path):
     agent = build_agent(tmp_path, [])
-    agent.cancel_checker = lambda runtime, task_state: task_state.run_id == "run-cancel-1"
+    agent.cancel_checker = lambda runtime, task_state: (
+        task_state.run_id == "run-cancel-1"
+    )
 
     assert agent.ask("Cancel this run", run_id="run-cancel-1") == "Canceled by user."
 
     run_dir = tmp_path / ".codecub" / "runs" / "run-cancel-1"
     task_state = json.loads((run_dir / "task_state.json").read_text(encoding="utf-8"))
     report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
-    trace_events = [json.loads(line)["event"] for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    trace_events = [
+        json.loads(line)["event"]
+        for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
 
     assert task_state["status"] == "stopped"
     assert task_state["stop_reason"] == "user_canceled"
@@ -1787,7 +2471,10 @@ def test_model_error_trace_and_report_redact_secret_values(tmp_path):
             approval_policy="auto",
         )
 
-        assert agent.ask("Trigger secret model failure", run_id="run-model-error-secret") == "Model error: backend down: <redacted>"
+        assert (
+            agent.ask("Trigger secret model failure", run_id="run-model-error-secret")
+            == "Model error: backend down: <redacted>"
+        )
 
     run_dir = tmp_path / ".codecub" / "runs" / "run-model-error-secret"
     trace_text = (run_dir / "trace.jsonl").read_text(encoding="utf-8")
@@ -1829,7 +2516,9 @@ def test_trace_and_report_redact_secret_env_values(tmp_path):
     assert secret not in trace_text
     assert secret not in report_text
 
-    prompt_events = [event for event in trace_events if event["event"] == "prompt_built"]
+    prompt_events = [
+        event for event in trace_events if event["event"] == "prompt_built"
+    ]
     assert prompt_events
     assert prompt_events[0]["prompt_metadata"]["secret_env_count"] >= 1
     assert "OPENAI_API_KEY" in prompt_events[0]["prompt_metadata"]["secret_env_names"]
@@ -1842,9 +2531,20 @@ def test_trace_and_report_redact_secret_env_values(tmp_path):
 
 def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
     agent = build_agent(tmp_path, ["<final>Done.</final>"])
-    agent.memory.append_note("alpha episodic note " + ("A" * 120), tags=("recall",), created_at="2026-04-07T10:00:00+00:00")
-    agent.memory.append_note("beta episodic recall note " + ("B" * 120), created_at="2026-04-07T10:01:00+00:00")
-    agent.memory.append_note("gamma episodic note " + ("C" * 120), tags=("recall",), created_at="2026-04-07T10:02:00+00:00")
+    agent.memory.append_note(
+        "alpha episodic note " + ("A" * 120),
+        tags=("recall",),
+        created_at="2026-04-07T10:00:00+00:00",
+    )
+    agent.memory.append_note(
+        "beta episodic recall note " + ("B" * 120),
+        created_at="2026-04-07T10:01:00+00:00",
+    )
+    agent.memory.append_note(
+        "gamma episodic note " + ("C" * 120),
+        tags=("recall",),
+        created_at="2026-04-07T10:02:00+00:00",
+    )
 
     for index in range(4):
         agent.record(
@@ -1867,16 +2567,29 @@ def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
 
     trace_events = [
         json.loads(line)
-        for line in (agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines())
+        for line in (
+            agent.run_store.trace_path(agent.current_task_state)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
     ]
-    prompt_events = [event for event in trace_events if event["event"] == "prompt_built"]
+    prompt_events = [
+        event for event in trace_events if event["event"] == "prompt_built"
+    ]
     assert prompt_events
     metadata = prompt_events[0]["prompt_metadata"]
-    relevant_section = agent.model_client.prompts[0].split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
+    relevant_section = (
+        agent.model_client.prompts[0]
+        .split("Relevant memory:\n", 1)[1]
+        .split("\n\nTranscript:", 1)[0]
+    )
 
     assert metadata["relevant_memory"]["selected_count"] == 2
     assert len(metadata["relevant_memory"]["rendered_notes"]) == 2
-    assert len([line for line in relevant_section.splitlines() if line.startswith("- ")]) == 2
+    assert (
+        len([line for line in relevant_section.splitlines() if line.startswith("- ")])
+        == 2
+    )
     assert "alpha episodic" in relevant_section
     assert "gamma episodic" in relevant_section
     assert "beta episodic" not in relevant_section
@@ -1904,7 +2617,9 @@ def test_prompt_metadata_refreshes_prefix_when_workspace_changes(tmp_path):
     assert "demo changed" in agent.prefix
 
 
-def test_agent_creates_checkpoint_when_context_reduction_happens_and_artifacts_only_reference_it(tmp_path):
+def test_agent_creates_checkpoint_when_context_reduction_happens_and_artifacts_only_reference_it(
+    tmp_path,
+):
     agent = build_agent(tmp_path, ["<final>Done after checkpoint.</final>"])
     for index in range(10):
         agent.record(
@@ -1914,7 +2629,11 @@ def test_agent_creates_checkpoint_when_context_reduction_happens_and_artifacts_o
                 "created_at": f"2026-04-07T10:{index:02d}:00+00:00",
             }
         )
-    agent.memory.append_note("checkpoint note " + ("B" * 220), tags=("checkpoint",), created_at="2026-04-07T11:00:00+00:00")
+    agent.memory.append_note(
+        "checkpoint note " + ("B" * 220),
+        tags=("checkpoint",),
+        created_at="2026-04-07T11:00:00+00:00",
+    )
     agent.context_manager.total_budget = 900
     agent.context_manager.section_budgets = {
         "prefix": 120,
@@ -1934,11 +2653,21 @@ def test_agent_creates_checkpoint_when_context_reduction_happens_and_artifacts_o
     assert checkpoint["current_blocker"] == ""
     assert checkpoint["next_step"]
 
-    task_state = json.loads(agent.run_store.task_state_path(agent.current_task_state).read_text(encoding="utf-8"))
-    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
+    task_state = json.loads(
+        agent.run_store.task_state_path(agent.current_task_state).read_text(
+            encoding="utf-8"
+        )
+    )
+    report = json.loads(
+        agent.run_store.report_path(agent.current_task_state).read_text(
+            encoding="utf-8"
+        )
+    )
     trace_events = [
         json.loads(line)
-        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+        for line in agent.run_store.trace_path(agent.current_task_state)
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
 
     assert task_state["checkpoint_id"] == checkpoint["checkpoint_id"]
@@ -1946,7 +2675,9 @@ def test_agent_creates_checkpoint_when_context_reduction_happens_and_artifacts_o
     assert report["task_state"]["checkpoint_id"] == checkpoint["checkpoint_id"]
     assert "current_goal" not in task_state
     assert "current_goal" not in report
-    checkpoint_events = [event for event in trace_events if event["event"] == "checkpoint_created"]
+    checkpoint_events = [
+        event for event in trace_events if event["event"] == "checkpoint_created"
+    ]
     assert checkpoint_events
     assert checkpoint_events[-1]["checkpoint_id"] == checkpoint["checkpoint_id"]
     assert "current_goal" not in checkpoint_events[-1]
@@ -2015,7 +2746,9 @@ def test_resume_invalidates_stale_file_summaries_and_marks_partial_stale(tmp_pat
                 "key_files": [{"path": "runtime.py", "freshness": freshness}],
                 "freshness": {"runtime.py": freshness},
                 "summary": "runtime.py is important",
-                "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
+                "runtime_identity": {
+                    "workspace_fingerprint": agent.workspace.fingerprint()
+                },
             }
         },
     }
@@ -2037,7 +2770,9 @@ def test_resume_invalidates_stale_file_summaries_and_marks_partial_stale(tmp_pat
     assert resumed.last_prompt_metadata["stale_summary_invalidations"] == 1
 
 
-def test_run_shell_nonzero_with_workspace_change_is_recorded_as_partial_success(tmp_path):
+def test_run_shell_nonzero_with_workspace_change_is_recorded_as_partial_success(
+    tmp_path,
+):
     agent = build_agent(tmp_path, [])
 
     result = agent.run_tool(
@@ -2054,7 +2789,9 @@ def test_run_shell_nonzero_with_workspace_change_is_recorded_as_partial_success(
     assert agent._last_tool_result_metadata["workspace_changed"] is True
 
 
-def test_resume_marks_workspace_mismatch_when_checkpoint_runtime_identity_is_stale(tmp_path):
+def test_resume_marks_workspace_mismatch_when_checkpoint_runtime_identity_is_stale(
+    tmp_path,
+):
     agent = build_agent(tmp_path, ["<final>checkpoint ready.</final>"])
     agent.session["checkpoints"] = {
         "current_id": "ckpt_workspace",
@@ -2103,9 +2840,13 @@ def test_write_file_trace_records_minimum_tool_contract_fields(tmp_path):
 
     trace_events = [
         json.loads(line)
-        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+        for line in agent.run_store.trace_path(agent.current_task_state)
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
-    tool_event = [event for event in trace_events if event["event"] == "tool_executed"][-1]
+    tool_event = [event for event in trace_events if event["event"] == "tool_executed"][
+        -1
+    ]
 
     assert tool_event["name"] == "write_file"
     assert tool_event["risk_level"] == "high"
@@ -2134,7 +2875,9 @@ def test_resume_marks_schema_mismatch_when_checkpoint_version_is_incompatible(tm
                 "key_files": [],
                 "freshness": {},
                 "summary": "schema changed",
-                "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
+                "runtime_identity": {
+                    "workspace_fingerprint": agent.workspace.fingerprint()
+                },
             }
         },
     }
@@ -2192,7 +2935,9 @@ def test_freshness_mismatch_creates_checkpoint_before_model_completion(tmp_path)
                 "key_files": [{"path": "runtime.py", "freshness": freshness}],
                 "freshness": {"runtime.py": freshness},
                 "summary": "runtime.py changed",
-                "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
+                "runtime_identity": {
+                    "workspace_fingerprint": agent.workspace.fingerprint()
+                },
             }
         },
     }
@@ -2203,9 +2948,13 @@ def test_freshness_mismatch_creates_checkpoint_before_model_completion(tmp_path)
 
     trace_events = [
         json.loads(line)
-        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+        for line in agent.run_store.trace_path(agent.current_task_state)
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
-    checkpoint_events = [event for event in trace_events if event["event"] == "checkpoint_created"]
+    checkpoint_events = [
+        event for event in trace_events if event["event"] == "checkpoint_created"
+    ]
 
     assert checkpoint_events
     assert checkpoint_events[0]["trigger"] == "freshness_mismatch"
@@ -2237,7 +2986,9 @@ def test_runtime_identity_persists_key_execution_metadata(tmp_path):
     assert runtime_identity["shell_env_allowlist"] == list(agent.shell_env_allowlist)
 
 
-def test_resume_records_runtime_identity_mismatch_fields_in_metadata_and_trace(tmp_path):
+def test_resume_records_runtime_identity_mismatch_fields_in_metadata_and_trace(
+    tmp_path,
+):
     agent = build_agent(tmp_path, ["<final>checkpoint ready.</final>"])
     agent.session["checkpoints"] = {
         "current_id": "ckpt_identity",
@@ -2298,9 +3049,13 @@ def test_resume_records_runtime_identity_mismatch_fields_in_metadata_and_trace(t
 
     trace_events = [
         json.loads(line)
-        for line in resumed.run_store.trace_path(resumed.current_task_state).read_text(encoding="utf-8").splitlines()
+        for line in resumed.run_store.trace_path(resumed.current_task_state)
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
-    mismatch_events = [event for event in trace_events if event["event"] == "runtime_identity_mismatch"]
+    mismatch_events = [
+        event for event in trace_events if event["event"] == "runtime_identity_mismatch"
+    ]
     assert mismatch_events
     assert mismatch_events[0]["fields"] == [
         "approval_policy",
@@ -2330,7 +3085,10 @@ def test_partial_success_creates_process_note_for_exploration_history(tmp_path):
     ]
 
     assert process_notes
-    assert process_notes[-1]["text"] == "run_shell partial_success on README.md; inspect diff before retry"
+    assert (
+        process_notes[-1]["text"]
+        == "run_shell partial_success on README.md; inspect diff before retry"
+    )
     assert "partial_success" in process_notes[-1]["tags"]
     assert "README.md" in process_notes[-1]["tags"]
 
@@ -2353,16 +3111,27 @@ def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
     assert "Project convention:" in answer
 
     index_path = tmp_path / ".codecub" / "memory" / "MEMORY.md"
-    conventions_path = tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    conventions_path = (
+        tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    )
     decisions_path = tmp_path / ".codecub" / "memory" / "topics" / "key-decisions.md"
-    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
+    report = json.loads(
+        agent.run_store.report_path(agent.current_task_state).read_text(
+            encoding="utf-8"
+        )
+    )
 
     assert index_path.exists()
     assert conventions_path.exists()
     assert decisions_path.exists()
     assert "project-conventions" in index_path.read_text(encoding="utf-8")
-    assert "Use constrained tools instead of guessing." in conventions_path.read_text(encoding="utf-8")
-    assert "Keep durable memory topic-based and lightweight." in decisions_path.read_text(encoding="utf-8")
+    assert "Use constrained tools instead of guessing." in conventions_path.read_text(
+        encoding="utf-8"
+    )
+    assert (
+        "Keep durable memory topic-based and lightweight."
+        in decisions_path.read_text(encoding="utf-8")
+    )
     assert report["durable_promotions"] == [
         "project-conventions: Use constrained tools instead of guessing.",
         "project-conventions: Preserve local agent state under .codecub/.",
@@ -2383,11 +3152,17 @@ def test_explicit_memory_promotion_supports_chinese_intent_and_labels(tmp_path):
 
     assert "项目约定：" in answer
 
-    conventions_path = tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    conventions_path = (
+        tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    )
     decisions_path = tmp_path / ".codecub" / "memory" / "topics" / "key-decisions.md"
 
-    assert "优先使用受约束工具，不要靠猜。" in conventions_path.read_text(encoding="utf-8")
-    assert "持久记忆保持轻量、按 topic 管理。" in decisions_path.read_text(encoding="utf-8")
+    assert "优先使用受约束工具，不要靠猜。" in conventions_path.read_text(
+        encoding="utf-8"
+    )
+    assert "持久记忆保持轻量、按 topic 管理。" in decisions_path.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_explicit_memory_promotion_rejects_secret_shaped_and_transient_lines(tmp_path):
@@ -2403,9 +3178,17 @@ def test_explicit_memory_promotion_rejects_secret_shaped_and_transient_lines(tmp
 
     agent.ask("Capture these stable facts into durable memory.")
 
-    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
-    conventions_path = tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
-    dependency_path = tmp_path / ".codecub" / "memory" / "topics" / "dependency-facts.md"
+    report = json.loads(
+        agent.run_store.report_path(agent.current_task_state).read_text(
+            encoding="utf-8"
+        )
+    )
+    conventions_path = (
+        tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    )
+    dependency_path = (
+        tmp_path / ".codecub" / "memory" / "topics" / "dependency-facts.md"
+    )
 
     assert report["durable_promotions"] == [
         "project-conventions: Use constrained tools instead of guessing.",
@@ -2415,7 +3198,9 @@ def test_explicit_memory_promotion_rejects_secret_shaped_and_transient_lines(tmp
         "key-decisions:transient_task_state",
         "dependency-facts:noisy_output",
     ]
-    assert "Use constrained tools instead of guessing." in conventions_path.read_text(encoding="utf-8")
+    assert "Use constrained tools instead of guessing." in conventions_path.read_text(
+        encoding="utf-8"
+    )
     assert not dependency_path.exists()
 
 
@@ -2428,11 +3213,23 @@ def test_explicit_memory_promotion_supersedes_matching_durable_fact(tmp_path):
         ],
     )
 
-    assert agent.ask("Capture this stable dependency fact into durable memory.") == "Dependency: Python runtime is 3.11."
-    assert agent.ask("Save the updated dependency fact into durable memory.") == "Dependency: Python runtime is 3.12."
+    assert (
+        agent.ask("Capture this stable dependency fact into durable memory.")
+        == "Dependency: Python runtime is 3.11."
+    )
+    assert (
+        agent.ask("Save the updated dependency fact into durable memory.")
+        == "Dependency: Python runtime is 3.12."
+    )
 
-    dependency_path = tmp_path / ".codecub" / "memory" / "topics" / "dependency-facts.md"
-    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
+    dependency_path = (
+        tmp_path / ".codecub" / "memory" / "topics" / "dependency-facts.md"
+    )
+    report = json.loads(
+        agent.run_store.report_path(agent.current_task_state).read_text(
+            encoding="utf-8"
+        )
+    )
     text = dependency_path.read_text(encoding="utf-8")
 
     assert "Python runtime is 3.12." in text
@@ -2454,7 +3251,9 @@ def test_explicit_memory_promotion_dedupes_duplicate_durable_note(tmp_path):
     agent.ask("Capture the stable fact into durable memory.")
     agent.ask("Capture the stable fact into durable memory again.")
 
-    conventions_path = tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    conventions_path = (
+        tmp_path / ".codecub" / "memory" / "topics" / "project-conventions.md"
+    )
     text = conventions_path.read_text(encoding="utf-8")
 
     assert text.count("Use constrained tools instead of guessing.") == 1
@@ -2486,7 +3285,10 @@ def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
     assert agent.last_prompt_metadata["cached_tokens"] == 512
     assert agent.last_prompt_metadata["cache_hit"] is True
     assert agent.last_prompt_metadata["prefix_hash"]
-    assert agent.last_prompt_metadata["prompt_cache_key"] == agent.last_prompt_metadata["prefix_hash"]
+    assert (
+        agent.last_prompt_metadata["prompt_cache_key"]
+        == agent.last_prompt_metadata["prefix_hash"]
+    )
 
 
 def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
@@ -2494,14 +3296,58 @@ def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
     old_text = "OLD-" + ("A" * 320)
     recent_text = "RECENT-" + ("B" * 320)
 
-    agent.record({"role": "user", "content": old_text, "created_at": "2026-04-07T09:00:00+00:00"})
-    agent.record({"role": "assistant", "content": old_text, "created_at": "2026-04-07T09:01:00+00:00"})
-    agent.record({"role": "user", "content": recent_text, "created_at": "2026-04-07T09:02:00+00:00"})
-    agent.record({"role": "assistant", "content": recent_text, "created_at": "2026-04-07T09:03:00+00:00"})
-    agent.record({"role": "user", "content": recent_text, "created_at": "2026-04-07T09:04:00+00:00"})
-    agent.record({"role": "assistant", "content": recent_text, "created_at": "2026-04-07T09:05:00+00:00"})
-    agent.record({"role": "user", "content": recent_text, "created_at": "2026-04-07T09:06:00+00:00"})
-    agent.record({"role": "assistant", "content": recent_text, "created_at": "2026-04-07T09:07:00+00:00"})
+    agent.record(
+        {"role": "user", "content": old_text, "created_at": "2026-04-07T09:00:00+00:00"}
+    )
+    agent.record(
+        {
+            "role": "assistant",
+            "content": old_text,
+            "created_at": "2026-04-07T09:01:00+00:00",
+        }
+    )
+    agent.record(
+        {
+            "role": "user",
+            "content": recent_text,
+            "created_at": "2026-04-07T09:02:00+00:00",
+        }
+    )
+    agent.record(
+        {
+            "role": "assistant",
+            "content": recent_text,
+            "created_at": "2026-04-07T09:03:00+00:00",
+        }
+    )
+    agent.record(
+        {
+            "role": "user",
+            "content": recent_text,
+            "created_at": "2026-04-07T09:04:00+00:00",
+        }
+    )
+    agent.record(
+        {
+            "role": "assistant",
+            "content": recent_text,
+            "created_at": "2026-04-07T09:05:00+00:00",
+        }
+    )
+    agent.record(
+        {
+            "role": "user",
+            "content": recent_text,
+            "created_at": "2026-04-07T09:06:00+00:00",
+        }
+    )
+    agent.record(
+        {
+            "role": "assistant",
+            "content": recent_text,
+            "created_at": "2026-04-07T09:07:00+00:00",
+        }
+    )
 
     assert agent.ask("Check the transcript") == "Done."
 

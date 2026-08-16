@@ -10,9 +10,50 @@ import time
 from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 
 from .connections import resolve_connection_profile
-from .telemetry.parsers import parse_anthropic_usage, parse_openai_compatible_usage, parse_rightcode_codex_usage
+from .telemetry.parsers import (
+    parse_anthropic_usage,
+    parse_openai_compatible_usage,
+    parse_rightcode_codex_usage,
+)
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict
+
+
+@dataclass(frozen=True)
+class ModelResponse:
+    text: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+    finish_reason: str = ""
+    usage: dict = field(default_factory=dict)
+    raw_metadata: dict = field(default_factory=dict)
+
+
+def _extract_chat_tool_calls(data):
+    choices = data.get("choices") or []
+    message = choices[0].get("message", {}) if choices else {}
+    calls = []
+    for item in message.get("tool_calls") or []:
+        function = item.get("function") or {}
+        try:
+            arguments = json.loads(function.get("arguments") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid native tool arguments JSON") from exc
+        if not isinstance(arguments, dict):
+            raise ValueError("native tool arguments must be an object")
+        calls.append(
+            ToolCall(
+                str(item.get("id") or ""), str(function.get("name") or ""), arguments
+            )
+        )
+    return tuple(calls), str(choices[0].get("finish_reason") or "") if choices else ""
 
 
 class FakeModelClient:
@@ -78,7 +119,9 @@ class OllamaModelClient:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {body}") from exc
+            raise RuntimeError(
+                f"Ollama request failed with HTTP {exc.code}: {body}"
+            ) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(
                 "Could not reach Ollama.\n"
@@ -133,7 +176,7 @@ def _extract_openai_text_from_sse(body_text):
         line = line.strip()
         if not line.startswith("data:"):
             continue
-        payload = line[len("data:"):].strip()
+        payload = line[len("data:") :].strip()
         if not payload or payload == "[DONE]":
             continue
         try:
@@ -180,7 +223,7 @@ def _decode_sse_event(line):
     line = str(line).strip()
     if not line.startswith("data:"):
         return None
-    payload = line[len("data:"):].strip()
+    payload = line[len("data:") :].strip()
     if not payload or payload == "[DONE]":
         return None
     try:
@@ -228,7 +271,7 @@ def _extract_openai_response_from_sse(body_text):
         line = line.strip()
         if not line.startswith("data:"):
             continue
-        payload = line[len("data:"):].strip()
+        payload = line[len("data:") :].strip()
         if not payload or payload == "[DONE]":
             continue
         try:
@@ -268,7 +311,9 @@ def _extract_usage_cache_details(data):
     usage = data.get("usage") or {}
     input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
-    input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    input_details = (
+        usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    )
     cached_tokens = int(input_details.get("cached_tokens") or 0)
     return {
         "input_tokens": input_tokens,
@@ -284,39 +329,66 @@ _OPENAI_ENDPOINT_FALLBACK_STATUS_CODES = {404, 405, 501}
 
 class _OpenAIEndpointUnsupported(RuntimeError):
     def __init__(self, code, body):
-        super().__init__(f"OpenAI-compatible endpoint unsupported with HTTP {code}: {body}")
+        super().__init__(
+            f"OpenAI-compatible endpoint unsupported with HTTP {code}: {body}"
+        )
         self.code = code
         self.body = body
 
 
 class OpenAICompatibleModelClient:
-    def __init__(self, model, base_url, api_key, temperature, timeout, connection_profile=None):
+    def __init__(
+        self, model, base_url, api_key, temperature, timeout, connection_profile=None
+    ):
         self.model = model
         self.base_url = _normalize_versioned_base_url(base_url)
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
-        self.connection_profile = connection_profile or resolve_connection_profile(self.base_url, "openai-responses")
+        self.connection_profile = connection_profile or resolve_connection_profile(
+            self.base_url, "openai-responses"
+        )
         # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
-        self.supports_prompt_cache = getattr(self.connection_profile, "prompt_cache_request_mode", "unavailable") == "provider_managed"
+        self.supports_prompt_cache = (
+            getattr(self.connection_profile, "prompt_cache_request_mode", "unavailable")
+            == "provider_managed"
+        )
         self.cache_capability = {
-            "mode": "operator_managed" if getattr(self.connection_profile, "id", "") == "rightcode-codex" else "provider_managed",
+            "mode": "operator_managed"
+            if getattr(self.connection_profile, "id", "") == "rightcode-codex"
+            else "provider_managed",
             "protocol": "openai-responses",
-            "endpoint_verification_status": getattr(self.connection_profile, "endpoint_verification_status", "unverified"),
-            "usage_schema_verification_status": getattr(self.connection_profile, "usage_schema_verification_status", "unverified"),
+            "endpoint_verification_status": getattr(
+                self.connection_profile, "endpoint_verification_status", "unverified"
+            ),
+            "usage_schema_verification_status": getattr(
+                self.connection_profile,
+                "usage_schema_verification_status",
+                "unverified",
+            ),
         }
         self.last_completion_metadata = {}
 
-    def _completion_metadata(self, data, prompt_cache_key=None, prompt_cache_retention=None, endpoint_kind="responses"):
+    def _completion_metadata(
+        self,
+        data,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+        endpoint_kind="responses",
+    ):
         metadata = {
-            "prompt_cache_supported": self.supports_prompt_cache and endpoint_kind == "responses",
+            "prompt_cache_supported": self.supports_prompt_cache
+            and endpoint_kind == "responses",
             "prompt_cache_key": prompt_cache_key,
             "prompt_cache_retention": prompt_cache_retention,
             "endpoint_kind": endpoint_kind,
             **_extract_usage_cache_details(data),
         }
-        if self.connection_profile is not None and self.connection_profile.id == "rightcode-codex":
+        if (
+            self.connection_profile is not None
+            and self.connection_profile.id == "rightcode-codex"
+        ):
             metadata["connection_profile"] = self.connection_profile.to_dict()
             metadata["usage_record"] = parse_rightcode_codex_usage(
                 data,
@@ -327,7 +399,10 @@ class OpenAICompatibleModelClient:
         elif self.connection_profile is not None:
             metadata["connection_profile"] = self.connection_profile.to_dict()
             metadata["usage_record"] = parse_openai_compatible_usage(
-                data, self.connection_profile, model=self.model, endpoint_kind=endpoint_kind
+                data,
+                self.connection_profile,
+                model=self.model,
+                endpoint_kind=endpoint_kind,
             )
         return metadata
 
@@ -337,7 +412,14 @@ class OpenAICompatibleModelClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _responses_payload(self, prompt, max_new_tokens, stream, prompt_cache_key=None, prompt_cache_retention=None):
+    def _responses_payload(
+        self,
+        prompt,
+        max_new_tokens,
+        stream,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+    ):
         payload = {
             "model": self.model,
             "input": [
@@ -373,6 +455,49 @@ class OpenAICompatibleModelClient:
             payload["temperature"] = self.temperature
         return payload
 
+    @property
+    def supports_native_tools(self):
+        return bool(getattr(self.connection_profile, "supports_native_tools", False))
+
+    def complete_with_tools(self, messages, tools, max_new_tokens, tool_choice=None):
+        """Execute a real OpenAI-chat native tool request (never XML emulation)."""
+        if not self.supports_native_tools:
+            raise RuntimeError("native tools unsupported by connection profile")
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "max_tokens": max_new_tokens,
+            "stream": False,
+        }
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        # The runtime currently executes one validated action per turn.  Ask
+        # compatible providers not to batch calls rather than silently dropping
+        # later calls or bypassing the normal validation/approval path.
+        if not bool(
+            getattr(self.connection_profile, "supports_parallel_tool_calls", False)
+        ):
+            payload["parallel_tool_calls"] = False
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        with self._open_request(
+            self._request("/chat/completions", payload)
+        ) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if data.get("error"):
+            raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
+        calls, finish_reason = _extract_chat_tool_calls(data)
+        metadata = self._completion_metadata(data, endpoint_kind="chat_completions")
+        self.last_completion_metadata = metadata
+        return ModelResponse(
+            _extract_openai_text(data),
+            calls,
+            finish_reason,
+            _extract_usage_cache_details(data),
+            metadata,
+        )
+
     def _request(self, path, payload):
         return urllib.request.Request(
             self.base_url + path,
@@ -388,12 +513,17 @@ class OpenAICompatibleModelClient:
                 return urllib.request.urlopen(request, timeout=self.timeout)
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                if allow_endpoint_fallback and exc.code in _OPENAI_ENDPOINT_FALLBACK_STATUS_CODES:
+                if (
+                    allow_endpoint_fallback
+                    and exc.code in _OPENAI_ENDPOINT_FALLBACK_STATUS_CODES
+                ):
                     raise _OpenAIEndpointUnsupported(exc.code, body) from exc
                 if exc.code >= 500 and attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
-                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
+                raise RuntimeError(
+                    f"OpenAI-compatible request failed with HTTP {exc.code}: {body}"
+                ) from exc
             except (urllib.error.URLError, RemoteDisconnected) as exc:
                 if attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
@@ -404,8 +534,16 @@ class OpenAICompatibleModelClient:
                     f"Model: {self.model}"
                 ) from exc
 
-    def _complete_from_body(self, body_text, content_type, prompt_cache_key=None, prompt_cache_retention=None):
-        if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
+    def _complete_from_body(
+        self,
+        body_text,
+        content_type,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+    ):
+        if content_type.startswith(
+            "text/event-stream"
+        ) or body_text.lstrip().startswith("data:"):
             text, response_data = _extract_openai_response_from_sse(body_text)
             if isinstance(response_data, dict) and response_data:
                 self.last_completion_metadata = self._completion_metadata(
@@ -415,7 +553,9 @@ class OpenAICompatibleModelClient:
                 )
             if text:
                 return text
-            raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
+            raise RuntimeError(
+                "OpenAI-compatible error: could not extract text from event stream response"
+            )
 
         try:
             data = json.loads(body_text)
@@ -432,7 +572,9 @@ class OpenAICompatibleModelClient:
         )
         return _extract_openai_text(data)
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+    def complete(
+        self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None
+    ):
         """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
 
         为什么存在：
@@ -461,21 +603,29 @@ class OpenAICompatibleModelClient:
         # runtime 传入的是“稳定前缀”的签名，而不是整段 prompt 的签名。
         # 这样缓存复用针对的是稳定段，不会因为动态 history 每轮变化而失效。
         try:
-            with self._open_request(self._request("/responses", payload), allow_endpoint_fallback=True) as response:
+            with self._open_request(
+                self._request("/responses", payload), allow_endpoint_fallback=True
+            ) as response:
                 body_text = response.read().decode("utf-8")
                 headers = getattr(response, "headers", {}) or {}
                 content_type = headers.get("Content-Type", "")
         except _OpenAIEndpointUnsupported:
             endpoint_kind = "chat_completions"
-            payload = self._chat_completions_payload(prompt, max_new_tokens, stream=False)
-            with self._open_request(self._request("/chat/completions", payload)) as response:
+            payload = self._chat_completions_payload(
+                prompt, max_new_tokens, stream=False
+            )
+            with self._open_request(
+                self._request("/chat/completions", payload)
+            ) as response:
                 body_text = response.read().decode("utf-8")
                 headers = getattr(response, "headers", {}) or {}
                 content_type = headers.get("Content-Type", "")
 
         # 有些兼容后端返回普通 JSON，有些返回 SSE。
         # 这里两种都接住，并尽量统一抽取文本和 usage/cache 元数据。
-        if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
+        if content_type.startswith(
+            "text/event-stream"
+        ) or body_text.lstrip().startswith("data:"):
             text, response_data = _extract_openai_response_from_sse(body_text)
             if isinstance(response_data, dict) and response_data:
                 # 这些元数据会一路传回 runtime，进入 trace 和 report，
@@ -488,7 +638,9 @@ class OpenAICompatibleModelClient:
                 )
             if text:
                 return text
-            raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
+            raise RuntimeError(
+                "OpenAI-compatible error: could not extract text from event stream response"
+            )
 
         try:
             data = json.loads(body_text)
@@ -506,7 +658,14 @@ class OpenAICompatibleModelClient:
         )
         return _extract_openai_text(data)
 
-    def stream_complete(self, prompt, max_new_tokens, on_delta, prompt_cache_key=None, prompt_cache_retention=None):
+    def stream_complete(
+        self,
+        prompt,
+        max_new_tokens,
+        on_delta,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+    ):
         self.last_completion_metadata = {}
         payload = {
             "model": self.model,
@@ -537,9 +696,16 @@ class OpenAICompatibleModelClient:
         endpoint_kind = "responses"
 
         def read_stream(path, payload, allow_endpoint_fallback=False):
-            with self._open_request(self._request(path, payload), allow_endpoint_fallback=allow_endpoint_fallback) as response:
+            with self._open_request(
+                self._request(path, payload),
+                allow_endpoint_fallback=allow_endpoint_fallback,
+            ) as response:
                 for raw_line in response:
-                    line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+                    line = (
+                        raw_line.decode("utf-8", errors="replace")
+                        if isinstance(raw_line, bytes)
+                        else str(raw_line)
+                    )
                     body_lines.append(line)
                     parsed_response = _extract_response_object_from_sse_line(line)
                     if parsed_response:
@@ -555,11 +721,15 @@ class OpenAICompatibleModelClient:
             body_lines.clear()
             text_parts.clear()
             response_data.clear()
-            payload = self._chat_completions_payload(prompt, max_new_tokens, stream=True)
+            payload = self._chat_completions_payload(
+                prompt, max_new_tokens, stream=True
+            )
             read_stream("/chat/completions", payload)
 
         if not text_parts:
-            text, response_from_sse = _extract_openai_response_from_sse("".join(body_lines))
+            text, response_from_sse = _extract_openai_response_from_sse(
+                "".join(body_lines)
+            )
             if response_from_sse:
                 response_data = response_from_sse
             if text:
@@ -577,7 +747,9 @@ class OpenAICompatibleModelClient:
         text = "".join(text_parts)
         if text:
             return text
-        raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
+        raise RuntimeError(
+            "OpenAI-compatible error: could not extract text from event stream response"
+        )
 
 
 def _extract_anthropic_text(data):
@@ -590,35 +762,67 @@ def _extract_anthropic_text(data):
 
 
 class AnthropicCompatibleModelClient:
-    def __init__(self, model, base_url, api_key, temperature, timeout, connection_profile=None):
+    def __init__(
+        self, model, base_url, api_key, temperature, timeout, connection_profile=None
+    ):
         self.model = model
         self.base_url = _normalize_versioned_base_url(base_url)
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
-        self.connection_profile = connection_profile or resolve_connection_profile(self.base_url, "anthropic-messages")
-        self.supports_prompt_cache = getattr(self.connection_profile, "prompt_cache_request_mode", "unavailable") == "explicit_ephemeral"
+        self.connection_profile = connection_profile or resolve_connection_profile(
+            self.base_url, "anthropic-messages"
+        )
+        self.supports_prompt_cache = (
+            getattr(self.connection_profile, "prompt_cache_request_mode", "unavailable")
+            == "explicit_ephemeral"
+        )
         self.supports_structured_prompt_cache = self.supports_prompt_cache
         self.cache_capability = {
-            "mode": "explicit_ephemeral" if getattr(self.connection_profile, "id", "") == "rightcode-claude" else "unavailable",
+            "mode": "explicit_ephemeral"
+            if getattr(self.connection_profile, "id", "") == "rightcode-claude"
+            else "unavailable",
             "protocol": "anthropic-messages",
             "enabled": self.supports_prompt_cache,
-            "reason": "stable prefix is sent as an ephemeral cache block" if self.supports_prompt_cache else "backend capability unavailable",
-            "endpoint_verification_status": getattr(self.connection_profile, "endpoint_verification_status", "unverified"),
-            "usage_schema_verification_status": getattr(self.connection_profile, "usage_schema_verification_status", "unverified"),
+            "reason": "stable prefix is sent as an ephemeral cache block"
+            if self.supports_prompt_cache
+            else "backend capability unavailable",
+            "endpoint_verification_status": getattr(
+                self.connection_profile, "endpoint_verification_status", "unverified"
+            ),
+            "usage_schema_verification_status": getattr(
+                self.connection_profile,
+                "usage_schema_verification_status",
+                "unverified",
+            ),
         }
         self.last_completion_metadata = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, stable_prefix=None):
+    def complete(
+        self,
+        prompt,
+        max_new_tokens,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+        stable_prefix=None,
+    ):
         # 为了保持统一接口，runtime 仍然会传缓存参数进来；
         # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
         del prompt_cache_key, prompt_cache_retention
         self.last_completion_metadata = {}
         content = [{"type": "text", "text": prompt}]
-        if self.supports_prompt_cache and stable_prefix and prompt.startswith(stable_prefix):
+        if (
+            self.supports_prompt_cache
+            and stable_prefix
+            and prompt.startswith(stable_prefix)
+        ):
             content = [
-                {"type": "text", "text": stable_prefix, "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": prompt[len(stable_prefix):]},
+                {
+                    "type": "text",
+                    "text": stable_prefix,
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": prompt[len(stable_prefix) :]},
             ]
         payload = {
             "model": self.model,
@@ -657,7 +861,9 @@ class AnthropicCompatibleModelClient:
                 if exc.code >= 500 and attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
-                raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
+                raise RuntimeError(
+                    f"Anthropic-compatible request failed with HTTP {exc.code}: {body}"
+                ) from exc
             except (urllib.error.URLError, RemoteDisconnected) as exc:
                 if attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
@@ -677,7 +883,9 @@ class AnthropicCompatibleModelClient:
         if data.get("error"):
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
         if self.connection_profile is not None:
-            usage_record = parse_anthropic_usage(data, self.connection_profile, model=self.model)
+            usage_record = parse_anthropic_usage(
+                data, self.connection_profile, model=self.model
+            )
             self.last_completion_metadata = {
                 "prompt_cache_supported": self.supports_prompt_cache,
                 "connection_profile": self.connection_profile.to_dict(),
@@ -690,4 +898,6 @@ class AnthropicCompatibleModelClient:
         text = _extract_anthropic_text(data)
         if text:
             return text
-        raise RuntimeError("Anthropic-compatible error: could not extract text from response")
+        raise RuntimeError(
+            "Anthropic-compatible error: could not extract text from response"
+        )

@@ -28,7 +28,12 @@ BASE_TOOL_SPECS = {
         "description": "Search the workspace with rg or a simple fallback.",
     },
     "symbol_search": {
-        "schema": {"query": "str", "path": "str='.'", "kind": "str=''", "limit": "int=20"},
+        "schema": {
+            "query": "str",
+            "path": "str='.'",
+            "kind": "str=''",
+            "limit": "int=20",
+        },
         "risky": False,
         "description": "Search Python definitions in the local structural symbol index.",
     },
@@ -77,6 +82,50 @@ TOOL_EXAMPLES = {
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
 }
+
+
+def _native_parameter_schema(value):
+    declared = str(value)
+    type_name, _, default = declared.partition("=")
+    json_type = {
+        "str": "string",
+        "int": "integer",
+        "float": "number",
+        "bool": "boolean",
+    }.get(type_name, "string")
+    schema = {"type": json_type}
+    if default:
+        schema["default"] = default.strip("'\"")
+    return schema
+
+
+def native_tool_definitions(tools):
+    """Render the canonical registry as OpenAI-compatible function schemas."""
+    definitions = []
+    for name, tool in tools.items():
+        properties = {
+            key: _native_parameter_schema(value)
+            for key, value in tool["schema"].items()
+        }
+        required = [
+            key for key, value in tool["schema"].items() if "=" not in str(value)
+        ]
+        definitions.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool["description"],
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+    return definitions
 
 
 def build_tool_registry(agent):
@@ -190,7 +239,10 @@ def tool_list_files(agent, args):
     if not path.is_dir():
         raise ValueError("path is not a directory")
     entries = [
-        item for item in sorted(path.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
+        item
+        for item in sorted(
+            path.iterdir(), key=lambda item: (item.is_file(), item.name.lower())
+        )
         if item.name not in IGNORED_PATH_NAMES
     ]
     lines = []
@@ -209,7 +261,10 @@ def tool_read_file(agent, args):
     if start < 1 or end < start:
         raise ValueError("invalid line range")
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
+    body = "\n".join(
+        f"{number:>4}: {line}"
+        for number, line in enumerate(lines[start - 1 : end], start=start)
+    )
     return f"# {path.relative_to(agent.root)}\n{body}"
 
 
@@ -232,12 +287,24 @@ def tool_search(agent, args):
         return result.stdout.strip() or result.stderr.strip() or "(no matches)"
 
     matches = []
-    files = [path] if path.is_file() else [
-        item for item in path.rglob("*")
-        if item.is_file() and not any(part in IGNORED_PATH_NAMES for part in item.relative_to(agent.root).parts)
-    ]
+    files = (
+        [path]
+        if path.is_file()
+        else [
+            item
+            for item in path.rglob("*")
+            if item.is_file()
+            and not any(
+                part in IGNORED_PATH_NAMES
+                for part in item.relative_to(agent.root).parts
+            )
+        ]
+    )
     for file_path in files:
-        for number, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        for number, line in enumerate(
+            file_path.read_text(encoding="utf-8", errors="replace").splitlines(),
+            start=1,
+        ):
             if pattern.lower() in line.lower():
                 matches.append(f"{file_path.relative_to(agent.root)}:{number}:{line}")
                 if len(matches) >= 200:
@@ -246,19 +313,30 @@ def tool_search(agent, args):
 
 
 def tool_symbol_search(agent, args):
-    results = agent.code_index.symbol_search(args["query"], args.get("path", "."), args.get("kind", ""), args.get("limit", 20))
-    return "\n".join(
-        f"{item.qualified_name}\n  kind: {item.kind}\n  path: {item.path}\n  lines: {item.start_line}-{item.end_line}"
-        for item in results
-    ) or "(no matches)"
+    results = agent.code_index.symbol_search(
+        args["query"],
+        args.get("path", "."),
+        args.get("kind", ""),
+        args.get("limit", 20),
+    )
+    return (
+        "\n".join(
+            f"{item.qualified_name}\n  kind: {item.kind}\n  path: {item.path}\n  lines: {item.start_line}-{item.end_line}"
+            for item in results
+        )
+        or "(no matches)"
+    )
 
 
 def tool_file_outline(agent, args):
     symbols = agent.code_index.file_outline(args["path"])
-    return "\n".join(
-        f"{'  ' if item.parent else ''}{item.kind} {item.qualified_name}  {item.start_line}-{item.end_line}"
-        for item in symbols
-    ) or "(no symbols indexed)"
+    return (
+        "\n".join(
+            f"{'  ' if item.parent else ''}{item.kind} {item.qualified_name}  {item.start_line}-{item.end_line}"
+            for item in symbols
+        )
+        or "(no symbols indexed)"
+    )
 
 
 def tool_find_references(agent, args):
@@ -280,6 +358,7 @@ def tool_run_shell(agent, args):
         shell=True,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=timeout,
         # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
         # 目的是减少敏感信息被意外带进命令执行环境的风险。

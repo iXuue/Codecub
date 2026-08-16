@@ -29,7 +29,21 @@ from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, 
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 REDACTED_VALUE = "<redacted>"
-DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
+DEFAULT_SHELL_ENV_ALLOWLIST = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "PWD",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "USER",
+)
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "relevant_memory": True,
@@ -37,6 +51,8 @@ DEFAULT_FEATURE_FLAGS = {
     "prompt_cache": True,
 }
 DEFAULT_MAX_STEPS = 80
+EDIT_EVIDENCE_RETRY_BUDGET = 2
+EDIT_DECISION_ATTEMPT_BUDGET = 4
 REPEATED_NO_PROGRESS_LIMIT = 5
 STOP_REASON_REPEATED_NO_PROGRESS = "repeated_no_progress"
 EXPLORATION_WARNING_THRESHOLD = 6
@@ -51,8 +67,12 @@ CHECKPOINT_FULL_VALID_STATUS = "full-valid"
 CHECKPOINT_PARTIAL_STALE_STATUS = "partial-stale"
 CHECKPOINT_WORKSPACE_MISMATCH_STATUS = "workspace-mismatch"
 CHECKPOINT_SCHEMA_MISMATCH_STATUS = "schema-mismatch"
-DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
-DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
+DURABLE_MEMORY_INTENT_PATTERN = re.compile(
+    r"(?i)\b(capture|remember|save|store|persist|note)\b"
+)
+DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(
+    r"(记住|保存|记录|沉淀|长期记忆|持久记忆)"
+)
 DURABLE_MEMORY_LINE_PATTERNS = (
     ("project-conventions", re.compile(r"(?i)^Project convention:\s*(.+)$")),
     ("key-decisions", re.compile(r"(?i)^Decision:\s*(.+)$")),
@@ -63,7 +83,9 @@ DURABLE_MEMORY_LINE_PATTERNS = (
     ("dependency-facts", re.compile(r"^依赖：\s*(.+)$")),
     ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
 )
-SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
+SECRET_SHAPED_TEXT_PATTERN = re.compile(
+    r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})"
+)
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -97,12 +119,12 @@ class FinalAnswerDeltaFilter:
             start = self.buffer.find(self.start_tag)
             tool_start = self.buffer.find("<tool")
             if tool_start != -1 and (start == -1 or tool_start < start):
-                self.buffer = self.buffer[-(len(self.start_tag) - 1):]
+                self.buffer = self.buffer[-(len(self.start_tag) - 1) :]
                 return
             if start == -1:
-                self.buffer = self.buffer[-(len(self.start_tag) - 1):]
+                self.buffer = self.buffer[-(len(self.start_tag) - 1) :]
                 return
-            self.buffer = self.buffer[start + len(self.start_tag):]
+            self.buffer = self.buffer[start + len(self.start_tag) :]
             self.in_final = True
 
         while self.in_final and self.buffer:
@@ -110,7 +132,7 @@ class FinalAnswerDeltaFilter:
             if end >= 0:
                 if end > 0:
                     self.on_text(self.buffer[:end])
-                self.buffer = self.buffer[end + len(self.end_tag):]
+                self.buffer = self.buffer[end + len(self.end_tag) :]
                 self.closed = True
                 return
 
@@ -182,21 +204,29 @@ class Pico:
         self.max_new_tokens = max_new_tokens
         self.context_window = context_window
         self.safety_margin_tokens = int(safety_margin_tokens)
-        self.token_counter = getattr(model_client, "token_counter", None) or resolve_token_counter(getattr(model_client, "model", ""))
+        self.token_counter = getattr(
+            model_client, "token_counter", None
+        ) or resolve_token_counter(getattr(model_client, "model", ""))
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
         self.allowed_tools = None if allowed_tools is None else frozenset(allowed_tools)
         self.requires_workspace_change = bool(requires_workspace_change)
-        self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
+        self.shell_env_allowlist = tuple(
+            shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST
+        )
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
         self.approval_handler = approval_handler
         self.event_handler = event_handler
         self.cancel_checker = None
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
-            self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
-        self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".codecub" / "runs")
+            self.feature_flags.update(
+                {str(key): bool(value) for key, value in feature_flags.items()}
+            )
+        self.run_store = run_store or RunStore(
+            Path(workspace.repo_root) / ".codecub" / "runs"
+        )
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -274,7 +304,11 @@ class Pico:
             "max_new_tokens": int(self.max_new_tokens),
             "feature_flags": dict(self.feature_flags),
             "shell_env_allowlist": list(self.shell_env_allowlist),
-            "workspace_fingerprint": getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", self.workspace.fingerprint()),
+            "workspace_fingerprint": getattr(
+                getattr(self, "prefix_state", None),
+                "workspace_fingerprint",
+                self.workspace.fingerprint(),
+            ),
             "tool_signature": self.tool_signature(),
         }
 
@@ -313,7 +347,11 @@ class Pico:
                     current = memorylib.file_freshness(path, self.root)
                     if expected != current and path not in stale_paths:
                         stale_paths.append(path)
-                saved_identity = dict(checkpoint.get("runtime_identity", {}) or self.session.get("runtime_identity", {}) or {})
+                saved_identity = dict(
+                    checkpoint.get("runtime_identity", {})
+                    or self.session.get("runtime_identity", {})
+                    or {}
+                )
                 current_identity = self.current_runtime_identity()
                 identity_keys = (
                     "cwd",
@@ -367,14 +405,26 @@ class Pico:
             f"- Current blocker: {checkpoint.get('current_blocker', '-') or '-'}",
             f"- Next step: {checkpoint.get('next_step', '-') or '-'}",
         ]
-        key_files = [str(item.get("path", "")).strip() for item in checkpoint.get("key_files", []) if str(item.get("path", "")).strip()]
+        key_files = [
+            str(item.get("path", "")).strip()
+            for item in checkpoint.get("key_files", [])
+            if str(item.get("path", "")).strip()
+        ]
         lines.append(f"- Key files: {', '.join(key_files) or '-'}")
         if checkpoint.get("completed"):
-            lines.append("- Completed: " + " | ".join(str(item) for item in checkpoint.get("completed", [])))
+            lines.append(
+                "- Completed: "
+                + " | ".join(str(item) for item in checkpoint.get("completed", []))
+            )
         if checkpoint.get("excluded"):
-            lines.append("- Excluded: " + " | ".join(str(item) for item in checkpoint.get("excluded", [])))
+            lines.append(
+                "- Excluded: "
+                + " | ".join(str(item) for item in checkpoint.get("excluded", []))
+            )
         if self.resume_state.get("stale_paths"):
-            lines.append("- Stale paths: " + ", ".join(self.resume_state["stale_paths"]))
+            lines.append(
+                "- Stale paths: " + ", ".join(self.resume_state["stale_paths"])
+            )
         summary = str(checkpoint.get("summary", "")).strip()
         if summary:
             lines.append(f"- Summary: {summary}")
@@ -393,7 +443,9 @@ class Pico:
         tools = toolkit.build_tool_registry(self)
         if self.allowed_tools is None:
             return tools
-        return {name: tool for name, tool in tools.items() if name in self.allowed_tools}
+        return {
+            name: tool for name, tool in tools.items() if name in self.allowed_tools
+        }
 
     def tool_signature(self):
         payload = []
@@ -407,12 +459,16 @@ class Pico:
                     "description": tool["description"],
                 }
             )
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
     def build_prefix(self):
         tool_lines = []
         for name, tool in self.tools.items():
-            fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
+            fields = ", ".join(
+                f"{key}: {value}" for key, value in tool["schema"].items()
+            )
             risk = "approval required" if tool["risky"] else "safe"
             tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
         tool_text = "\n".join(tool_lines)
@@ -420,15 +476,19 @@ class Pico:
         if "write_file" in self.tools:
             xml_tool_rules += (
                 "- For write_file calls with multi-line content, prefer XML style:\n"
-                "  <tool name=\"write_file\" path=\"file.py\"><content>...</content></tool>\n"
+                '  <tool name="write_file" path="file.py"><content>...</content></tool>\n'
             )
         if "patch_file" in self.tools:
             xml_tool_rules += (
                 "- For patch_file calls with multi-line text, use <old_text> and <new_text>:\n"
-                "  <tool name=\"patch_file\" path=\"file.py\"><old_text>...</old_text><new_text>...</new_text></tool>"
+                '  <tool name="patch_file" path="file.py"><old_text>...</old_text><new_text>...</new_text></tool>'
             )
         examples = "\n".join(
-            [toolkit.tool_example(name) for name in self.tools if toolkit.tool_example(name)]
+            [
+                toolkit.tool_example(name)
+                for name in self.tools
+                if toolkit.tool_example(name)
+            ]
             + ["<final>Done.</final>"]
         )
         task_contract = (
@@ -485,17 +545,25 @@ class Pico:
 
     def refresh_prefix(self, force=False):
         previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
-        previous_workspace_fingerprint = getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", None)
+        previous_workspace_fingerprint = getattr(
+            getattr(self, "prefix_state", None), "workspace_fingerprint", None
+        )
 
         # 工作区事实相对稳定，所以这里按整体刷新；
         # 只有这些事实真的变化了，才重建完整 prefix。
         refreshed_workspace = WorkspaceContext.build(self.root)
         refreshed_workspace_fingerprint = refreshed_workspace.fingerprint()
-        workspace_changed = force or refreshed_workspace_fingerprint != previous_workspace_fingerprint
+        workspace_changed = (
+            force or refreshed_workspace_fingerprint != previous_workspace_fingerprint
+        )
         if workspace_changed:
             self.workspace = refreshed_workspace
 
-        prefix_state = self.build_prefix() if workspace_changed or force or previous_hash is None else self.prefix_state
+        prefix_state = (
+            self.build_prefix()
+            if workspace_changed or force or previous_hash is None
+            else self.prefix_state
+        )
         prefix_changed = force or previous_hash != prefix_state.hash
         if prefix_changed:
             self._apply_prefix_state(prefix_state)
@@ -554,7 +622,9 @@ class Pico:
 
             if item["role"] == "tool":
                 limit = 900 if recent else 180
-                lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
+                lines.append(
+                    f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
+                )
                 lines.append(clip(item["content"], limit))
             else:
                 limit = 900 if recent else 220
@@ -576,7 +646,10 @@ class Pico:
     @staticmethod
     def looks_sensitive_env_name(name):
         upper = str(name).upper()
-        return any(upper == marker or upper.endswith(marker) or upper.endswith(f"_{marker}") for marker in SENSITIVE_ENV_NAME_MARKERS)
+        return any(
+            upper == marker or upper.endswith(marker) or upper.endswith(f"_{marker}")
+            for marker in SENSITIVE_ENV_NAME_MARKERS
+        )
 
     def is_secret_env_name(self, name):
         upper = str(name).upper()
@@ -616,7 +689,11 @@ class Pico:
 
     def redact_text(self, text):
         text = str(text)
-        for _, value in sorted(self.detected_secret_env_items(), key=lambda item: len(item[1]), reverse=True):
+        for _, value in sorted(
+            self.detected_secret_env_items(),
+            key=lambda item: len(item[1]),
+            reverse=True,
+        ):
             text = text.replace(value, REDACTED_VALUE)
         return text
 
@@ -644,12 +721,23 @@ class Pico:
             if name in os.environ
         }
         env["PWD"] = str(self.root)
+        # Experiment workspaces can be nested under the repository's artifact
+        # directory while intentionally excluding .git.  On Windows Git does
+        # not reliably honor GIT_CEILING_DIRECTORIES for drive-qualified paths,
+        # so make Git operate on the platform null device instead of discovering
+        # the parent source repository.
+        env["GIT_DIR"] = os.devnull
         if "PATH" not in env and os.environ.get("PATH"):
             env["PATH"] = os.environ["PATH"]
         if os.name == "nt":
             system_root = os.environ.get("SystemRoot", r"C:\Windows")
             env.setdefault("SystemRoot", system_root)
-            env.setdefault("ComSpec", os.environ.get("ComSpec", str(Path(system_root) / "System32" / "cmd.exe")))
+            env.setdefault(
+                "ComSpec",
+                os.environ.get(
+                    "ComSpec", str(Path(system_root) / "System32" / "cmd.exe")
+                ),
+            )
         return env
 
     def prompt_metadata(self, user_message, prompt):
@@ -658,7 +746,9 @@ class Pico:
 
     def _build_prompt_and_metadata(self, user_message, status_callback=None):
         if status_callback is not None:
-            status_callback("checking_workspace", "Checking repository state", str(self.root))
+            status_callback(
+                "checking_workspace", "Checking repository state", str(self.root)
+            )
         refresh = self.refresh_prefix()
         if status_callback is not None:
             status_callback("loading_memory", "Loading session memory", "")
@@ -666,7 +756,9 @@ class Pico:
         if status_callback is not None:
             status_callback("building_prompt", "Building prompt", "")
         prompt, metadata = self.context_manager.build(user_message)
-        available_prompt_tokens = resolve_prompt_budget(self.context_window, self.max_new_tokens, self.safety_margin_tokens)
+        available_prompt_tokens = resolve_prompt_budget(
+            self.context_window, self.max_new_tokens, self.safety_margin_tokens
+        )
         # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
         # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
         metadata.update(
@@ -685,17 +777,29 @@ class Pico:
                 "tool_signature": self.prefix_state.tool_signature,
                 "workspace_changed": refresh["workspace_changed"],
                 "prefix_changed": refresh["prefix_changed"],
-                "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
-                "resume_status": self.resume_state.get("status", CHECKPOINT_NONE_STATUS),
-                "stale_summary_invalidations": int(self.resume_state.get("stale_summary_invalidations", 0)),
+                "prompt_cache_supported": bool(
+                    getattr(self.model_client, "supports_prompt_cache", False)
+                ),
+                "resume_status": self.resume_state.get(
+                    "status", CHECKPOINT_NONE_STATUS
+                ),
+                "stale_summary_invalidations": int(
+                    self.resume_state.get("stale_summary_invalidations", 0)
+                ),
                 "stale_paths": list(self.resume_state.get("stale_paths", [])),
-                "runtime_identity_mismatch_fields": list(self.resume_state.get("runtime_identity_mismatch_fields", [])),
+                "runtime_identity_mismatch_fields": list(
+                    self.resume_state.get("runtime_identity_mismatch_fields", [])
+                ),
                 "context_window": self.context_window,
                 "max_new_tokens": int(self.max_new_tokens),
                 "safety_margin_tokens": self.safety_margin_tokens,
                 "available_prompt_tokens": available_prompt_tokens,
-                "token_counter_source": getattr(self.token_counter, "source", "unavailable"),
-                "token_counter_quality": getattr(self.token_counter, "quality", "unavailable"),
+                "token_counter_source": getattr(
+                    self.token_counter, "source", "unavailable"
+                ),
+                "token_counter_quality": getattr(
+                    self.token_counter, "quality", "unavailable"
+                ),
             }
         )
         metadata.update(self.detected_secret_env_summary())
@@ -713,8 +817,14 @@ class Pico:
         if self.event_handler is not None:
             self.event_handler(event_name, dict(payload or {}), self, task_state)
 
-    def emit_run_status(self, task_state, phase, label, detail="", started_at="", run_started_at=None):
-        elapsed_ms = int((time.monotonic() - run_started_at) * 1000) if run_started_at is not None else 0
+    def emit_run_status(
+        self, task_state, phase, label, detail="", started_at="", run_started_at=None
+    ):
+        elapsed_ms = (
+            int((time.monotonic() - run_started_at) * 1000)
+            if run_started_at is not None
+            else 0
+        )
         self.emit_app_event(
             "run_status",
             task_state,
@@ -739,7 +849,9 @@ class Pico:
             if not path.is_file():
                 continue
             try:
-                snapshot[path.relative_to(self.root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+                snapshot[path.relative_to(self.root).as_posix()] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
             except Exception:
                 continue
         return snapshot
@@ -779,7 +891,9 @@ class Pico:
             "current_goal": str(user_message),
             "completed": [task_state.final_answer] if task_state.final_answer else [],
             "excluded": [],
-            "current_blocker": "" if str(task_state.stop_reason or "") in ("", "final_answer_returned") else str(task_state.stop_reason),
+            "current_blocker": ""
+            if str(task_state.stop_reason or "") in ("", "final_answer_returned")
+            else str(task_state.stop_reason),
             "next_step": self.infer_next_step(task_state),
             "key_files": key_files,
             "freshness": freshness,
@@ -832,7 +946,9 @@ class Pico:
         if name == "read_file":
             summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
-            self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
+            self.memory.append_note(
+                summary, tags=(canonical_path,), source=canonical_path
+            )
         elif name in {"write_file", "patch_file"}:
             self.memory.invalidate_file_summary(canonical_path)
 
@@ -843,7 +959,11 @@ class Pico:
         status = str(metadata.get("tool_status", "")).strip()
         if status not in {"partial_success", "error", "rejected"}:
             return
-        affected_paths = [str(path).strip() for path in metadata.get("affected_paths", []) if str(path).strip()]
+        affected_paths = [
+            str(path).strip()
+            for path in metadata.get("affected_paths", [])
+            if str(path).strip()
+        ]
         path_text = ", ".join(affected_paths) or "workspace"
         if status == "partial_success":
             text = f"{name} partial_success on {path_text}; inspect diff before retry"
@@ -879,13 +999,19 @@ class Pico:
         )
         if any(lowered.startswith(prefix) for prefix in checkpoint_like_prefixes):
             return "transient_task_state"
-        if re.search(r"(?i)\b(stdout|stderr|traceback|exit_code)\b", text) or len(text) > 220:
+        if (
+            re.search(r"(?i)\b(stdout|stderr|traceback|exit_code)\b", text)
+            or len(text) > 220
+        ):
             return "noisy_output"
         return ""
 
     def extract_durable_promotions(self, user_message, final_answer):
         user_text = str(user_message or "")
-        if not (DURABLE_MEMORY_INTENT_PATTERN.search(user_text) or DURABLE_MEMORY_INTENT_ZH_PATTERN.search(user_text)):
+        if not (
+            DURABLE_MEMORY_INTENT_PATTERN.search(user_text)
+            or DURABLE_MEMORY_INTENT_ZH_PATTERN.search(user_text)
+        ):
             return [], []
         promotions = []
         rejections = []
@@ -908,7 +1034,9 @@ class Pico:
         return promotions, rejections
 
     def promote_durable_memory(self, user_message, final_answer):
-        promotions, rejections = self.extract_durable_promotions(user_message, final_answer)
+        promotions, rejections = self.extract_durable_promotions(
+            user_message, final_answer
+        )
         promoted, superseded = self.memory.promote_durable(promotions)
         self.session["memory"] = self.memory.to_dict()
         self.last_durable_promotions = promoted
@@ -941,9 +1069,15 @@ class Pico:
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
-        task_run_id = self.validate_external_run_id(run_id) if run_id else self.new_run_id()
-        task_state = TaskState.create(run_id=task_run_id, task_id=self.new_task_id(), user_request=user_message)
-        task_state.resume_status = self.resume_state.get("status", CHECKPOINT_NONE_STATUS)
+        task_run_id = (
+            self.validate_external_run_id(run_id) if run_id else self.new_run_id()
+        )
+        task_state = TaskState.create(
+            run_id=task_run_id, task_id=self.new_task_id(), user_request=user_message
+        )
+        task_state.resume_status = self.resume_state.get(
+            "status", CHECKPOINT_NONE_STATUS
+        )
         self.current_task_state = task_state
         self.current_run_usage = []
         self.current_run_source_reads = []
@@ -972,6 +1106,41 @@ class Pico:
         finalization_required = False
         finalization_rejections = 0
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)
+        native_mode = bool(getattr(self.model_client, "supports_native_tools", False))
+        native_messages = []
+        pending_native_calls = []
+        if native_mode:
+            native_messages = [
+                {
+                    "role": "system",
+                    "content": "You are CodeCub, a local coding agent. Use the supplied tools when workspace evidence or changes are required. Do not emit XML tool syntax.",
+                }
+            ]
+            self.emit_trace(
+                task_state,
+                "model_protocol_selected",
+                {
+                    "model_protocol": "native_tools",
+                    "provider_protocol": getattr(
+                        getattr(self.model_client, "connection_profile", None),
+                        "protocol",
+                        "",
+                    ),
+                },
+            )
+        else:
+            self.emit_trace(
+                task_state,
+                "model_protocol_selected",
+                {
+                    "model_protocol": "legacy_text",
+                    "provider_protocol": getattr(
+                        getattr(self.model_client, "connection_profile", None),
+                        "protocol",
+                        "",
+                    ),
+                },
+            )
 
         # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
         # 1. 感知：重新组 prompt，把当前状态整理给模型看
@@ -981,7 +1150,9 @@ class Pico:
         # 然后进入下一轮，直到停机条件满足
         while tool_steps < self.max_steps and attempts < max_attempts:
             if self.cancellation_requested(task_state):
-                return self.stop_user_canceled_run(task_state, run_started_wall, run_started_at)
+                return self.stop_user_canceled_run(
+                    task_state, run_started_wall, run_started_at
+                )
             attempts += 1
             task_state.record_attempt()
             self.run_store.write_task_state(task_state)
@@ -1012,7 +1183,22 @@ class Pico:
                     },
                 )
 
-            prompt, prompt_metadata = self._build_prompt_and_metadata(user_message, status_callback=emit_context_status)
+            prompt, prompt_metadata = self._build_prompt_and_metadata(
+                user_message, status_callback=emit_context_status
+            )
+            if native_mode:
+                prompt_metadata["model_protocol"] = "native_tools"
+                if len(native_messages) == 1:
+                    native_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "For file tools, use workspace-relative paths; "
+                                "shell commands already execute at the workspace root.\n\n"
+                                + user_message
+                            ),
+                        }
+                    )
             self.emit_trace(
                 task_state,
                 "prompt_built",
@@ -1023,7 +1209,9 @@ class Pico:
             )
             # 说明已有检查点的关键文件部分过期（内容变了）
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
+                checkpoint = self.create_checkpoint(
+                    task_state, user_message, trigger="freshness_mismatch"
+                )
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
                     task_state,
@@ -1034,15 +1222,22 @@ class Pico:
                     },
                 )
             # 说明运行环境/工作区指纹不一致（如 cwd、模型、工具签名等变化）
-            elif prompt_metadata.get("resume_status") == CHECKPOINT_WORKSPACE_MISMATCH_STATUS:
+            elif (
+                prompt_metadata.get("resume_status")
+                == CHECKPOINT_WORKSPACE_MISMATCH_STATUS
+            ):
                 self.emit_trace(
                     task_state,
                     "runtime_identity_mismatch",
                     {
-                        "fields": list(prompt_metadata.get("runtime_identity_mismatch_fields", [])),
+                        "fields": list(
+                            prompt_metadata.get("runtime_identity_mismatch_fields", [])
+                        ),
                     },
                 )
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="workspace_mismatch")
+                checkpoint = self.create_checkpoint(
+                    task_state, user_message, trigger="workspace_mismatch"
+                )
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
                     task_state,
@@ -1054,7 +1249,9 @@ class Pico:
                 )
             # 当 prompt 预算被削减（上下文压缩）时，也会创建检查点
             if prompt_metadata.get("budget_reductions"):
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="context_reduction")
+                checkpoint = self.create_checkpoint(
+                    task_state, user_message, trigger="context_reduction"
+                )
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
                     task_state,
@@ -1074,7 +1271,9 @@ class Pico:
                 },
             )
             if self.cancellation_requested(task_state):
-                return self.stop_user_canceled_run(task_state, run_started_wall, run_started_at)
+                return self.stop_user_canceled_run(
+                    task_state, run_started_wall, run_started_at
+                )
             self.emit_run_status(
                 task_state,
                 "model_request",
@@ -1085,7 +1284,9 @@ class Pico:
             )
             prompt_cache_key = None
             prompt_cache_retention = None
-            if self.feature_enabled("prompt_cache") and getattr(self.model_client, "supports_prompt_cache", False):
+            if self.feature_enabled("prompt_cache") and getattr(
+                self.model_client, "supports_prompt_cache", False
+            ):
                 # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
@@ -1099,7 +1300,9 @@ class Pico:
                 run_started_at=run_started_at,
             )
             stream_filter = FinalAnswerDeltaFilter(
-                lambda text: self.emit_app_event("assistant_delta", task_state, {"text": text})
+                lambda text: self.emit_app_event(
+                    "assistant_delta", task_state, {"text": text}
+                )
             )
             self.last_prompt_metadata = prompt_metadata
             try:
@@ -1107,9 +1310,98 @@ class Pico:
                     "prompt_cache_key": prompt_cache_key,
                     "prompt_cache_retention": prompt_cache_retention,
                 }
-                if getattr(self.model_client, "supports_structured_prompt_cache", False):
+                if getattr(
+                    self.model_client, "supports_structured_prompt_cache", False
+                ):
                     model_kwargs["stable_prefix"] = self.prefix
-                if hasattr(self.model_client, "stream_complete"):
+                if native_mode:
+                    connection_profile = getattr(
+                        self.model_client, "connection_profile", None
+                    )
+                    supports_tool_choice = bool(
+                        getattr(connection_profile, "supports_tool_choice", False)
+                    )
+                    edit_decision = (
+                        self.requires_workspace_change
+                        and self.current_planning.get("action_readiness")
+                        == "action_expected"
+                        and not self.current_planning.get("workspace_change_count")
+                    )
+                    native_tools = toolkit.native_tool_definitions(self.tools)
+                    tool_choice = (
+                        "auto"
+                        if connection_profile is None or supports_tool_choice
+                        else None
+                    )
+                    # Do not insert an edit-decision user turn until every
+                    # result for an earlier native tool-call batch is present.
+                    if edit_decision and not pending_native_calls:
+                        if connection_profile is None or supports_tool_choice:
+                            native_tools = [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_edit_decision",
+                                        "description": "Submit exactly one edit proposal or one bounded evidence request.",
+                                        "parameters": {
+                                            "type": "object",
+                                            "properties": {
+                                                "decision": {
+                                                    "type": "string",
+                                                    "enum": ["edit", "need_evidence"],
+                                                },
+                                                "tool": {"type": "string"},
+                                                "arguments": {"type": "object"},
+                                            },
+                                            "required": ["decision", "tool", "arguments"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                }
+                            ]
+                            tool_choice = (
+                                "required" if supports_tool_choice else tool_choice
+                            )
+                        else:
+                            # Some OpenAI-compatible providers accept native tools but
+                            # reject tool_choice.  Keep the real tool schema in this
+                            # phase: replacing it with a synthetic decision function
+                            # can yield stale calls to tools that are no longer listed.
+                            # The direct-call compatibility branch below still records
+                            # the same bounded edit or evidence decision.
+                            native_messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Edit-decision phase: choose one direct native "
+                                        "tool call. Use patch_file or write_file for the "
+                                        "smallest justified edit; request read_file, search, "
+                                        "or symbol_search only for essential missing evidence."
+                                    ),
+                                }
+                            )
+                        self.emit_trace(
+                            task_state,
+                            "phase_transition",
+                            {
+                                "phase": "edit_decision",
+                                "edit_decision_index": self.current_planning.get(
+                                    "edit_decision_count", 0
+                                )
+                                + 1,
+                                "compatibility_mode": not supports_tool_choice,
+                            },
+                        )
+                    if pending_native_calls:
+                        raw = pending_native_calls.pop(0)
+                    else:
+                        raw = self.model_client.complete_with_tools(
+                            native_messages,
+                            native_tools,
+                            self.max_new_tokens,
+                            tool_choice=tool_choice,
+                        )
+                elif hasattr(self.model_client, "stream_complete"):
                     raw = self.model_client.stream_complete(
                         prompt,
                         self.max_new_tokens,
@@ -1123,21 +1415,35 @@ class Pico:
                         **model_kwargs,
                     )
             except Exception as exc:
-                return self.stop_model_error_run(task_state, exc, model_started_at, run_started_wall, run_started_at)
-            completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
+                return self.stop_model_error_run(
+                    task_state, exc, model_started_at, run_started_wall, run_started_at
+                )
+            completion_metadata = dict(
+                getattr(self.model_client, "last_completion_metadata", {}) or {}
+            )
             if self.cancellation_requested(task_state):
-                return self.stop_user_canceled_run(task_state, run_started_wall, run_started_at)
+                return self.stop_user_canceled_run(
+                    task_state, run_started_wall, run_started_at
+                )
             if completion_metadata:
                 # 把后端返回的 usage/cache 统计并回 prompt_metadata，
                 # 方便统一写入 report 和 trace。
                 prompt_metadata.update(completion_metadata)
             estimated_tokens = prompt_metadata.get("estimated_prompt_tokens")
             actual_tokens = completion_metadata.get("input_tokens")
-            if isinstance(estimated_tokens, int) and isinstance(actual_tokens, int) and actual_tokens > 0:
+            if (
+                isinstance(estimated_tokens, int)
+                and isinstance(actual_tokens, int)
+                and actual_tokens > 0
+            ):
                 prompt_metadata["actual_input_tokens"] = actual_tokens
-                prompt_metadata["token_estimation_error"] = abs(actual_tokens - estimated_tokens) / actual_tokens
+                prompt_metadata["token_estimation_error"] = (
+                    abs(actual_tokens - estimated_tokens) / actual_tokens
+                )
                 if prompt_metadata.get("available_prompt_tokens"):
-                    prompt_metadata["context_utilization"] = estimated_tokens / prompt_metadata["available_prompt_tokens"]
+                    prompt_metadata["context_utilization"] = (
+                        estimated_tokens / prompt_metadata["available_prompt_tokens"]
+                    )
             usage_record = completion_metadata.get("usage_record")
             if isinstance(usage_record, dict):
                 usage_record = dict(usage_record)
@@ -1149,7 +1455,9 @@ class Pico:
                         "turn_id": task_state.task_id,
                         "request_index": attempts,
                         "recorded_at": now(),
-                        "duration_ms": int((time.monotonic() - model_started_at) * 1000),
+                        "duration_ms": int(
+                            (time.monotonic() - model_started_at) * 1000
+                        ),
                         "status": "completed",
                     }
                 )
@@ -1164,31 +1472,216 @@ class Pico:
                         session_id=self.session.get("id", ""),
                         run_id=task_state.run_id,
                     )
-                    session_snapshot = (stored or {}).get("snapshot") if isinstance(stored, dict) else None
+                    session_snapshot = (
+                        (stored or {}).get("snapshot")
+                        if isinstance(stored, dict)
+                        else None
+                    )
                     if isinstance(session_snapshot, dict):
-                        self.emit_app_event("usage_updated", task_state, {
-                            "schema_version": 2,
-                            "usage_id": usage_record["usage_id"],
-                            "run_snapshot": run_snapshot,
-                            "session_snapshot": session_snapshot,
-                        })
+                        self.emit_app_event(
+                            "usage_updated",
+                            task_state,
+                            {
+                                "schema_version": 2,
+                                "usage_id": usage_record["usage_id"],
+                                "run_snapshot": run_snapshot,
+                                "session_snapshot": session_snapshot,
+                            },
+                        )
                 except Exception as exc:
                     self.emit_trace(
                         task_state,
                         "usage_persistence_warning",
-                        {"error_type": exc.__class__.__name__, "message": self.redact_text(str(exc))},
+                        {
+                            "error_type": exc.__class__.__name__,
+                            "message": self.redact_text(str(exc)),
+                        },
                     )
                 self.emit_trace(
                     task_state,
                     "model_usage_recorded",
                     {
                         "usage_id": usage_record["usage_id"],
-                        "connection_profile_id": usage_record.get("connection_profile_id", ""),
+                        "connection_profile_id": usage_record.get(
+                            "connection_profile_id", ""
+                        ),
                     },
                 )
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
-            kind, payload = self.parse(raw)
+            if native_mode:
+                if raw.tool_calls:
+                    # Providers may return a batch even when asked not to.  Preserve
+                    # every call id and make the batch boundary explicit instead of
+                    # silently executing concurrent mutations.  The first call is
+                    # processed through the normal guarded path; remaining calls are
+                    # returned as deferred so the next structured decision is based
+                    # on the refreshed workspace.
+                    call = raw.tool_calls[0]
+                    fallback_direct_decision = (
+                        not supports_tool_choice
+                        and self.requires_workspace_change
+                        and self.current_planning.get("action_readiness")
+                        == "action_expected"
+                        and not self.current_planning.get("workspace_change_count")
+                        and call.name
+                        in {
+                            "patch_file",
+                            "write_file",
+                            "read_file",
+                            "search",
+                            "symbol_search",
+                        }
+                    )
+                    if call.name == "submit_edit_decision" or fallback_direct_decision:
+                        if fallback_direct_decision:
+                            decision = (
+                                "edit"
+                                if call.name in {"patch_file", "write_file"}
+                                else "need_evidence"
+                            )
+                            requested_name = call.name
+                            requested_args = call.arguments
+                            self.emit_trace(
+                                task_state,
+                                "native_direct_edit_decision",
+                                {
+                                    "decision": decision,
+                                    "tool": requested_name,
+                                    "compatibility_reason": "provider_omits_tool_choice",
+                                },
+                            )
+                        else:
+                            decision = call.arguments.get("decision")
+                            requested_name = call.arguments.get("tool")
+                            requested_args = call.arguments.get("arguments")
+                        if (
+                            self.current_planning.get("edit_decision_count", 0)
+                            >= EDIT_DECISION_ATTEMPT_BUDGET
+                        ):
+                            return self.stop_model_error_run(
+                                task_state,
+                                RuntimeError("edit_decision_exhausted"),
+                                model_started_at,
+                                run_started_wall,
+                                run_started_at,
+                            )
+                        self.current_planning["edit_decision_count"] = (
+                            self.current_planning.get("edit_decision_count", 0) + 1
+                        )
+                        allowed = (
+                            {"patch_file", "write_file"}
+                            if decision == "edit"
+                            else {"read_file", "search", "symbol_search"}
+                        )
+                        if (
+                            decision not in {"edit", "need_evidence"}
+                            or requested_name not in allowed
+                            or not isinstance(requested_args, dict)
+                        ):
+                            self.current_planning["invalid_edit_decision_count"] = (
+                                self.current_planning.get(
+                                    "invalid_edit_decision_count", 0
+                                )
+                                + 1
+                            )
+                            kind, payload = (
+                                "retry",
+                                "Invalid edit decision; submit one allowed structured decision.",
+                            )
+                        elif (
+                            decision == "need_evidence"
+                            and self.current_planning.get("evidence_request_count", 0)
+                            >= EDIT_EVIDENCE_RETRY_BUDGET
+                        ):
+                            # The evidence budget limits executed reads/searches,
+                            # not the model's opportunity to correct an over-budget
+                            # request.  Keep this decision attempt counted, reject
+                            # the request without running it, and reserve any
+                            # remaining bounded decision attempt for an edit.
+                            kind, payload = (
+                                "retry",
+                                "Evidence-request budget exhausted; do not request "
+                                "more evidence. Make the smallest justified edit now.",
+                            )
+                        else:
+                            if decision == "need_evidence":
+                                self.current_planning["evidence_request_count"] = (
+                                    self.current_planning.get(
+                                        "evidence_request_count", 0
+                                    )
+                                    + 1
+                                )
+                            kind, payload = (
+                                "tool",
+                                {
+                                    "name": requested_name,
+                                    "args": requested_args,
+                                    "tool_call_id": call.id,
+                                    "edit_decision": decision,
+                                },
+                            )
+                    else:
+                        kind, payload = (
+                            "tool",
+                            {
+                                "name": call.name,
+                                "args": call.arguments,
+                                "tool_call_id": call.id,
+                            },
+                        )
+                    if kind == "retry":
+                        # A rejected first call is not retained in native
+                        # history, so the next model request cannot contain an
+                        # unanswered assistant tool call.  A rejected queued
+                        # call, however, already belongs to an accepted batch
+                        # and must receive a matching tool result.
+                        if raw.raw_metadata.get("queued_native_call"):
+                            native_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call.id,
+                                    "content": f"error: {payload}",
+                                }
+                            )
+                    elif not raw.raw_metadata.get("queued_native_call"):
+                        native_messages.append(
+                            {
+                                "role": "assistant",
+                                "content": raw.text or None,
+                                "tool_calls": [
+                                    {
+                                        "id": item.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": item.name,
+                                            "arguments": json.dumps(item.arguments),
+                                        },
+                                    }
+                                    for item in raw.tool_calls
+                                ],
+                            }
+                        )
+                        pending_native_calls.extend(
+                            type(raw)(
+                                tool_calls=(item,),
+                                raw_metadata={"queued_native_call": True},
+                            )
+                            for item in raw.tool_calls[1:]
+                        )
+                    if len(raw.tool_calls) > 1:
+                        self.emit_trace(
+                            task_state,
+                            "native_tool_batch_queued",
+                            {
+                                "received": len(raw.tool_calls),
+                                "queued": len(raw.tool_calls) - 1,
+                            },
+                        )
+                else:
+                    kind, payload = "final", raw.text
+            else:
+                kind, payload = self.parse(raw)
             self.emit_trace(
                 task_state,
                 "model_parsed",
@@ -1204,16 +1697,26 @@ class Pico:
                 args = payload.get("args", {})
                 if finalization_required and task_policy.is_research_tool(name):
                     finalization_rejections += 1
-                    notice = task_policy.finalization_notice(self.current_run_source_reads, research_steps, research_budget)
-                    self.record({"role": "assistant", "content": notice, "created_at": now()})
-                    self.emit_trace(task_state, "research_budget_exhausted", {
-                        "tool_name": name,
-                        "research_steps": research_steps,
-                        "research_budget": research_budget,
-                        "finalization_rejections": finalization_rejections,
-                    })
+                    notice = task_policy.finalization_notice(
+                        self.current_run_source_reads, research_steps, research_budget
+                    )
+                    self.record(
+                        {"role": "assistant", "content": notice, "created_at": now()}
+                    )
+                    self.emit_trace(
+                        task_state,
+                        "research_budget_exhausted",
+                        {
+                            "tool_name": name,
+                            "research_steps": research_steps,
+                            "research_budget": research_budget,
+                            "finalization_rejections": finalization_rejections,
+                        },
+                    )
                     if finalization_rejections >= 2:
-                        return self.stop_finalization_failed_run(task_state, user_message, run_started_wall, run_started_at)
+                        return self.stop_finalization_failed_run(
+                            task_state, user_message, run_started_wall, run_started_at
+                        )
                     self.run_store.write_task_state(task_state)
                     continue
                 tool_steps += 1
@@ -1235,18 +1738,24 @@ class Pico:
                 if read_notice:
                     result = f"{read_notice}\n\n{result}"
                 if name == "read_file":
-                    self._last_tool_result_metadata["read_evidence_classification"] = read_classification
+                    self._last_tool_result_metadata["read_evidence_classification"] = (
+                        read_classification
+                    )
                     if read_classification == "avoidable_repeated_read":
                         self.current_planning["avoidable_repeated_read_calls"] += 1
                     elif read_classification == "evidence_evicted_reread":
                         self.current_planning["evidence_evicted_reread_calls"] += 1
                     self.record_read_evidence(args, result, task_state.tool_steps)
-                elif bool((self._last_tool_result_metadata or {}).get("workspace_changed")):
+                elif bool(
+                    (self._last_tool_result_metadata or {}).get("workspace_changed")
+                ):
                     self.invalidate_evidence_for_paths(
                         (self._last_tool_result_metadata or {}).get("affected_paths")
                     )
                 if self.cancellation_requested(task_state):
-                    return self.stop_user_canceled_run(task_state, run_started_wall, run_started_at)
+                    return self.stop_user_canceled_run(
+                        task_state, run_started_wall, run_started_at
+                    )
                 self.record(
                     {
                         "role": "tool",
@@ -1256,6 +1765,14 @@ class Pico:
                         "created_at": now(),
                     }
                 )
+                if native_mode:
+                    native_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": payload.get("tool_call_id", ""),
+                            "content": result,
+                        }
+                    )
                 if name == "read_file" and task_policy.is_source_path(args.get("path")):
                     self.current_run_source_reads.append(str(args.get("path")))
                 if research_budget is not None and task_policy.is_research_tool(name):
@@ -1270,10 +1787,44 @@ class Pico:
                 }
                 self.emit_trace(task_state, "tool_executed", tool_event_payload)
                 if self.event_handler is not None:
-                    self.event_handler("tool_executed", dict(tool_event_payload), self, task_state)
+                    self.event_handler(
+                        "tool_executed", dict(tool_event_payload), self, task_state
+                    )
                 semantic_repeat = self.update_planning_state(
                     name, args, self._last_tool_result_metadata, task_state.tool_steps
                 )
+                # A native assistant tool-call message must be followed by a
+                # tool result for every call before any user message.  Providers
+                # can return a batch despite advertising no parallel support;
+                # defer decision feedback until its queued calls are drained.
+                if (
+                    native_mode
+                    and payload.get("edit_decision")
+                    and not pending_native_calls
+                ):
+                    decision = payload["edit_decision"]
+                    if decision == "need_evidence":
+                        remaining = max(
+                            0,
+                            EDIT_EVIDENCE_RETRY_BUDGET
+                            - self.current_planning["evidence_request_count"],
+                        )
+                        notice = (
+                            "Bounded edit decision recorded as need_evidence. "
+                            f"Remaining evidence requests: {remaining}. "
+                            "When the available evidence is sufficient, make the smallest justified edit."
+                        )
+                    else:
+                        notice = (
+                            "Bounded edit decision recorded as edit. "
+                            "Run a focused verification command before finalizing."
+                        )
+                    native_messages.append({"role": "user", "content": notice})
+                    self.emit_trace(
+                        task_state,
+                        "edit_decision_feedback",
+                        {"decision": decision, "tool": name},
+                    )
                 if semantic_repeat:
                     self.emit_trace(
                         task_state,
@@ -1282,7 +1833,10 @@ class Pico:
                     )
                 self.maybe_emit_exploration_warning(task_state)
                 self.maybe_emit_implementation_warning(task_state)
-                if dict(self._last_tool_result_metadata or {}).get("tool_error_code") == "repeated_identical_call":
+                if (
+                    dict(self._last_tool_result_metadata or {}).get("tool_error_code")
+                    == "repeated_identical_call"
+                ):
                     return self.stop_repeated_no_progress_run(
                         task_state,
                         user_message,
@@ -1299,13 +1853,21 @@ class Pico:
                     and (
                         self.current_planning["redundant_exploration_steps"]
                         + self.current_planning["redundant_verification_steps"]
-                    ) >= SEMANTIC_REPEAT_HARD_STOP_THRESHOLD
+                    )
+                    >= SEMANTIC_REPEAT_HARD_STOP_THRESHOLD
                     and self.current_planning["first_action_step"] is None
                 ):
                     return self.stop_repeated_no_progress_run(
-                        task_state, user_message, name, args, run_started_wall, run_started_at
+                        task_state,
+                        user_message,
+                        name,
+                        args,
+                        run_started_wall,
+                        run_started_at,
                     )
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
+                checkpoint = self.create_checkpoint(
+                    task_state, user_message, trigger="tool_executed"
+                )
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
                     task_state,
@@ -1317,13 +1879,21 @@ class Pico:
                 )
                 if research_budget is not None and research_steps >= research_budget:
                     finalization_required = True
-                    notice = task_policy.finalization_notice(self.current_run_source_reads, research_steps, research_budget)
-                    self.record({"role": "assistant", "content": notice, "created_at": now()})
-                    self.emit_trace(task_state, "finalization_required", {
-                        "source_reads": list(self.current_run_source_reads),
-                        "research_steps": research_steps,
-                        "research_budget": research_budget,
-                    })
+                    notice = task_policy.finalization_notice(
+                        self.current_run_source_reads, research_steps, research_budget
+                    )
+                    self.record(
+                        {"role": "assistant", "content": notice, "created_at": now()}
+                    )
+                    self.emit_trace(
+                        task_state,
+                        "finalization_required",
+                        {
+                            "source_reads": list(self.current_run_source_reads),
+                            "research_steps": research_steps,
+                            "research_budget": research_budget,
+                        },
+                    )
                     self.emit_run_status(
                         task_state,
                         "finalization_required",
@@ -1335,34 +1905,98 @@ class Pico:
                 continue
 
             if kind == "retry":
-                self.record({"role": "assistant", "content": payload, "created_at": now()})
+                self.record(
+                    {"role": "assistant", "content": payload, "created_at": now()}
+                )
                 self.run_store.write_task_state(task_state)
                 continue
 
-            if task_policy.requires_source_evidence(user_message) and not self.current_run_source_reads:
+            if (
+                task_policy.requires_source_evidence(user_message)
+                and not self.current_run_source_reads
+            ):
                 notice = task_policy.evidence_retry_notice()
-                self.record({"role": "assistant", "content": notice, "created_at": now()})
-                self.emit_trace(task_state, "evidence_insufficient", {"required": "source_file_read", "source_reads": []})
+                self.record(
+                    {"role": "assistant", "content": notice, "created_at": now()}
+                )
+                self.emit_trace(
+                    task_state,
+                    "evidence_insufficient",
+                    {"required": "source_file_read", "source_reads": []},
+                )
                 self.run_store.write_task_state(task_state)
                 continue
-            final = (payload or raw).strip()
-            return self.finish_successful_run(task_state, user_message, final, run_started_wall, run_started_at)
+            if (
+                native_mode
+                and self.requires_workspace_change
+                and self.current_planning["workspace_change_count"]
+                > self.current_planning["last_verified_change_count"]
+            ):
+                notice = (
+                    "A workspace change was made but has not been verified. "
+                    "Run one focused verification command now, then provide the final answer."
+                )
+                self.record(
+                    {"role": "assistant", "content": notice, "created_at": now()}
+                )
+                if native_mode:
+                    native_messages.append({"role": "user", "content": notice})
+                self.emit_trace(
+                    task_state,
+                    "verification_required_after_change",
+                    {
+                        "workspace_change_count": self.current_planning[
+                            "workspace_change_count"
+                        ],
+                        "last_verified_change_count": self.current_planning[
+                            "last_verified_change_count"
+                        ],
+                    },
+                )
+                self.run_store.write_task_state(task_state)
+                continue
+            # Native providers may return a normal finish with an empty text
+            # field.  `raw` is a ModelResponse in that mode, never fallback
+            # content for a final answer.
+            final = str(payload or "").strip()
+            return self.finish_successful_run(
+                task_state, user_message, final, run_started_wall, run_started_at
+            )
 
-        return self.stop_limited_run(task_state, user_message, attempts, max_attempts, tool_steps, run_started_wall, run_started_at)
+        return self.stop_limited_run(
+            task_state,
+            user_message,
+            attempts,
+            max_attempts,
+            tool_steps,
+            run_started_wall,
+            run_started_at,
+        )
 
-    def stop_finalization_failed_run(self, task_state, user_message, run_started_wall, run_started_at):
+    def stop_finalization_failed_run(
+        self, task_state, user_message, run_started_wall, run_started_at
+    ):
         final = "Stopped because the model did not produce a final answer after the research budget was exhausted."
         task_state.stop("finalization_failed", final_answer=final)
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.promote_durable_memory(user_message, final)
         self.run_store.write_task_state(task_state)
         self.emit_run_finished(task_state, final, run_started_at)
-        self.emit_run_status(task_state, "failed", "Failed", detail="finalization_failed", started_at=run_started_wall, run_started_at=run_started_at)
+        self.emit_run_status(
+            task_state,
+            "failed",
+            "Failed",
+            detail="finalization_failed",
+            started_at=run_started_wall,
+            run_started_at=run_started_at,
+        )
         self.write_final_report(task_state)
         return final
 
     def write_final_report(self, task_state):
-        self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+        self.run_store.write_report(
+            task_state, self.redact_artifact(self.build_report(task_state))
+        )
 
     def emit_run_finished(self, task_state, final, run_started_at):
         self.emit_trace(
@@ -1386,7 +2020,9 @@ class Pico:
             },
         )
 
-    def finish_successful_run(self, task_state, user_message, final, run_started_wall, run_started_at):
+    def finish_successful_run(
+        self, task_state, user_message, final, run_started_wall, run_started_at
+    ):
         self.emit_run_status(
             task_state,
             "finalizing",
@@ -1397,7 +2033,9 @@ class Pico:
         self.record({"role": "assistant", "content": final, "created_at": now()})
         task_state.finish_success(final)
         self.promote_durable_memory(user_message, final)
-        checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
+        checkpoint = self.create_checkpoint(
+            task_state, user_message, trigger="run_finished"
+        )
         self.run_store.write_task_state(task_state)
         self.emit_checkpoint_created(task_state, checkpoint, "run_finished")
         self.emit_run_finished(task_state, final, run_started_at)
@@ -1411,7 +2049,16 @@ class Pico:
         self.write_final_report(task_state)
         return final
 
-    def stop_limited_run(self, task_state, user_message, attempts, max_attempts, tool_steps, run_started_wall, run_started_at):
+    def stop_limited_run(
+        self,
+        task_state,
+        user_message,
+        attempts,
+        max_attempts,
+        tool_steps,
+        run_started_wall,
+        run_started_at,
+    ):
         if attempts >= max_attempts and tool_steps < self.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
             task_state.stop_retry_limit(final)
@@ -1436,7 +2083,15 @@ class Pico:
         self.write_final_report(task_state)
         return final
 
-    def stop_repeated_no_progress_run(self, task_state, user_message, tool_name, tool_args, run_started_wall, run_started_at):
+    def stop_repeated_no_progress_run(
+        self,
+        task_state,
+        user_message,
+        tool_name,
+        tool_args,
+        run_started_wall,
+        run_started_at,
+    ):
         final = (
             "Stopped after the same no-progress tool action repeated "
             f"{REPEATED_NO_PROGRESS_LIMIT} times: {tool_name}."
@@ -1454,8 +2109,12 @@ class Pico:
                 "limit": REPEATED_NO_PROGRESS_LIMIT,
             },
         )
-        checkpoint = self.create_checkpoint(task_state, user_message, trigger=STOP_REASON_REPEATED_NO_PROGRESS)
-        self.emit_checkpoint_created(task_state, checkpoint, STOP_REASON_REPEATED_NO_PROGRESS)
+        checkpoint = self.create_checkpoint(
+            task_state, user_message, trigger=STOP_REASON_REPEATED_NO_PROGRESS
+        )
+        self.emit_checkpoint_created(
+            task_state, checkpoint, STOP_REASON_REPEATED_NO_PROGRESS
+        )
         self.emit_run_finished(task_state, final, run_started_at)
         self.emit_run_status(
             task_state,
@@ -1510,7 +2169,9 @@ class Pico:
             message = f"error: invalid arguments for {name}: {exc}"
             if example:
                 message += f"\nexample: {example}"
-            security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            security_event_type = (
+                "path_escape" if "path escapes workspace" in str(exc) else ""
+            )
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "invalid_arguments",
@@ -1541,7 +2202,9 @@ class Pico:
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "approval_denied",
-                "security_event_type": "read_only_block" if self.read_only else "approval_denied",
+                "security_event_type": "read_only_block"
+                if self.read_only
+                else "approval_denied",
                 "risk_level": "high",
                 "read_only": False,
                 "affected_paths": [],
@@ -1553,8 +2216,12 @@ class Pico:
         after_snapshot = before_snapshot
         try:
             result = clip(tool["run"](args))
-            after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
-            affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
+            after_snapshot = (
+                self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
+            )
+            affected_paths, diff_summary = self.diff_workspace_snapshots(
+                before_snapshot, after_snapshot
+            )
             workspace_changed = bool(affected_paths)
             tool_status = "ok"
             tool_error_code = ""
@@ -1580,17 +2247,27 @@ class Pico:
                 "diff_summary": diff_summary,
             }
             if workspace_changed:
-                self._last_tool_result_metadata["code_index_refresh"] = self.code_index.refresh(affected_paths)
+                self._last_tool_result_metadata["code_index_refresh"] = (
+                    self.code_index.refresh(affected_paths)
+                )
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return result
         except Exception as exc:
-            after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
-            affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
+            after_snapshot = (
+                self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
+            )
+            affected_paths, diff_summary = self.diff_workspace_snapshots(
+                before_snapshot, after_snapshot
+            )
             workspace_changed = bool(affected_paths)
-            security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            security_event_type = (
+                "path_escape" if "path escapes workspace" in str(exc) else ""
+            )
             self._last_tool_result_metadata = {
                 "tool_status": "partial_success" if workspace_changed else "error",
-                "tool_error_code": "tool_partial_success" if workspace_changed else "tool_failed",
+                "tool_error_code": "tool_partial_success"
+                if workspace_changed
+                else "tool_failed",
                 "security_event_type": security_event_type,
                 "risk_level": "high" if tool["risky"] else "low",
                 "read_only": not tool["risky"],
@@ -1653,6 +2330,9 @@ class Pico:
             "read_guard_notices": set(),
             "action_readiness": "unknown",
             "action_readiness_transitions": [{"state": "unknown", "tool_step": 0}],
+            "edit_decision_count": 0,
+            "invalid_edit_decision_count": 0,
+            "evidence_request_count": 0,
         }
 
     @staticmethod
@@ -1671,7 +2351,9 @@ class Pico:
         if name in task_policy.ACTION_TOOLS:
             if state["first_action_step"] is None:
                 state["first_action_step"] = tool_step
-                state["exploration_steps_before_first_action"] = state["consecutive_exploration"]
+                state["exploration_steps_before_first_action"] = state[
+                    "consecutive_exploration"
+                ]
             state["consecutive_exploration"] = 0
             state["seen_reads"].clear()
             state["seen_searches"].clear()
@@ -1708,9 +2390,23 @@ class Pico:
         if name not in task_policy.EXPLORATION_TOOLS:
             return False
         state["consecutive_exploration"] += 1
-        if status == "ok" and self.requires_workspace_change:
+        if (
+            status == "ok"
+            and self.requires_workspace_change
+            and not state["workspace_change_count"]
+        ):
             if name == "read_file" and task_policy.is_source_path(args.get("path")):
-                self.set_action_readiness(state, "action_expected", tool_step)
+                profile = getattr(self.model_client, "connection_profile", None)
+                requires_two_source_reads = bool(
+                    getattr(self.model_client, "supports_native_tools", False)
+                    and profile is not None
+                    and not getattr(profile, "supports_tool_choice", False)
+                )
+                if (
+                    not requires_two_source_reads
+                    or len(self.current_run_source_reads) >= 2
+                ):
+                    self.set_action_readiness(state, "action_expected", tool_step)
             elif state["action_readiness"] == "unknown":
                 self.set_action_readiness(state, "evidence_gathering", tool_step)
         redundant = False
@@ -1741,7 +2437,9 @@ class Pico:
             return "new", None
         path = task_policy.canonical_path((args or {}).get("path"))
         current_freshness = memorylib.file_freshness(path, self.root)
-        prompt_entries = (self.last_prompt_metadata.get("inspected_evidence") or {}).get("entries", [])
+        prompt_entries = (
+            self.last_prompt_metadata.get("inspected_evidence") or {}
+        ).get("entries", [])
         candidates = [
             entry
             for entry in prompt_entries
@@ -1752,7 +2450,9 @@ class Pico:
         if not candidates:
             return "new", None
         visible = any(bool(entry.get("visible")) for entry in candidates)
-        return ("avoidable_repeated_read" if visible else "evidence_evicted_reread"), candidates[-1]
+        return (
+            "avoidable_repeated_read" if visible else "evidence_evicted_reread"
+        ), candidates[-1]
 
     def read_guard_notice(self, args):
         classification, entry = self.assess_read_evidence(args)
@@ -1795,7 +2495,9 @@ class Pico:
             "hint": self.compact_evidence_hint(result),
         }
         entry["marker"] = hashlib.sha256(
-            f"{entry['path']}:{entry['start']}:{entry['end']}:{entry['freshness']}".encode("utf-8")
+            f"{entry['path']}:{entry['start']}:{entry['end']}:{entry['freshness']}".encode(
+                "utf-8"
+            )
         ).hexdigest()[:12]
         ledger = self.current_planning["evidence_ledger"]
         ledger[:] = [
@@ -1876,11 +2578,21 @@ class Pico:
 
     @staticmethod
     def new_task_id():
-        return "task_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        return (
+            "task_"
+            + datetime.now().strftime("%Y%m%d-%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:6]
+        )
 
     @staticmethod
     def new_run_id():
-        return "run_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        return (
+            "run_"
+            + datetime.now().strftime("%Y%m%d-%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:6]
+        )
 
     def cancellation_requested(self, task_state):
         checker = getattr(self, "cancel_checker", None)
@@ -1912,10 +2624,16 @@ class Pico:
         self.write_final_report(task_state)
         return final
 
-    def stop_model_error_run(self, task_state, exc, model_started_at, run_started_wall, run_started_at):
+    def stop_model_error_run(
+        self, task_state, exc, model_started_at, run_started_wall, run_started_at
+    ):
         error_message = self.redact_text(str(exc))
         error_type = exc.__class__.__name__
-        final = f"Model error: {error_message}" if error_message else f"Model error: {error_type}"
+        final = (
+            f"Model error: {error_message}"
+            if error_message
+            else f"Model error: {error_type}"
+        )
         self.last_model_error = {
             "error_type": error_type,
             "message": error_message,
@@ -1947,7 +2665,9 @@ class Pico:
     def validate_external_run_id(run_id):
         value = str(run_id or "").strip()
         if value in {"", ".", ".."} or RUN_ID_PATTERN.fullmatch(value) is None:
-            raise ValueError("invalid run_id: use only letters, numbers, underscore, dash, and dot")
+            raise ValueError(
+                "invalid run_id: use only letters, numbers, underscore, dash, and dot"
+            )
         return value
 
     def build_report(self, task_state):
@@ -1969,7 +2689,8 @@ class Pico:
             "planning": {
                 key: value
                 for key, value in self.current_planning.items()
-                if key not in {
+                if key
+                not in {
                     "seen_reads",
                     "seen_searches",
                     "seen_verifications",
@@ -2031,7 +2752,9 @@ class Pico:
         if self.approval_policy == "ask" and self.approval_handler is not None:
             return bool(self.approval_handler(name, args, self))
         try:
-            answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
+            answer = input(
+                f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] "
+            )
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}
@@ -2057,7 +2780,9 @@ class Pico:
         # 这里支持两种工具格式：
         # 1. <tool>...</tool> 里包 JSON，适合简短调用
         # 2. XML 风格属性/子标签，适合写文件这类多行内容
-        if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
+        if "<tool>" in raw and (
+            "<final>" not in raw or raw.find("<tool>") < raw.find("<final>")
+        ):
             body = Pico.extract(raw, "tool")
             try:
                 payload = json.loads(body)
@@ -2073,7 +2798,9 @@ class Pico:
             elif not isinstance(args, dict):
                 return "retry", Pico.retry_notice()
             return "tool", payload
-        if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
+        if "<tool" in raw and (
+            "<final>" not in raw or raw.find("<tool") < raw.find("<final>")
+        ):
             payload = Pico.parse_xml_tool(raw)
             if payload is not None:
                 return "tool", payload
@@ -2085,7 +2812,9 @@ class Pico:
             return "retry", Pico.retry_notice("model returned an empty <final> answer")
         raw = raw.strip()
         if raw:
-            return "retry", Pico.retry_notice("model response is missing required <tool> or <final> tags")
+            return "retry", Pico.retry_notice(
+                "model response is missing required <tool> or <final> tags"
+            )
         return "retry", Pico.retry_notice("model returned an empty response")
 
     @staticmethod
@@ -2112,7 +2841,15 @@ class Pico:
 
         body = match.group("body")
         args = dict(attrs)
-        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
+        for key in (
+            "content",
+            "old_text",
+            "new_text",
+            "command",
+            "task",
+            "pattern",
+            "path",
+        ):
             if f"<{key}>" in body:
                 args[key] = Pico.extract_raw(body, key)
 
@@ -2126,8 +2863,12 @@ class Pico:
     @staticmethod
     def parse_attrs(text):
         attrs = {}
-        for match in re.finditer(r"""([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""", text):
-            attrs[match.group(1)] = match.group(2) if match.group(2) is not None else match.group(3)
+        for match in re.finditer(
+            r"""([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""", text
+        ):
+            attrs[match.group(1)] = (
+                match.group(2) if match.group(2) is not None else match.group(3)
+            )
         return attrs
 
     @staticmethod
@@ -2160,7 +2901,9 @@ class Pico:
         self.session["history"] = []
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
-        self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
+        self.memory = memorylib.LayeredMemory(
+            self.session["memory"], workspace_root=self.root
+        )
         self.session_store.save(self.session)
 
     def path(self, raw_path):
