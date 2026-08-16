@@ -287,6 +287,9 @@ def _run_memory_variant(mode):
         (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
         (workspace_root / "facts.txt").write_text("deploy key is red\n", encoding="utf-8")
         agent = _build_memory_experiment_agent(workspace_root, "deploy key is red", "facts.txt")
+        # Phase 3: 旧 Memory Ablation 实验验证的是 v1 记忆链路；显式关闭
+        # memory_v2，避免默认开启的 Memory 2.0 改变被测行为。
+        agent.feature_flags["memory_v2"] = False
         assert agent.ask("Read facts.txt and remember the key fact.") == "Done."
 
         if mode == "memory_off":
@@ -384,6 +387,8 @@ def _run_memory_task_variant(task, variant):
         (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
         _write_memory_task_files(workspace_root, task)
         agent = _build_memory_experiment_agent(workspace_root, task["fact"], task["filename"])
+        # Phase 3: 旧 Memory Ablation 实验验证 v1 链路（见 _run_memory_variant）。
+        agent.feature_flags["memory_v2"] = False
         assert agent.ask(_bootstrap_prompt(task)) == "Done."
         if variant == "memory_off":
             agent.feature_flags["memory"] = False
@@ -845,6 +850,8 @@ def run_real_memory_experiment(provider="gpt", repetitions=1):
                     (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
                     _write_memory_task_files(workspace_root, task)
                     agent = _build_real_agent(workspace_root, provider)
+                    # Phase 3: 旧 real Memory Ablation 验证 v1 链路。
+                    agent.feature_flags["memory_v2"] = False
                     agent.ask(f"Read {task['filename']} and remember the exact line. After you know it, reply with Done only.")
                     if variant == "memory_off":
                         agent.feature_flags["memory"] = False
