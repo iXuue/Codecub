@@ -2546,7 +2546,12 @@ def test_trace_and_report_redact_secret_env_values(tmp_path):
 
 
 def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
-    agent = build_agent(tmp_path, ["<final>Done.</final>"])
+    # 该测试验证旧 ContextManager 的 section 预算裁剪契约；显式走 legacy 路径。
+    agent = build_agent(
+        tmp_path,
+        ["<final>Done.</final>"],
+        feature_flags={"context_compiler": False},
+    )
     agent.memory.append_note(
         "alpha episodic note " + ("A" * 120),
         tags=("recall",),
@@ -3308,7 +3313,12 @@ def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
 
 
 def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
-    agent = build_agent(tmp_path, ["<final>Done.</final>"])
+    # 该测试验证旧 ContextManager 的 recent/older transcript 渲染契约；legacy 路径。
+    agent = build_agent(
+        tmp_path,
+        ["<final>Done.</final>"],
+        feature_flags={"context_compiler": False},
+    )
     old_text = "OLD-" + ("A" * 320)
     recent_text = "RECENT-" + ("B" * 320)
 
