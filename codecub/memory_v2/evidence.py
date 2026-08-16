@@ -496,7 +496,21 @@ def _line_range(args):
     return ""
 
 
+_CODE_SIGNAL_PATTERN = re.compile(
+    r"(?i)(^\s*\d+\s*:\s*(def|class|async def)\b|^\s*(def|class|async def)\b|"
+    r"DEFAULT_|_DEFAULT|[:=]\s*(True|False|None)|feature_flag|#\s*(fix|bug|note|todo))"
+)
+
+
 def _summarize_read_result(result_text, limit=160):
+    """Representative summary of a read result for evidence.
+
+    Prefers code-signal lines (definitions, DEFAULT_* constants, flag-like
+    assignments, comments) over the raw first lines — a read of the feature
+    flag region should yield a summary that actually mentions the flag
+    (found by Phase 3 Fast Validation Task C: naive first-3-lines captured
+    the env-allowlist tail instead of DEFAULT_FEATURE_FLAGS).
+    """
     lines = [
         line.strip() for line in str(result_text or "").splitlines() if line.strip()
     ]
@@ -506,5 +520,9 @@ def _summarize_read_result(result_text, limit=160):
         lines = lines[1:]
     if not lines:
         return "(empty)"
-    summary = " | ".join(lines[:3])
+    signals = [line for line in lines if _CODE_SIGNAL_PATTERN.search(line)]
+    if signals:
+        summary = " | ".join(signals[:3])
+    else:
+        summary = " | ".join(lines[:3])
     return _clip(summary, limit)

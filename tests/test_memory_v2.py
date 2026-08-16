@@ -414,6 +414,31 @@ def test_extraction_working_state_not_auto_promoted_wholesale(workspace):
     assert v2.durable_store.active_size() == 0
 
 
+def test_evidence_summary_prefers_code_signal_lines():
+    """Found by Fast Validation Task C: a read of the flags region must yield
+    a summary mentioning the flag, not the first (env-allowlist) lines."""
+    from codecub.memory_v2.evidence import _summarize_read_result
+
+    result = (
+        '55:     "TMP",\n'
+        '56:     "TEMP",\n'
+        '57:     "USER",\n'
+        '58: DEFAULT_FEATURE_FLAGS = {\n'
+        '59:     "memory": True,\n'
+        '60:     "memory_v2": True,\n'
+    )
+    summary = _summarize_read_result(result)
+    assert "DEFAULT_FEATURE_FLAGS" in summary
+    assert '"memory"' in summary or "memory" in summary
+    assert "TMP" not in summary
+
+
+def test_evidence_summary_falls_back_to_first_lines():
+    from codecub.memory_v2.evidence import _summarize_read_result
+
+    assert _summarize_read_result("plain line one\nplain line two\n") == "plain line one | plain line two"
+
+
 def test_extraction_generic_shell_success_not_promoted(workspace):
     """Spec §20: 瞬时 shell output（如 `dir`/`ls` 成功）不进 Durable。"""
     v2 = make_v2(workspace)
