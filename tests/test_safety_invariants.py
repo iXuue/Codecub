@@ -45,6 +45,19 @@ def test_symlink_path_traversal_is_rejected(tmp_path):
         (tmp_path / "linked.txt").symlink_to(outside)
     except OSError as exc:
         pytest.skip(f"symlink creation is not available in this environment: {exc}")
+    # Windows（尤其沙箱）可能创建了 symlink 但不按 symlink 语义解析，或把
+    # symlink 落盘成普通文件。此时无法演练“symlink 逃逸被拒绝”，属于平台
+    # 固有限制而非 runtime regression；先验证语义真正生效，否则明确跳过。
+    try:
+        resolved_target = (tmp_path / "linked.txt").resolve()
+    except OSError:
+        resolved_target = tmp_path / "linked.txt"
+    if str(resolved_target) != str(outside.resolve()):
+        pytest.skip(
+            "symlink resolution is not honored in this environment "
+            f"(linked.txt resolved to {resolved_target}); "
+            "symlink traversal cannot be exercised"
+        )
     agent = build_agent(tmp_path, [])
 
     result = agent.run_tool("read_file", {"path": "linked.txt"})

@@ -91,6 +91,20 @@ def test_interactive_emergency_cap_effective(tmp_path):
     assert any(event["event"] == "emergency_cap_reached" for event in trace)
 
 
+def test_production_emergency_cap_default_is_500(tmp_path):
+    """Phase 1.5: 生产默认 emergency cap 保持 500；注入的小 cap 只是测试手段。"""
+    from codecub.runtime import DEFAULT_INTERACTIVE_EMERGENCY_CAP
+
+    assert DEFAULT_INTERACTIVE_EMERGENCY_CAP == 500
+    agent = build_agent(tmp_path, [])
+    assert agent.emergency_cap == 500
+    # emergency cap 与 fixed step budget 是两个独立机制：
+    # 显式 max_steps 时 cap 不生效。
+    budgeted = build_agent(tmp_path, [], max_steps=6)
+    assert budgeted.effective_step_budget == 6
+    assert budgeted.emergency_cap == 500
+
+
 # ---------------------------------------------------------------------------
 # Long Progress
 # ---------------------------------------------------------------------------
@@ -113,6 +127,59 @@ def test_long_progress_runs_beyond_old_small_budget(tmp_path):
     assert report["tool_steps"] >= 50
     assert report["watchdog"]["state"] == WATCHDOG_STATE_NORMAL
     assert report["watchdog"]["stuck_suspected_count"] == 0
+
+
+def test_interactive_runtime_runs_past_old_80_step_default(tmp_path):
+    """Phase 1.5: 超过旧 Interactive 默认 80 步硬性验证。
+
+    110 个连续、互不相同的 source-file read（每步都是真实 progress signature），
+    走完整 runtime loop。硬性断言 tool_steps > 80，且不被任何 stuck / budget
+    机制终止。
+    """
+    total = 110
+    make_files(tmp_path, *["n%d.py" % i for i in range(total)])
+    outputs = [read_tool("n%d.py" % i) for i in range(total)]
+    outputs.append("<final>Past 80 steps.</final>")
+    agent = build_agent(tmp_path, outputs)
+
+    answer = agent.ask("Long-horizon task")
+
+    assert answer == "Past 80 steps."
+    report = json.loads(
+        agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8")
+    )
+    assert report["status"] == "completed"
+    assert report["tool_steps"] > 80
+    assert report["stop_reason"] not in (
+        "step_limit_reached",
+        "repeated_no_progress",
+        "stuck_confirmed",
+        "emergency_cap_reached",
+    )
+    assert report["runtime_mode"] == RUNTIME_MODE_INTERACTIVE
+    assert report["effective_step_budget"] is None
+    assert report["watchdog"]["state"] == WATCHDOG_STATE_NORMAL
+    assert report["watchdog"]["stuck_suspected_count"] == 0
+    assert report["watchdog"]["stuck_confirmed_count"] == 0
+
+
+def test_watchdog_stays_normal_across_120_distinct_progress_signals():
+    """Phase 1.5: watchdog 在 120+ 个互不相同的 progress 信号下保持 NORMAL。"""
+    watchdog = ProgressWatchdog()
+    decision = None
+    for i in range(1, 121):
+        decision = watchdog.record_tool_event(
+            "read_file",
+            {"path": "s%d.py" % i, "start": 1, "end": 5},
+            {"tool_status": "ok"},
+            "content",
+            i,
+        )
+    assert decision.state == WATCHDOG_STATE_NORMAL
+    assert watchdog.stuck_suspected_count == 0
+    assert watchdog.stuck_confirmed_count == 0
+    assert watchdog.no_progress_score == 0
+    assert watchdog.last_progress_step == 120
 
 
 # ---------------------------------------------------------------------------
