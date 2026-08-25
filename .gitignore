@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+.uv-cache/
+uv.lock
+
+# Packaging
+*.egg-info/
+build/
+dist/
+!desktop/build/
+!desktop/build/icon.ico
+!desktop/build/icon-preview.png
+!desktop/build/icon-*.png
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Desktop app local dependencies and build output
+desktop/node_modules/
+desktop/dist-electron/
+desktop/dist-renderer/
+desktop/.electron-cache/
+desktop/.tmp/
+desktop/.package-preserve/
+desktop/release/
+desktop/resources/backend/
+
+# Temporary files
+.mini-coding-agent
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Local scratch space
+.env
+.env.*
+!.env.example
+tmp/
+.worktrees/
+.workbuddy/
+.pico/
+.codecub/sessions/
+.codecub/runs/
+.codecub/memory/
+.codecub/cache/
+.codecub/index/
+.codecub/usage/
+.codecub/logs/
+artifacts/
+readme_intro_locked/
+
+# Local docs not intended for publication
+docs/
+
+# OS files
+.DS_Store
+
+# Packaging metadata
+pico.egg-info/
+codecub.egg-info/

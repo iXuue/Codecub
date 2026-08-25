@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codecub"
+version = "0.1.0"
+description = "CodeCub local desktop-first coding agent backend"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+tokenizers = [
+  "tiktoken>=0.8.0",
+]
+redis = [
+  "redis>=5",
+]
+otel = [
+  "opentelemetry-api>=1.27",
+  "opentelemetry-sdk>=1.27",
+  "opentelemetry-exporter-otlp-proto-http>=1.27",
+]
+
+[project.scripts]
+codecub = "codecub.cli:main"
+
+[dependency-groups]
+dev = [
+  "pyinstaller>=6.20.0",
+  "pytest>=8.3.5",
+  "ruff>=0.4.4",
+]
+
+[tool.setuptools]
+packages = ["codecub"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow and not benchmark'"
+testpaths = ["tests"]
+norecursedirs = ["artifacts"]
+markers = [
+  "slow: long-running tests excluded from the default pytest run",
+  "benchmark: benchmark and metrics tests excluded from the default pytest run",
+]
+
+[tool.ruff]
+extend-exclude = [".workbuddy"]
