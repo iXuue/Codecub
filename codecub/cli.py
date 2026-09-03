@@ -16,8 +16,14 @@ from pathlib import Path
 
 from .app_runner import run_app_mode
 from .connections import resolve_effective_connection_profile
-from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
-from .runtime import Pico, SessionStore
+from .models import (
+    AnthropicCompatibleModelClient,
+    OllamaModelClient,
+    OpenAICompatibleModelClient,
+)
+from .model_gateway import GatewayPolicy, ModelGateway
+from .runtime import EXECUTION_MODE_MULTI_AGENT, EXECUTION_MODE_SINGLE, Pico, SessionStore
+from .spine import LegacyTurnRunner, Origin, Source, Spine, TurnRequest
 from .workspace import WorkspaceContext, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
@@ -142,7 +148,12 @@ def _strip_unquoted_comment(value):
         if char == '"' and not in_single:
             in_double = not in_double
             continue
-        if char == "#" and not in_single and not in_double and (index == 0 or value[index - 1].isspace()):
+        if (
+            char == "#"
+            and not in_single
+            and not in_double
+            and (index == 0 or value[index - 1].isspace())
+        ):
             return value[:index].rstrip()
     return value.strip()
 
@@ -243,9 +254,7 @@ def _configured_secret_names(args):
         extra_names = os.environ.get(LEGACY_SECRET_ENV_NAMES_VAR, "")
     if extra_names.strip():
         configured_secret_names.update(
-            item.strip().upper()
-            for item in extra_names.split(",")
-            if item.strip()
+            item.strip().upper() for item in extra_names.split(",") if item.strip()
         )
     return sorted(configured_secret_names)
 
@@ -263,46 +272,81 @@ def _decode_connection_profile(value):
     if not isinstance(profile, dict) or profile.get("schema_version") != 1:
         raise ValueError("unsupported connection profile configuration")
     allowed = {
-        "schema_version", "connection_profile_id", "connection_type", "api_operator", "model_vendor",
-        "protocol", "response_schema", "credential_id", "endpoint_verification_status",
+        "schema_version",
+        "connection_profile_id",
+        "connection_type",
+        "api_operator",
+        "model_vendor",
+        "protocol",
+        "response_schema",
+        "credential_id",
+        "endpoint_verification_status",
         "usage_schema_verification_status",
     }
-    return {key: value for key, value in profile.items() if key in allowed and isinstance(value, (str, int))}
+    return {
+        key: value
+        for key, value in profile.items()
+        if key in allowed and isinstance(value, (str, int))
+    }
 
 
 def _build_model_client(args):
     provider = _effective_provider(args)
-    supplied_profile = _decode_connection_profile(getattr(args, "connection_profile_b64", ""))
+    supplied_profile = _decode_connection_profile(
+        getattr(args, "connection_profile_b64", "")
+    )
     # CLI 只负责把 provider 选择翻译成具体 client。
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
     if provider in OPENAI_COMPATIBLE_PROVIDER_CONFIG:
         config = OPENAI_COMPATIBLE_PROVIDER_CONFIG[provider]
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or os.environ.get(config["base_url_env"]) or config["default_base_url"]
+        base_url = (
+            getattr(args, "base_url", None)
+            or os.environ.get(config["base_url_env"])
+            or config["default_base_url"]
+        )
         api_key = os.environ.get(config["api_key_env"], "")
         return OpenAICompatibleModelClient(
             model=model,
             base_url=base_url,
             api_key=api_key,
             temperature=args.temperature,
-            timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
-            connection_profile=resolve_effective_connection_profile(base_url, "openai-chat", supplied_profile),
+            timeout=getattr(
+                args, "openai_timeout", getattr(args, "ollama_timeout", 300)
+            ),
+            connection_profile=resolve_effective_connection_profile(
+                base_url, "openai-chat", supplied_profile
+            ),
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or os.environ.get("ANTHROPIC_API_BASE") or DEFAULT_ANTHROPIC_BASE_URL
-        api_key = _first_env("ANTHROPIC_API_KEY", "RIGHT_CODES_API_KEY", "OPENAI_API_KEY")
+        base_url = (
+            getattr(args, "base_url", None)
+            or os.environ.get("ANTHROPIC_API_BASE")
+            or DEFAULT_ANTHROPIC_BASE_URL
+        )
+        api_key = _first_env(
+            "ANTHROPIC_API_KEY", "RIGHT_CODES_API_KEY", "OPENAI_API_KEY"
+        )
         return AnthropicCompatibleModelClient(
             model=model,
             base_url=base_url,
             api_key=api_key,
             temperature=args.temperature,
-            timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
-            connection_profile=resolve_effective_connection_profile(base_url, "anthropic-messages", supplied_profile),
+            timeout=getattr(
+                args, "openai_timeout", getattr(args, "ollama_timeout", 300)
+            ),
+            connection_profile=resolve_effective_connection_profile(
+                base_url, "anthropic-messages", supplied_profile
+            ),
         )
 
     model = _effective_model(args, provider)
-    host = getattr(args, "host", None) or os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST
+    host = (
+        getattr(args, "host", None)
+        or os.environ.get("OLLAMA_HOST")
+        or DEFAULT_OLLAMA_HOST
+    )
     return OllamaModelClient(
         model=model,
         host=host,
@@ -374,7 +418,11 @@ class CliActivityRenderer:
         del runtime, task_state
         if event_name == "run_status":
             phase = str(payload.get("phase", ""))
-            label = CLI_STATUS_LABELS.get(phase) or str(payload.get("label", "")) or "Working"
+            label = (
+                CLI_STATUS_LABELS.get(phase)
+                or str(payload.get("label", ""))
+                or "Working"
+            )
             detail = str(payload.get("detail", "")).strip()
             text = f"{label}: {detail}" if detail else label
             self.status(text)
@@ -387,7 +435,9 @@ class CliActivityRenderer:
             diff_summary = payload.get("diff_summary", [])
             if payload.get("workspace_changed") or diff_summary:
                 count = len(diff_summary) if isinstance(diff_summary, list) else 0
-                self.status("Checked file changes" + (f": {count} file(s)" if count else ""))
+                self.status(
+                    "Checked file changes" + (f": {count} file(s)" if count else "")
+                )
             return
         if event_name == "assistant_delta":
             text = str(payload.get("text", ""))
@@ -447,27 +497,59 @@ def build_agent(args):
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.codecub/sessions")
     model = _build_model_client(args)
+    fallback_name = os.environ.get("CODECUB_FALLBACK_MODEL", "").strip()
+    fallback = None
+    if fallback_name:
+        original = args.model
+        args.model = fallback_name
+        try:
+            fallback = _build_model_client(args)
+        finally:
+            args.model = original
+    gateway = ModelGateway(
+        model,
+        GatewayPolicy(
+            max_concurrency=int(os.environ.get("CODECUB_MODEL_MAX_CONCURRENCY", "2")),
+            min_interval_seconds=float(
+                os.environ.get("CODECUB_MODEL_MIN_INTERVAL_SECONDS", "0")
+            ),
+            max_retries=int(os.environ.get("CODECUB_MODEL_MAX_RETRIES", "2")),
+            retry_base_seconds=float(
+                os.environ.get("CODECUB_MODEL_RETRY_BASE_SECONDS", "1")
+            ),
+        ),
+        fallback=fallback,
+    )
+    execution_mode = (
+        EXECUTION_MODE_MULTI_AGENT
+        if getattr(args, "multi_agent", False)
+        else EXECUTION_MODE_SINGLE
+    )
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
     if session_id:
         return Pico.from_session(
             model_client=model,
+            model_gateway=gateway,
             workspace=workspace,
             session_store=store,
             session_id=session_id,
             approval_policy=args.approval,
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
+            execution_mode=execution_mode,
             secret_env_names=configured_secret_names,
         )
     return Pico(
         model_client=model,
+        model_gateway=gateway,
         workspace=workspace,
         session_store=store,
         approval_policy=args.approval,
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
+        execution_mode=execution_mode,
         secret_env_names=configured_secret_names,
     )
 
@@ -479,7 +561,11 @@ def build_arg_parser():
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    parser.add_argument("--cwd-b64", default="", help="UTF-8 base64 encoded workspace directory for desktop-safe launch.")
+    parser.add_argument(
+        "--cwd-b64",
+        default="",
+        help="UTF-8 base64 encoded workspace directory for desktop-safe launch.",
+    )
     parser.add_argument(
         "--provider",
         choices=MODEL_PROVIDERS,
@@ -491,13 +577,40 @@ def build_arg_parser():
         default=None,
         help="Model name override. Provider-specific .env variables are used when set.",
     )
-    parser.add_argument("--host", default=None, help="Ollama server URL. Defaults to OLLAMA_HOST from .env, then localhost.")
-    parser.add_argument("--base-url", default=None, help="Provider API base URL for hosted providers.")
-    parser.add_argument("--connection-profile-b64", default="", help="Non-secret desktop connection identity JSON encoded as UTF-8 base64.")
-    parser.add_argument("--ollama-timeout", type=int, default=300, help="Ollama request timeout in seconds.")
-    parser.add_argument("--openai-timeout", type=int, default=300, help="OpenAI-compatible request timeout in seconds.")
-    parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
-    parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Ollama server URL. Defaults to OLLAMA_HOST from .env, then localhost.",
+    )
+    parser.add_argument(
+        "--base-url", default=None, help="Provider API base URL for hosted providers."
+    )
+    parser.add_argument(
+        "--connection-profile-b64",
+        default="",
+        help="Non-secret desktop connection identity JSON encoded as UTF-8 base64.",
+    )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=300,
+        help="Ollama request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--openai-timeout",
+        type=int,
+        default=300,
+        help="OpenAI-compatible request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--resume", default=None, help="Session id to resume or 'latest'."
+    )
+    parser.add_argument(
+        "--approval",
+        choices=("ask", "auto", "never"),
+        default="ask",
+        help="Approval policy for risky tools.",
+    )
     parser.add_argument(
         "--secret-env-name",
         dest="secret_env_names",
@@ -511,9 +624,26 @@ def build_arg_parser():
         default=None,
         help="Explicit step budget per request. Interactive mode has no fixed budget unless this is set; experiments always use the task step budget.",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum model output tokens per step.")
-    parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
-    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=1024,
+        help="Maximum model output tokens per step.",
+    )
+    parser.add_argument(
+        "--multi-agent",
+        action="store_true",
+        help="Expose bounded Research/Implement/Review multi-agent tools. Defaults to single-agent mode.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.2,
+        help="Sampling temperature sent to Ollama.",
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama."
+    )
     parser.add_argument(
         "--app-mode",
         action="store_true",
@@ -536,9 +666,31 @@ def main(argv=None):
     agent = build_agent(args)
     activity = CliActivityRenderer()
     agent.event_handler = activity.handle
+    spine = Spine(LegacyTurnRunner(lambda _request: agent))
 
-    model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
-    host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
+    def ask_through_spine(message):
+        request = TurnRequest(
+            message=message,
+            session_id=str(agent.session.get("id", "")),
+            conversation_id=f"cli:{agent.session.get('id', '')}",
+            origin=Origin.USER,
+            source=Source(channel="cli"),
+        )
+        outcome = spine.submit(request).result()
+        if outcome.status.value == "FAILED":
+            raise RuntimeError(outcome.error)
+        return outcome.answer
+
+    model = getattr(
+        agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL)
+    )
+    host = getattr(
+        agent.model_client,
+        "host",
+        getattr(
+            agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)
+        ),
+    )
     print(build_welcome(agent, model=model, host=host))
 
     if args.prompt:
@@ -547,7 +699,7 @@ def main(argv=None):
         if prompt:
             activity.begin(prompt)
             try:
-                answer = agent.ask(prompt)
+                answer = ask_through_spine(prompt)
                 if activity.delta_seen:
                     activity.finish()
                 else:
@@ -577,7 +729,7 @@ def main(argv=None):
             print(HELP_DETAILS)
             continue
         if user_input == "/memory recall" or user_input.startswith("/memory recall "):
-            query = user_input[len("/memory recall"):].strip()
+            query = user_input[len("/memory recall") :].strip()
             if not query:
                 print("usage: /memory recall <query>")
                 continue
@@ -596,7 +748,7 @@ def main(argv=None):
 
         activity.begin(user_input)
         try:
-            answer = agent.ask(user_input)
+            answer = ask_through_spine(user_input)
             if activity.delta_seen:
                 activity.finish()
             else:

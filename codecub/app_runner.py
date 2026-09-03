@@ -2,10 +2,12 @@ import itertools
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 from .app_protocol import encode_event, make_event, parse_command_line
 from .legacy_import import detect_legacy_pico, import_legacy_pico_sessions
+from .spine import ApprovalBroker
 
 HEARTBEAT_INTERVAL_SECONDS = 10
 
@@ -73,11 +75,13 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
     output_lock = threading.Lock()
     pending_lock = threading.Lock()
     pending_approvals = {}
+    approval_broker = ApprovalBroker()
     approval_counter = itertools.count(1)
     active_run = {
         "run_id": "",
         "thread": None,
         "cancel_requested": False,
+        "cancelling": False,
         "last_status": {},
         "last_status_time": 0.0,
         "heartbeat_stop": None,
@@ -85,6 +89,9 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
     }
     canceled_run_ids = set()
     delta_seen_by_run = set()
+    scheduling_lock = threading.Lock()
+    pending_turns = deque()
+    injection_mailbox = deque()
 
     def emit(event_type, run_id="", payload=None):
         with output_lock:
@@ -139,11 +146,15 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 request.approved = False
                 request.reason = reason
                 request.event.set()
+                approval_broker.resolve(request.approval_id, False, run_id=request.run_id)
 
     def approval_handler(name, approval_args, runtime):
         run_id = active_run.get("run_id", "")
         approval_id = f"approval-{next(approval_counter)}"
         request = ApprovalRequest(approval_id, run_id, name, approval_args)
+        interaction = approval_broker.request(
+            "approval", run_id, {"tool_name": name, "args": dict(approval_args or {})}, approval_id
+        )
         with pending_lock:
             pending_approvals[approval_id] = request
         emit(
@@ -168,7 +179,7 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 "risk_level": "high",
             },
         )
-        request.event.wait()
+        request.approved = bool(approval_broker.wait(interaction))
         decision = "approved" if request.approved else "rejected"
         emit(
             "approval_resolved",
@@ -220,13 +231,28 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
         del runtime
         run_id = getattr(task_state, "run_id", "")
         if run_id and run_id in canceled_run_ids:
+            if not active_run.get("cancelling"):
+                active_run["cancelling"] = True
+                emit("run_status", run_id=run_id, payload={"phase": "cancelling", "label": "Cancelling"})
             return True
         active_run_id = active_run.get("run_id", "")
-        return bool(active_run.get("cancel_requested") and (not active_run_id or active_run_id == run_id))
+        requested = bool(active_run.get("cancel_requested") and (not active_run_id or active_run_id == run_id))
+        if requested and not active_run.get("cancelling"):
+            active_run["cancelling"] = True
+            emit("run_status", run_id=run_id, payload={"phase": "cancelling", "label": "Cancelling"})
+        return requested
 
     agent.approval_handler = approval_handler
     agent.event_handler = event_handler
     agent.cancel_checker = cancel_checker
+
+    def drain_injections():
+        with scheduling_lock:
+            items = [message for _run_id, message in injection_mailbox]
+            injection_mailbox.clear()
+        return items
+
+    agent.injection_provider = drain_injections
 
     emit(
         "session_started",
@@ -257,6 +283,17 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
             answer = agent.ask(message, run_id=run_id)
         except Exception as exc:
             if run_id in canceled_run_ids:
+                emit(
+                    "run_status",
+                    run_id=run_id,
+                    payload={"phase": "canceled", "label": "Canceled"},
+                )
+                emit(
+                    "run_canceled",
+                    run_id=run_id,
+                    payload={"reason": "user_requested", **_run_artifact_payload(agent)},
+                )
+                finish_run(run_id)
                 return
             payload = {
                 "error_type": exc.__class__.__name__,
@@ -269,11 +306,23 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 payload={"phase": "failed", "label": "Failed", "detail": str(exc)},
             )
             emit("run_failed", run_id=run_id, payload=payload)
+            finish_run(run_id)
             return
         finally:
             stop_heartbeat()
 
         if run_id in canceled_run_ids or active_run.get("cancel_requested"):
+            emit(
+                "run_status",
+                run_id=run_id,
+                payload={"phase": "canceled", "label": "Canceled"},
+            )
+            emit(
+                "run_canceled",
+                run_id=run_id,
+                payload={"reason": "user_requested", **_run_artifact_payload(agent)},
+            )
+            finish_run(run_id)
             return
 
         task_state = getattr(agent, "current_task_state", None)
@@ -285,12 +334,7 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 **_run_artifact_payload(agent),
             }
             emit("run_failed", run_id=run_id, payload=payload)
-            if active_run.get("run_id") == run_id:
-                active_run["run_id"] = ""
-                active_run["thread"] = None
-                active_run["cancel_requested"] = False
-                active_run["last_status"] = {}
-                active_run["last_status_time"] = 0.0
+            finish_run(run_id)
             return
 
         if run_id not in delta_seen_by_run:
@@ -298,12 +342,38 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
         emit("assistant_message", run_id=run_id, payload={"text": answer})
         emit("run_status", run_id=run_id, payload={"phase": "completed", "label": "Completed"})
         emit("run_completed", run_id=run_id, payload={"final": answer, **_run_artifact_payload(agent)})
-        if active_run.get("run_id") == run_id:
+        finish_run(run_id)
+
+    def begin_run(run_id, message):
+        delta_seen_by_run.discard(run_id)
+        active_run["run_id"] = run_id
+        active_run["cancel_requested"] = False
+        active_run["cancelling"] = False
+        active_run["last_status"] = {"phase": "received", "label": "Task received", "detail": message}
+        active_run["last_status_time"] = time.monotonic()
+        emit("user_message_received", run_id=run_id, payload={"message": message})
+        start_heartbeat(run_id)
+        thread = threading.Thread(target=run_worker, args=(run_id, message), daemon=True)
+        active_run["thread"] = thread
+        thread.start()
+
+    def finish_run(run_id):
+        next_turn = None
+        with scheduling_lock:
+            if active_run.get("run_id") != run_id:
+                return
+            while injection_mailbox:
+                pending_turns.appendleft(injection_mailbox.pop())
             active_run["run_id"] = ""
             active_run["thread"] = None
             active_run["cancel_requested"] = False
+            active_run["cancelling"] = False
             active_run["last_status"] = {}
             active_run["last_status_time"] = 0.0
+            if pending_turns:
+                next_turn = pending_turns.popleft()
+        if next_turn is not None:
+            begin_run(*next_turn)
 
     def resolve_approval(command):
         approval_id = command.get("approval_id", "")
@@ -337,6 +407,7 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
         request.approved = command["type"] == "approve_operation"
         request.reason = command.get("reason", "")
         request.event.set()
+        approval_broker.resolve(approval_id, request.approved, run_id=run_id)
 
     for raw_line in stdin:
         if not str(raw_line).strip():
@@ -368,8 +439,14 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
                 canceled_run_ids.add(run_id)
             active_run["cancel_requested"] = True
             reject_pending_for_run(run_id, "user_requested")
-            emit("run_status", run_id=run_id, payload={"phase": "canceled", "label": "Canceled"})
-            emit("run_canceled", run_id=run_id, payload={"reason": "user_requested", **_run_artifact_payload(agent)})
+            emit(
+                "run_status",
+                run_id=run_id,
+                payload={"phase": "cancel_requested", "label": "Cancel requested"},
+            )
+            if active_run.get("thread") is None:
+                emit("run_status", run_id=run_id, payload={"phase": "canceled", "label": "Canceled"})
+                emit("run_canceled", run_id=run_id, payload={"reason": "user_requested", **_run_artifact_payload(agent)})
             continue
 
         if command_type in {"approve_operation", "reject_operation"}:
@@ -393,28 +470,47 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
 
         if command_type == "send_message":
             current_thread = active_run.get("thread")
-            if current_thread is not None and current_thread.is_alive():
-                emit(
-                    "run_failed",
-                    run_id=active_run.get("run_id", ""),
-                    payload={
-                        "error_type": "RuntimeError",
-                        "message": "another run is already active",
-                    },
-                )
+            if current_thread is not None:
+                run_id = command.get("run_id") or _new_run_id()
+                message = command["message"]
+                policy = command.get("busy_policy", "APPEND")
+                if not current_thread.is_alive():
+                    # The run has returned but its worker has not yet executed
+                    # finish_run().  Keep scheduling ownership with that
+                    # worker; an INJECT can no longer cross a live boundary.
+                    with scheduling_lock:
+                        if policy == "INTERRUPT":
+                            pending_turns.appendleft((run_id, message))
+                        else:
+                            pending_turns.append((run_id, message))
+                    emit(
+                        "run_status",
+                        run_id=run_id,
+                        payload={"phase": "queued", "label": "Queued", "fallback": policy == "INJECT"},
+                    )
+                    continue
+                if policy == "INJECT":
+                    with scheduling_lock:
+                        injection_mailbox.append((run_id, message))
+                    emit("run_status", run_id=active_run.get("run_id", ""), payload={"phase": "injected", "label": "Injected", "detail": message})
+                    continue
+                with scheduling_lock:
+                    if policy == "INTERRUPT":
+                        pending_turns.appendleft((run_id, message))
+                    else:
+                        pending_turns.append((run_id, message))
+                if policy == "INTERRUPT":
+                    active_id = active_run.get("run_id", "")
+                    canceled_run_ids.add(active_id)
+                    active_run["cancel_requested"] = True
+                    reject_pending_for_run(active_id, "interrupted")
+                    emit("run_status", run_id=active_id, payload={"phase": "cancel_requested", "label": "Interrupt requested"})
+                else:
+                    emit("run_status", run_id=run_id, payload={"phase": "queued", "label": "Queued"})
                 continue
             run_id = command.get("run_id") or _new_run_id()
             message = command["message"]
-            delta_seen_by_run.discard(run_id)
-            active_run["run_id"] = run_id
-            active_run["cancel_requested"] = False
-            active_run["last_status"] = {"phase": "received", "label": "Task received", "detail": message}
-            active_run["last_status_time"] = time.monotonic()
-            emit("user_message_received", run_id=run_id, payload={"message": message})
-            start_heartbeat(run_id)
-            thread = threading.Thread(target=run_worker, args=(run_id, message), daemon=True)
-            active_run["thread"] = thread
-            thread.start()
+            begin_run(run_id, message)
             continue
 
     thread = active_run.get("thread")

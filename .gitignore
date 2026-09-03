@@ -30,6 +30,7 @@ desktop/node_modules/
 desktop/dist-electron/
 desktop/dist-renderer/
 desktop/.electron-cache/
+desktop/.tmp/
 desktop/.package-preserve/
 desktop/release/
 desktop/resources/backend/
@@ -48,11 +49,14 @@ desktop/resources/backend/
 !.env.example
 tmp/
 .worktrees/
+.workbuddy/
 .pico/
 .codecub/sessions/
 .codecub/runs/
 .codecub/memory/
 .codecub/cache/
+.codecub/index/
+.codecub/usage/
 .codecub/logs/
 artifacts/
 readme_intro_locked/

@@ -6,6 +6,8 @@ session.json 负责保存“可恢复的会话状态”；RunStore 负责保存�
 
 import json
 import tempfile
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -16,6 +18,8 @@ def _run_id(value):
 
 
 class RunStore:
+    _side_effect_locks = {}
+    _side_effect_locks_guard = threading.Lock()
     def __init__(self, root):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -88,6 +92,81 @@ class RunStore:
             if line.strip():
                 records.append(json.loads(line))
         return records
+
+    @classmethod
+    def _side_effect_lock(cls, run_id):
+        key = str(_run_id(run_id))
+        with cls._side_effect_locks_guard:
+            return cls._side_effect_locks.setdefault(key, threading.Lock())
+
+    @staticmethod
+    def _side_effect_timestamp():
+        return datetime.now(timezone.utc).isoformat()
+
+    def _load_task_state_payload(self, task_state):
+        path = self.task_state_path(task_state)
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return task_state.to_dict()
+
+    def claim_side_effect_operation(self, task_state, operation_key, tool_name, args_digest):
+        """Atomically claim one run-scoped logical side effect.
+
+        A lingering claimed record is intentionally not replayed: after a crash
+        we cannot prove whether the downstream side effect committed.
+        """
+        key = str(operation_key or "").strip()
+        if not key:
+            raise ValueError("operation_key must not be empty")
+        with self._side_effect_lock(task_state.run_id):
+            payload = self._load_task_state_payload(task_state)
+            ledger = dict(payload.get("side_effect_operations", {}) or {})
+            previous = ledger.get(key)
+            if previous is not None:
+                same_identity = (
+                    previous.get("tool_name") == str(tool_name)
+                    and previous.get("args_digest") == str(args_digest)
+                )
+                task_state.side_effect_operations = ledger
+                return {
+                    "claimed": False,
+                    "conflict": not same_identity,
+                    "prior_state": str(previous.get("state", "")),
+                    "entry": dict(previous),
+                }
+            timestamp = self._side_effect_timestamp()
+            entry = {
+                "operation_key": key,
+                "tool_name": str(tool_name),
+                "args_digest": str(args_digest),
+                "state": "claimed",
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "result_metadata": {},
+            }
+            ledger[key] = entry
+            payload["side_effect_operations"] = ledger
+            self._write_json_atomic(self.task_state_path(task_state), payload)
+            task_state.side_effect_operations = ledger
+            return {"claimed": True, "conflict": False, "prior_state": "", "entry": entry}
+
+    def update_side_effect_operation(self, task_state, operation_key, state, result_metadata=None):
+        """Persist a terminal/uncertain outcome without exposing raw payloads."""
+        key = str(operation_key or "").strip()
+        with self._side_effect_lock(task_state.run_id):
+            payload = self._load_task_state_payload(task_state)
+            ledger = dict(payload.get("side_effect_operations", {}) or {})
+            entry = dict(ledger.get(key, {}))
+            if not entry:
+                raise ValueError("side effect operation was not claimed")
+            entry["state"] = str(state)
+            entry["updated_at"] = self._side_effect_timestamp()
+            entry["result_metadata"] = dict(result_metadata or {})
+            ledger[key] = entry
+            payload["side_effect_operations"] = ledger
+            self._write_json_atomic(self.task_state_path(task_state), payload)
+            task_state.side_effect_operations = ledger
+            return entry
 
     def _write_json_atomic(self, path, payload):
         # 原子写：先写临时文件，再 replace。

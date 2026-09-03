@@ -1,7 +1,7 @@
-"""Agent 运行时核心逻辑。
+"""Pico composition root and public compatibility facade.
 
-Pico 就是包在模型外面的控制循环：负责组 prompt、解析模型输出、
-校验并执行工具、写 trace、更新工作记忆，以及在合适的时候停下来。
+The model/tool reasoning loop lives in :mod:`codecub.agent.loop`; this module
+assembles its collaborators and preserves the historical ``Pico`` API.
 """
 
 import json
@@ -17,27 +17,41 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .memory_v2 import MemoryV2
-from .context_manager import ContextManager
+from .context_assembler import ContextAssembler
+from .context_validator import ContextValidator
+from .instruction_loader import InstructionLoader
+from .instructions import InstructionResolver
 from .context_compiler import (
     ContextBudget,
     ContextCompiler,
     HistoryCondenser,
-    PINNED_PROJECT_RULES,
-    PINNED_RUNTIME_MODE,
-    PINNED_SAFETY,
     WorkingState,
 )
 from .code_index import CodeIndex
 from .edit_decision import EditDecisionWatchdog
-from .token_budget import resolve_prompt_budget, resolve_token_counter
+from .token_budget import resolve_token_counter
 from .run_store import RunStore
+from .sessions import SessionManager, SessionStore as _SessionStore
+from .agent import AgentLoop, LegacyContextAdapter, LegacyLoopStateAdapter, LegacyModelInvoker, LoopHistory, LoopObserver, LoopStatus, TurnPreparation, TurnRunner
+from .agent.hooks import HookComposite
+from .tooling import ToolExecutionContext, ToolExecutor
+from .models import ToolCall
 from .telemetry import aggregate_usage_records, build_usage_snapshot
+
 from .usage_store import UsageStore
 from .task_state import TaskState
 from . import tools as toolkit
 from . import task_policy
 from .watchdog import ProgressWatchdog
+from .resilience import ToolCircuitBreaker
+from .retrieval import HybridRetriever
+from .event_bus import LocalEventBus
+from .cache import LocalJsonCache, file_summary_cache_key
+from .orchestration import Orchestrator
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+
+# Public compatibility export; callers historically import this from runtime.
+SessionStore = _SessionStore
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 REDACTED_VALUE = "<redacted>"
@@ -66,6 +80,9 @@ DEFAULT_FEATURE_FLAGS = {
     "evidence_memory": True,
     "durable_memory": True,
     "context_reduction": True,
+    # Adaptive Hybrid Raw Evidence is experimental; production uses
+    # State-Preserving Compression by default.
+    "hybrid_context_enabled": False,
     "context_compiler": True,
     "prompt_cache": True,
 }
@@ -74,6 +91,9 @@ DEFAULT_INTERACTIVE_EMERGENCY_CAP = 500
 DEFAULT_INTERACTIVE_ATTEMPT_CAP = 1200
 RUNTIME_MODE_INTERACTIVE = "interactive"
 RUNTIME_MODE_EXPERIMENT = "experiment"
+EXECUTION_MODE_SINGLE = "single"
+EXECUTION_MODE_MULTI_AGENT = "multi_agent"
+EXECUTION_MODES = {EXECUTION_MODE_SINGLE, EXECUTION_MODE_MULTI_AGENT}
 STOP_REASON_STUCK_CONFIRMED = "stuck_confirmed"
 STOP_REASON_EMERGENCY_CAP_REACHED = "emergency_cap_reached"
 # Phase 2.6：取消小固定 edit-decision hard-stop
@@ -88,6 +108,7 @@ SEMANTIC_REPEAT_HARD_STOP_THRESHOLD = 8
 READ_OVERLAP_THRESHOLD = 0.8
 EVIDENCE_LEDGER_LIMIT = 6
 EVIDENCE_HINT_LIMIT = 280
+READ_RANGE_LEDGER_LIMIT = 20
 RECOVERY_TURN_PROMPT = (
     "Your recent actions have not produced new evidence, workspace changes, "
     "or new verification information.\n\n"
@@ -137,75 +158,690 @@ class PromptPrefix:
     built_at: str
 
 
-class FinalAnswerDeltaFilter:
-    start_tag = "<final>"
-    end_tag = "</final>"
+@dataclass(frozen=True)
+class ReadRangeRecord:
+    path: str
+    start_line: int
+    end_line: int
+    freshness: str
+    step: int
 
-    def __init__(self, on_text):
-        self.on_text = on_text
-        self.buffer = ""
-        self.in_final = False
-        self.closed = False
 
-    def feed(self, chunk):
-        if self.closed or not chunk:
+@dataclass(frozen=True)
+class ReadCoverage:
+    covered_ranges: tuple[tuple[int, int], ...]
+    uncovered_ranges: tuple[tuple[int, int], ...]
+    previous_step: int = 0
+
+    @property
+    def fully_covered(self):
+        return not self.uncovered_ranges
+
+
+class _RuntimeToolSubject:
+    """Explicit capability view used to bind the canonical tool functions."""
+
+    def __init__(self, *, root, workspace, session_store, run_store, model_client,
+                 model_gateway, max_new_tokens, depth, max_depth, read_only,
+                 execution_mode,
+                 secret_env_names, shell_env_allowlist, code_index, retriever,
+                 orchestrator, cancellation, state_ref, working_state_ref,
+                 session, cancel_checker_ref):
+        self.root = root
+        self.workspace = workspace
+        self.session_store = session_store
+        self.run_store = run_store
+        self.model_client = model_client
+        self.model_gateway = model_gateway
+        self.max_new_tokens = max_new_tokens
+        self.depth = depth
+        self.max_depth = max_depth
+        self.read_only = read_only
+        self.execution_mode = execution_mode
+        self.secret_env_names = secret_env_names
+        self.shell_env_allowlist = shell_env_allowlist
+        self.code_index = code_index
+        self.retriever = retriever
+        self.orchestrator = orchestrator
+        self.cancellation_source = cancellation
+        self._state_ref = state_ref
+        self._working_state_ref = working_state_ref
+        self.session = session
+        self._cancel_checker_ref = cancel_checker_ref
+        self.last_retrieval_result = None
+
+    @property
+    def current_task_state(self):
+        return self._state_ref.get("current")
+
+    @property
+    def working_state(self):
+        return self._working_state_ref.get("current")
+
+    @property
+    def cancel_checker(self):
+        return self._cancel_checker_ref.get("value")
+
+    def path(self, raw_path):
+        path = Path(raw_path)
+        path = path if path.is_absolute() else self.root / path
+        resolved = path.resolve()
+        if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
+            raise ValueError(f"path escapes workspace: {raw_path}")
+        return resolved
+
+    def multi_agent_enabled(self):
+        return self.execution_mode == EXECUTION_MODE_MULTI_AGENT
+
+    def cancellation_requested(self, task_state=None):
+        return self.cancellation_source.requested(task_state)
+
+    def shell_env(self):
+        env = {name: os.environ[name] for name in self.shell_env_allowlist if name in os.environ}
+        env["PWD"] = str(self.root)
+        env["GIT_DIR"] = os.devnull
+        if "PATH" not in env and os.environ.get("PATH"):
+            env["PATH"] = os.environ["PATH"]
+        if os.name == "nt":
+            system_root = os.environ.get("SystemRoot", r"C:\Windows")
+            env.setdefault("SystemRoot", system_root)
+            env.setdefault("ComSpec", os.environ.get("ComSpec", str(Path(system_root) / "System32" / "cmd.exe")))
+        return env
+
+    def history_text(self):
+        history = self.session.get("history", [])
+        if not history:
+            return "- empty"
+        return clip("\n".join(str(item.get("content", "")) for item in history), MAX_HISTORY)
+
+
+class _RuntimeToolRegistry:
+    """Registry seam: the executor sees lookup, not Pico's private map."""
+
+    def __init__(self, tools):
+        self._tools = tools
+
+    def resolve(self, name):
+        return self._tools.get(name)
+
+
+class _RuntimeToolValidation:
+    def __init__(self, *, root, depth, max_depth):
+        self.root = root
+        self.depth = depth
+        self.max_depth = max_depth
+
+    def path(self, raw_path):
+        path = Path(raw_path)
+        path = path if path.is_absolute() else self.root / path
+        resolved = path.resolve()
+        if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
+            raise ValueError(f"path escapes workspace: {raw_path}")
+        return resolved
+
+    def validate(self, name, args, _tool):
+        toolkit.validate_tool(self, name, args)
+
+    def example(self, name):
+        return toolkit.tool_example(name)
+
+    @staticmethod
+    def validate_result(tool, result):
+        return toolkit.validate_tool_result_contract(tool, result)
+
+
+class _RuntimeToolApproval:
+    def __init__(self, *, read_only, approval_policy, approval_handler_ref, subject):
+        self._read_only = bool(read_only)
+        self._approval_policy = approval_policy
+        self._approval_handler_ref = approval_handler_ref
+        self._subject = subject
+
+    @property
+    def read_only(self):
+        return self._read_only
+
+    def approve(self, name, args):
+        if self._read_only or self._approval_policy == "never":
+            return False
+        if self._approval_policy == "auto":
+            return True
+        handler = self._approval_handler_ref.get("value")
+        if self._approval_policy == "ask" and handler is not None:
+            return bool(handler(name, args, self._subject))
+        try:
+            answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
+        except EOFError:
+            return False
+        return answer.strip().lower() in {"y", "yes"}
+
+
+class _RuntimeToolReplay:
+    def __init__(self, *, tools, circuit_breaker, run_store, state_ref):
+        self._tools = tools
+        self._circuit_breaker = circuit_breaker
+        self._run_store = run_store
+        self._state_ref = state_ref
+        self.limit = REPEATED_NO_PROGRESS_LIMIT
+
+    def repeated(self, name, args):
+        history = self._state_ref.get("history", [])
+        required = self.limit - 1
+        if len(history) < required:
+            return False
+        recent = history[-required:]
+        return all(item.get("name") == name and item.get("args") == args for item in recent)
+
+    def allow(self, name):
+        return self._circuit_breaker.allow(name)
+
+    def status(self, name):
+        return self._circuit_breaker.status(name)
+
+    def claim(self, name, args, operation_key, side_effect):
+        task_state = self._state_ref.get("current")
+        if not side_effect or not operation_key or task_state is None:
+            return {"claimed": True}
+        digest = hashlib.sha256(json.dumps(args or {}, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        claim = self._run_store.claim_side_effect_operation(task_state, operation_key, name, digest)
+        if claim["claimed"]:
+            return {"claimed": True, "operation_key": operation_key, "args_digest": digest}
+        prior_state = claim.get("prior_state", "")
+        if claim.get("conflict"):
+            code, message = "idempotency_key_conflict", "error: idempotency key conflicts with a different side-effect operation"
+        elif prior_state == "completed":
+            code, message = "side_effect_replay_blocked", "error: side-effect operation was already completed"
+        else:
+            code, message = "outcome_uncertain", "error: prior side-effect outcome is uncertain; replay is blocked"
+        return {
+            "claimed": False, "error_code": code, "message": message,
+            "metadata": {
+                "side_effect_operation_key": operation_key, "side_effect_args_digest": digest,
+                "side_effect_claimed": False, "side_effect_replay_detected": True,
+                "side_effect_replay_blocked": True, "side_effect_prior_state": prior_state,
+                "side_effect_commit_recorded": False,
+                "side_effect_outcome_uncertain": prior_state in {"claimed", "uncertain"},
+                "idempotency_key_conflict": bool(claim.get("conflict")),
+            },
+        }
+
+    def complete(self, claim, success, metadata):
+        key = claim.get("operation_key", "")
+        task_state = self._state_ref.get("current")
+        if not key or task_state is None:
             return
-        self.buffer += str(chunk)
+        metadata.update({
+            "side_effect_operation_key": key, "side_effect_args_digest": claim["args_digest"],
+            "side_effect_claimed": True, "side_effect_replay_detected": False,
+            "side_effect_replay_blocked": False, "side_effect_prior_state": "",
+            "side_effect_commit_recorded": bool(success),
+            "side_effect_outcome_uncertain": not bool(success), "idempotency_key_conflict": False,
+        })
+        self._run_store.update_side_effect_operation(
+            task_state, key, "completed" if success else "uncertain",
+            {key: metadata.get(key) for key in (
+                "tool_status", "tool_error_code", "tool_execution_success",
+                "tool_business_success", "tool_result_validation_failed",
+                "tool_result_failure_reason", "workspace_changed",
+            )},
+        )
 
-        if not self.in_final:
-            start = self.buffer.find(self.start_tag)
-            tool_start = self.buffer.find("<tool")
-            if tool_start != -1 and (start == -1 or tool_start < start):
-                self.buffer = self.buffer[-(len(self.start_tag) - 1) :]
-                return
-            if start == -1:
-                self.buffer = self.buffer[-(len(self.start_tag) - 1) :]
-                return
-            self.buffer = self.buffer[start + len(self.start_tag) :]
-            self.in_final = True
-
-        while self.in_final and self.buffer:
-            end = self.buffer.find(self.end_tag)
-            if end >= 0:
-                if end > 0:
-                    self.on_text(self.buffer[:end])
-                self.buffer = self.buffer[end + len(self.end_tag) :]
-                self.closed = True
-                return
-
-            safe_length = self._safe_emit_length()
-            if safe_length <= 0:
-                return
-            self.on_text(self.buffer[:safe_length])
-            self.buffer = self.buffer[safe_length:]
-
-    def _safe_emit_length(self):
-        max_tail = min(len(self.end_tag) - 1, len(self.buffer))
-        for tail_length in range(max_tail, 0, -1):
-            if self.end_tag.startswith(self.buffer[-tail_length:]):
-                return len(self.buffer) - tail_length
-        return len(self.buffer)
+    def record_result(self, name, success):
+        if self._tools.get(name, {}).get("circuit_breaker", True):
+            recorder = self._circuit_breaker.record_success if success else self._circuit_breaker.record_failure
+            recorder(name)
 
 
-class SessionStore:
-    def __init__(self, root):
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+class _RuntimeToolCancellation:
+    def __init__(self, checker_ref, state_ref):
+        self._checker_ref = checker_ref
+        self._state_ref = state_ref
 
-    def path(self, session_id):
-        return self.root / f"{session_id}.json"
+    def requested(self, task_state=None):
+        state = task_state or self._state_ref.get("current")
+        checker = self._checker_ref.get("value")
+        return bool(checker is not None and checker(self, state))
 
-    def save(self, session):
-        path = self.path(session["id"])
-        path.write_text(json.dumps(session, indent=2), encoding="utf-8")
-        return path
 
-    def load(self, session_id):
-        return json.loads(self.path(session_id).read_text(encoding="utf-8"))
+class _RuntimeToolWorkspace:
+    def __init__(self, *, root):
+        self._root = root
 
-    def latest(self):
-        files = sorted(self.root.glob("*.json"), key=lambda path: path.stat().st_mtime)
-        return files[-1].stem if files else None
+    def snapshot(self):
+        snapshot = {}
+        for path in self._root.rglob("*"):
+            if not path.is_file() or any(part in IGNORED_PATH_NAMES for part in path.relative_to(self._root).parts):
+                continue
+            try:
+                snapshot[path.relative_to(self._root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except Exception:
+                continue
+        return snapshot
+
+    @staticmethod
+    def diff(before, after):
+        changed, summaries = [], []
+        for path in sorted(set(before) | set(after)):
+            if before.get(path) == after.get(path):
+                continue
+            changed.append(path)
+            summaries.append(
+                f"created:{path}" if path not in before else f"deleted:{path}" if path not in after else f"modified:{path}"
+            )
+        return changed, summaries
+
+    def fingerprint(self):
+        return WorkspaceContext.build(self._root).fingerprint()
+
+
+class _RuntimeToolObservation:
+    """Explicit tool-result sink for read ranges, memory, and code index state."""
+
+    def __init__(self, *, root, state_ref, planning_ref, working_state_ref,
+                 task_state_ref, metadata_ref, memory, memory_v2, feature_flags,
+                 code_index, file_summary_cache, model_client, session):
+        self._root = root
+        self._state_ref = state_ref
+        self._planning_ref = planning_ref
+        self._working_state_ref = working_state_ref
+        self._task_state_ref = task_state_ref
+        self._metadata_ref = metadata_ref
+        self._memory = memory
+        self._memory_v2 = memory_v2
+        self._feature_flags = feature_flags
+        self._code_index = code_index
+        self._file_summary_cache = file_summary_cache
+        self._model_client = model_client
+        self._session = session
+        self.last_metadata = {}
+
+    @property
+    def planning(self):
+        state = self._state_ref.get("current")
+        return getattr(state, "planning", None) or self._planning_ref.get("current", {})
+
+    @property
+    def task_state(self):
+        return self._task_state_ref.get("current")
+
+    def _assess_read_range(self, args):
+        path = task_policy.canonical_path((args or {}).get("path"))
+        if not path:
+            return None, ""
+        freshness = memorylib.file_freshness(path, self._root)
+        coverage = analyze_read_coverage(
+            path, int((args or {}).get("start", 1)), int((args or {}).get("end", 200)),
+            self.planning.get("read_range_ledger", []), freshness,
+        )
+        return coverage, freshness
+
+    @staticmethod
+    def _redundant_read_notice(args, coverage, action):
+        path = task_policy.canonical_path((args or {}).get("path"))
+        start, end = int((args or {}).get("start", 1)), int((args or {}).get("end", 200))
+        covered = ", ".join(f"L{item_start}-L{item_end}" for item_start, item_end in coverage.covered_ranges)
+        return (
+            f"Read guard: {path} L{start}-L{end} is already covered by previous read evidence ({covered}) at step {coverage.previous_step}; unchanged=true. "
+            f"No source was returned; if raw source is specifically needed, call read_file(..., force=True). action={action}."
+        )
+
+    def prepare(self, name, args, _tool):
+        if name != "read_file":
+            return {}
+        planning = self.planning
+        coverage, version = self._assess_read_range(args)
+        covered_lines = sum(end - start + 1 for start, end in coverage.covered_ranges)
+        base_metadata = {"security_event_type": "", "risk_level": "low", "read_only": True, "affected_paths": [], "workspace_changed": False, "diff_summary": []}
+        if coverage.covered_ranges and not bool(args.get("force", False)) and coverage.fully_covered:
+            planning["read_guard_triggered"] += 1
+            planning["redundant_read_suppressed"] += 1
+            planning["read_guard_covered_lines_skipped"] += covered_lines
+            return {"result": self._redundant_read_notice(args, coverage, "suppressed"), "metadata": {**base_metadata, "read_range_guard": {
+                "path": task_policy.canonical_path(args.get("path")),
+                "requested_range": [int(args.get("start", 1)), int(args.get("end", 200))],
+                "covered_ranges": [list(item) for item in coverage.covered_ranges], "returned_ranges": [],
+                "file_changed": False, "action": "suppressed", "file_version": version,
+            }}}
+        if coverage.covered_ranges and not bool(args.get("force", False)):
+            planning["read_guard_triggered"] += 1
+            planning["read_guard_delta_reads"] += 1
+            planning["read_guard_delta_lines_returned"] += sum(end - start + 1 for start, end in coverage.uncovered_ranges)
+            planning["read_guard_covered_lines_skipped"] += covered_lines
+            covered = ", ".join(f"L{start}-L{end}" for start, end in coverage.covered_ranges)
+            returned = ", ".join(f"L{start}-L{end}" for start, end in coverage.uncovered_ranges)
+            return {
+                "calls": tuple({**args, "start": start, "end": end} for start, end in coverage.uncovered_ranges),
+                "format_result": lambda values: f"Read guard: {covered} was already available and unchanged. Only previously unseen {returned} is returned below.\n\n" + "\n\n".join(values),
+                "action": "delta_read", "coverage": coverage, "version": version,
+            }
+        action = "forced" if bool(args.get("force", False)) and coverage.covered_ranges else "read"
+        if action == "forced":
+            planning["read_guard_triggered"] += 1
+            planning["redundant_read_forced"] += 1
+        elif any((item.path if isinstance(item, ReadRangeRecord) else item["path"]) == task_policy.canonical_path(args.get("path")) for item in planning.get("read_range_ledger", [])):
+            action = "stale_read"
+        return {"action": action, "coverage": coverage, "version": version}
+
+    def _record_read_range(self, args, step):
+        path = task_policy.canonical_path((args or {}).get("path"))
+        if not path:
+            return
+        record = ReadRangeRecord(path, int((args or {}).get("start", 1)), int((args or {}).get("end", 200)), memorylib.file_freshness(path, self._root), int(step or 0))
+        ledger = self.planning.setdefault("read_range_ledger", [])
+        previous = [item if isinstance(item, ReadRangeRecord) else ReadRangeRecord(**item) for item in ledger]
+        ledger[:] = [{"path": item.path, "start_line": item.start_line, "end_line": item.end_line, "freshness": item.freshness, "step": item.step} for item in merge_read_ranges(previous, record)[-20:]]
+        self.planning["read_range_ledger_entries"] = len(ledger)
+
+    def finalize(self, name, args, _result, metadata, prepared):
+        if name != "read_file":
+            return
+        coverage = prepared.get("coverage")
+        action = prepared.get("action", "read")
+        metadata["read_range_guard"] = {
+            "path": task_policy.canonical_path(args.get("path")),
+            "requested_range": [int(args.get("start", 1)), int(args.get("end", 200))],
+            "covered_ranges": [list(item) for item in coverage.covered_ranges] if coverage else [],
+            "returned_ranges": [list(item) for item in coverage.uncovered_ranges] if action == "delta_read" and coverage else [[int(args.get("start", 1)), int(args.get("end", 200))]],
+            "file_changed": action == "stale_read", "action": action, "file_version": prepared.get("version", ""),
+        }
+        self._record_read_range(args, getattr(self.task_state, "tool_steps", 0))
+
+    def _update_memory_after_tool(self, name, args, result):
+        if not self._feature_flags.get("memory", False) or not args.get("path"):
+            return
+        canonical_path = self._memory.canonical_path(args["path"])
+        if name in {"read_file", "write_file", "patch_file"}:
+            self._memory.remember_file(canonical_path)
+        if name == "read_file":
+            try:
+                content_hash = hashlib.sha256((self._root / str(args["path"])).resolve().read_bytes()).hexdigest()
+            except OSError:
+                content_hash = ""
+            key = file_summary_cache_key(canonical_path, content_hash, getattr(self._model_client, "model", "local"), "read-summary-v1")
+            summary = self._file_summary_cache.get(key)
+            if summary is None:
+                summary = memorylib.summarize_read_result(result)
+                self._file_summary_cache.set(key, summary)
+            self._memory.set_file_summary(canonical_path, summary)
+            self._memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
+        elif name in {"write_file", "patch_file"}:
+            self._memory.invalidate_file_summary(canonical_path)
+
+    def _record_memory_v2_evidence(self, name, args, result, metadata):
+        if not (self._feature_flags.get("memory", False) and self._feature_flags.get("memory_v2", False) and self._feature_flags.get("evidence_memory", False)):
+            return
+        try:
+            self._memory_v2.record_tool_evidence(name, args, result, metadata=metadata)
+            if name == "read_file":
+                self._memory_v2.note_read(str(args.get("path") or ""))
+        except Exception:
+            return
+
+    def _record_process_note(self, name, metadata):
+        status = str(metadata.get("tool_status", "")).strip()
+        if status not in {"partial_success", "error", "rejected"}:
+            return
+        affected = [str(path).strip() for path in metadata.get("affected_paths", []) if str(path).strip()]
+        path_text = ", ".join(affected) or "workspace"
+        detail = "inspect diff before retry" if status == "partial_success" else "check the failure before retry" if status == "error" else "choose a different action before retry"
+        self._memory.append_note(f"{name} {status} on {path_text}; {detail}", tags=("process", status, *affected), source=name, kind="process")
+        self._session["memory"] = self._memory.to_dict()
+
+    def record(self, name, args, result, metadata):
+        self.last_metadata = dict(metadata)
+        target = self._metadata_ref.setdefault("value", {})
+        target.clear()
+        target.update(self.last_metadata)
+        if metadata.get("workspace_changed"):
+            self.planning["read_range_ledger_entries"] = len(self.planning.get("read_range_ledger", []))
+            self.last_metadata["code_index_refresh"] = self._code_index.refresh(metadata.get("affected_paths", []))
+            target.clear()
+            target.update(self.last_metadata)
+        if metadata.get("tool_execution_success"):
+            self._update_memory_after_tool(name, args, result)
+            self._record_memory_v2_evidence(name, args, result, self.last_metadata)
+        self._record_process_note(name, self.last_metadata)
+
+
+class _RuntimeTurnLifecycle:
+    """Narrow port exposing Runtime-owned primitives to TurnRunner.
+
+    TurnRunner owns terminal ordering and outcome mapping.  This temporary
+    adapter only supplies legacy storage, event, memory, and session actions
+    that have not yet moved out of Runtime.
+    """
+
+    def __init__(self, pico, run_store):
+        self._pico = pico
+        self._run_store = run_store
+
+    @property
+    def hook_subject(self):
+        return self._pico
+
+    def initialize(self, user_message, run_id):
+        pico = self._pico
+        run_started_at = time.monotonic()
+        run_started_wall = now()
+        pico.memory.set_task_summary(user_message)
+        pico.record({"role": "user", "content": user_message, "created_at": now()})
+        task_run_id = pico.validate_external_run_id(run_id) if run_id else pico.new_run_id()
+        task_state = TaskState.create(
+            run_id=task_run_id, task_id=pico.new_task_id(), user_request=user_message
+        )
+        state_path = self._run_store.task_state_path(task_run_id)
+        if state_path.exists():
+            task_state.side_effect_operations = dict(
+                self._run_store.load_task_state(task_run_id).get("side_effect_operations", {}) or {}
+            )
+        elif pico.current_checkpoint():
+            task_state.side_effect_operations = dict(
+                pico.current_checkpoint().get("side_effect_operations", {}) or {}
+            )
+        task_state.resume_status = pico.resume_state.get("status", CHECKPOINT_NONE_STATUS)
+        pico.current_task_state = task_state
+        pico._tool_state_ref["current"] = task_state
+        pico._tool_state_ref["history"] = pico.session["history"]
+        pico.loop_history.begin_turn()
+        pico.current_run_usage = pico.loop_history.run_usage
+        pico.current_run_source_reads = pico.loop_history.source_reads
+        pico.current_planning = pico.new_planning_state()
+        if pico.working_state is not None:
+            pico.working_state = WorkingState()
+            pico.working_state.set_goal(user_message)
+        pico._working_state_ref["current"] = pico.working_state
+        pico._planning_state_ref["current"] = pico.current_planning
+        reset_watchdogs = getattr(pico.loop_state_collaborator, "reset_watchdogs", None)
+        if reset_watchdogs is not None:
+            reset_watchdogs()
+            pico.watchdog = pico.loop_state_collaborator.watchdog
+            pico.edit_decision_watchdog = pico.loop_state_collaborator.edit_decision_watchdog
+        pico.loop_state_collaborator.bind_turn(
+            working_state=pico.working_state,
+            planning=pico.current_planning,
+            watchdog=pico.watchdog,
+        )
+        if pico.context_compiler is not None:
+            pico.context_compiler.reset_run_state()
+        if pico.memory_v2_enabled():
+            pico.memory_v2.reset_run_state()
+            pico.memory_v2.set_run_context(task_id=task_state.task_id, run_id=task_state.run_id)
+        pico.current_run_dir = self._run_store.start_run(task_state)
+        pico.emit_run_status(task_state, "building_context", "Building context", started_at=run_started_wall, run_started_at=run_started_at)
+        pico.emit_trace(task_state, "run_started", {"task_id": task_state.task_id, "user_request": clip(user_message, 300)})
+        if pico.memory_v2_enabled():
+            pico.context_collaborator.refresh_memory_retrieval(user_message, force=True)
+        return TurnPreparation(task_state, run_started_at, run_started_wall)
+
+    def cancellation_requested(self):
+        state = self._pico.current_task_state
+        return bool(state and self._pico.cancellation_requested(state))
+
+    def bind_loop(self, loop):
+        pico = self._pico
+        bind_context_state = getattr(pico.context_collaborator, "bind_loop_state", None)
+        if bind_context_state is not None:
+            bind_context_state(
+                pico.loop_state_collaborator,
+                working_state=pico.working_state,
+                planning=pico.current_planning,
+            )
+        loop.bind_collaborators(
+            context=pico.context_collaborator,
+            model_invoker=pico.model_invoker,
+            tool_executor=pico.tool_executor,
+            loop_state=pico.loop_state_collaborator,
+            injection_source=pico.injection_provider,
+            cancellation=pico.cancellation_source,
+            history=pico.loop_history,
+            run_store=pico.run_store,
+            status=pico.loop_status,
+        )
+        loop.bind_loop_config(prefix=pico.prefix)
+
+    def emit_status(self, task_state, phase, label, outcome, detail=""):
+        self._pico.emit_run_status(
+            task_state, phase, label, detail=detail,
+            started_at=outcome.started_wall, run_started_at=outcome.started_at,
+        )
+
+    def record_assistant(self, answer):
+        self._pico.record({"role": "assistant", "content": answer, "created_at": now()})
+
+    def enrich_memory(self, outcome):
+        self._pico.promote_durable_memory(outcome.user_message, outcome.answer)
+        self._pico.extract_memory_v2(outcome.user_message, outcome.answer)
+
+    def create_checkpoint(self, task_state, user_message, trigger):
+        return self._pico.create_checkpoint(task_state, user_message, trigger)
+
+    def write_task_state(self, task_state):
+        self._run_store.write_task_state(task_state)
+
+    def emit_checkpoint_created(self, task_state, trigger):
+        checkpoint = self._pico.current_checkpoint()
+        self._pico.emit_checkpoint_created(task_state, checkpoint, trigger)
+
+    def emit_run_finished(self, task_state, outcome):
+        self._pico.emit_run_finished(task_state, outcome.answer, outcome.started_at)
+
+    def write_final_report(self, task_state):
+        self._pico.write_final_report(task_state)
+
+    def record_model_error(self, outcome):
+        self._pico.last_model_error = {
+            "error_type": outcome.metadata["error_type"],
+            "message": outcome.metadata["error_message"],
+        }
+
+    def emit_model_error(self, task_state, outcome):
+        self._pico.emit_trace(
+            task_state,
+            "model_error",
+            {
+                "error_type": outcome.metadata["error_type"],
+                "message": outcome.metadata["error_message"],
+                "duration_ms": int(
+                    (time.monotonic() - outcome.metadata["model_started_at"]) * 1000
+                ),
+            },
+        )
+
+    def emit_cancelled(self, task_state, outcome):
+        self._pico.emit_trace(
+            task_state,
+            "run_canceled",
+            {
+                "status": task_state.status,
+                "stop_reason": task_state.stop_reason,
+                "final_answer": outcome.answer,
+                "run_duration_ms": int((time.monotonic() - outcome.started_at) * 1000),
+            },
+        )
+
+    def emit_emergency_cap(self, task_state, outcome):
+        self._pico.emit_trace(
+            task_state,
+            "emergency_cap_reached",
+            {"cap": outcome.metadata["cap"], "tool_steps": task_state.tool_steps},
+        )
+
+
+def analyze_read_coverage(path, start, end, previous_ranges, current_file_version):
+    """Compute union coverage for a requested range at one file freshness."""
+
+    canonical = task_policy.canonical_path(path)
+    matched = []
+    previous_step = 0
+    for raw_record in previous_ranges:
+        record = raw_record if isinstance(raw_record, ReadRangeRecord) else ReadRangeRecord(**raw_record)
+        if record.path != canonical or record.freshness != current_file_version:
+            continue
+        overlap_start, overlap_end = max(int(start), record.start_line), min(int(end), record.end_line)
+        if overlap_start <= overlap_end:
+            matched.append((overlap_start, overlap_end))
+            previous_step = max(previous_step, record.step)
+    covered = []
+    for range_start, range_end in sorted(matched):
+        if covered and range_start <= covered[-1][1] + 1:
+            covered[-1] = (covered[-1][0], max(covered[-1][1], range_end))
+        else:
+            covered.append((range_start, range_end))
+    uncovered, cursor = [], int(start)
+    for range_start, range_end in covered:
+        if cursor < range_start:
+            uncovered.append((cursor, range_start - 1))
+        cursor = max(cursor, range_end + 1)
+    if cursor <= int(end):
+        uncovered.append((cursor, int(end)))
+    return ReadCoverage(tuple(covered), tuple(uncovered), previous_step)
+
+
+def read_overlap_ratio(start, end, previous_start, previous_end):
+    intersection = max(0, min(int(end), int(previous_end)) - max(int(start), int(previous_start)) + 1)
+    smaller_range = min(int(end) - int(start) + 1, int(previous_end) - int(previous_start) + 1)
+    return intersection / smaller_range if smaller_range > 0 else 0.0
+
+
+def is_redundant_read(path, start, end, previous_ranges, current_file_version):
+    """Return the covering record when an unchanged range overlaps by at least 80%."""
+
+    canonical = task_policy.canonical_path(path)
+    for raw_record in previous_ranges:
+        record = (
+            raw_record
+            if isinstance(raw_record, ReadRangeRecord)
+            else ReadRangeRecord(**raw_record)
+        )
+        if (
+            record.path == canonical
+            and record.freshness == current_file_version
+            and read_overlap_ratio(start, end, record.start_line, record.end_line)
+            >= READ_OVERLAP_THRESHOLD
+        ):
+            return record
+    return None
+
+
+def merge_read_ranges(records, new_record):
+    """Merge overlapping/touching records for one file revision, preserving latest step."""
+
+    compatible = [
+        record
+        for record in records
+        if record.path == new_record.path and record.freshness == new_record.freshness
+    ]
+    retained = [record for record in records if record not in compatible]
+    start, end, step = new_record.start_line, new_record.end_line, new_record.step
+    pending = sorted(compatible, key=lambda item: (item.start_line, item.end_line))
+    for record in pending:
+        if record.end_line + 1 < start or record.start_line - 1 > end:
+            retained.append(record)
+            continue
+        start, end = min(start, record.start_line), max(end, record.end_line)
+        step = max(step, record.step)
+    retained.append(ReadRangeRecord(new_record.path, start, end, new_record.freshness, step))
+    return sorted(retained, key=lambda item: (item.step, item.path, item.start_line))
 
 
 class Pico:
@@ -232,12 +868,32 @@ class Pico:
         allowed_tools=None,
         requires_workspace_change=False,
         runtime_mode=None,
+        execution_mode=EXECUTION_MODE_SINGLE,
         emergency_cap=None,
+        event_bus=None,
+        model_gateway=None,
+        runtime_hooks=None,
+        context_validator=None,
+        instruction_resolver=None,
+        instruction_loader=None,
+        agent_role="",
+        repository_id="",
+        user_instructions=(),
+        repository_instructions=(),
+        agent_instructions=(),
+        tool_instructions=(),
     ):
         self.model_client = model_client
+        self.model_gateway = model_gateway
         self.workspace = workspace
         self.root = Path(workspace.repo_root)
+        self.file_summary_cache = LocalJsonCache(
+            self.root / ".codecub" / "cache" / "file_summaries.json"
+        )
         self.session_store = session_store
+        self.session_manager = SessionManager(
+            session_store, workspace.repo_root, memorylib.default_memory_state
+        )
         self.approval_policy = approval_policy
         # max_steps=None 表示“不设固定步数预算”：interactive 模式由
         # Progress Watchdog + emergency cap 决定何时停止；experiment 模式
@@ -247,6 +903,7 @@ class Pico:
             str(runtime_mode or RUNTIME_MODE_INTERACTIVE).strip()
             or RUNTIME_MODE_INTERACTIVE
         )
+        self.execution_mode = self.normalize_execution_mode(execution_mode)
         self.emergency_cap = (
             int(emergency_cap)
             if emergency_cap is not None
@@ -263,13 +920,37 @@ class Pico:
         self.read_only = read_only
         self.allowed_tools = None if allowed_tools is None else frozenset(allowed_tools)
         self.requires_workspace_change = bool(requires_workspace_change)
+        self.agent_role = str(agent_role or "").strip()
+        self.repository_id = str(repository_id or "").strip()
+        self.user_instructions = tuple(user_instructions or ())
+        self.repository_instructions = tuple(repository_instructions or ())
+        self.agent_instructions = tuple(agent_instructions or ())
+        self.tool_instructions = tuple(tool_instructions or ())
+        self.instruction_resolver = instruction_resolver or InstructionResolver()
+        self.instruction_loader = instruction_loader or InstructionLoader(self.root)
         self.shell_env_allowlist = tuple(
             shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST
         )
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
+        self._approval_handler_ref = {"value": approval_handler}
+        self._cancel_checker_ref = {"value": None}
+        self._tool_state_ref = {"current": None, "history": []}
+        self._planning_state_ref = {"current": {}}
+        self._working_state_ref = {"current": None}
+        self._tool_metadata_ref = {"value": {}}
+        self._event_handler_ref = {"value": event_handler}
         self.approval_handler = approval_handler
         self.event_handler = event_handler
+        self.event_bus = event_bus or LocalEventBus()
         self.cancel_checker = None
+        # Compatibility seam for Spine InjectionMailbox.  It is deliberately a
+        # callable so the legacy Runtime does not import or own Spine state.
+        self.injection_provider = None
+        self.protected_runtime_constraints = []
+        # Filled by the Spine compatibility adapter for every dispatched turn.
+        # Kept separate from Session so concurrent conversations cannot borrow
+        # correlation data from one another.
+        self.spine_trace_context = {}
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update(
@@ -278,14 +959,8 @@ class Pico:
         self.run_store = run_store or RunStore(
             Path(workspace.repo_root) / ".codecub" / "runs"
         )
-        self.session = session or {
-            "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
-            "created_at": now(),
-            "workspace_root": workspace.repo_root,
-            "history": [],
-            "memory": memorylib.default_memory_state(),
-        }
-        self._ensure_session_shape()
+        self.session = self.session_manager.create(session, now=now())
+        self._tool_state_ref["history"] = self.session["history"]
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
             workspace_root=self.root,
@@ -301,32 +976,148 @@ class Pico:
         self.memory_v2.migrate_legacy(self.session.get("memory"))
         self.code_index = CodeIndex(self.root)
         self.code_index.refresh()
+        self.retriever = HybridRetriever(self.root, self.code_index)
+        self.orchestrator = Orchestrator(
+            model_client=self.model_client,
+            model_gateway=self.model_gateway,
+            workspace=self.workspace,
+            session_store=self.session_store,
+            run_store=self.run_store,
+            approval_policy=self.approval_policy,
+            max_new_tokens=self.max_new_tokens,
+            secret_env_names=self.secret_env_names,
+            shell_env_allowlist=self.shell_env_allowlist,
+            event_bus=self.event_bus,
+            state_ref=self._tool_state_ref,
+            cancel_checker_ref=self._cancel_checker_ref,
+        )
+        self.last_retrieval_result = None
+        self.tool_circuit_breaker = ToolCircuitBreaker()
+        self.cancellation_source = _RuntimeToolCancellation(
+            self._cancel_checker_ref, self._tool_state_ref
+        )
+        self.tool_subject = _RuntimeToolSubject(
+            root=self.root,
+            workspace=self.workspace,
+            session_store=self.session_store,
+            run_store=self.run_store,
+            model_client=self.model_client,
+            model_gateway=self.model_gateway,
+            max_new_tokens=self.max_new_tokens,
+            depth=self.depth,
+            max_depth=self.max_depth,
+            read_only=self.read_only,
+            execution_mode=self.execution_mode,
+            secret_env_names=self.secret_env_names,
+            shell_env_allowlist=self.shell_env_allowlist,
+            code_index=self.code_index,
+            retriever=self.retriever,
+            orchestrator=self.orchestrator,
+            cancellation=self.cancellation_source,
+            state_ref=self._tool_state_ref,
+            working_state_ref=self._working_state_ref,
+            session=self.session,
+            cancel_checker_ref=self._cancel_checker_ref,
+        )
         self.tools = self.build_tools()
+        self.hooks = HookComposite(runtime_hooks or ())
+        self.tool_executor = ToolExecutor(
+            ToolExecutionContext(
+                registry=_RuntimeToolRegistry(self.tools),
+                validation=_RuntimeToolValidation(
+                    root=self.root, depth=self.depth, max_depth=self.max_depth
+                ),
+                approval=_RuntimeToolApproval(
+                    read_only=self.read_only,
+                    approval_policy=self.approval_policy,
+                    approval_handler_ref=self._approval_handler_ref,
+                    subject=self.tool_subject,
+                ),
+                replay=_RuntimeToolReplay(
+                    tools=self.tools,
+                    circuit_breaker=self.tool_circuit_breaker,
+                    run_store=self.run_store,
+                    state_ref=self._tool_state_ref,
+                ),
+                cancellation=self.cancellation_source,
+                workspace=_RuntimeToolWorkspace(root=self.root),
+                observation=_RuntimeToolObservation(
+                    root=self.root,
+                    state_ref=self._tool_state_ref,
+                    planning_ref=self._planning_state_ref,
+                    working_state_ref=self._working_state_ref,
+                    task_state_ref=self._tool_state_ref,
+                    metadata_ref=self._tool_metadata_ref,
+                    memory=self.memory,
+                    memory_v2=self.memory_v2,
+                    feature_flags=self.feature_flags,
+                    code_index=self.code_index,
+                    file_summary_cache=self.file_summary_cache,
+                    model_client=self.model_client,
+                    session=self.session,
+                ),
+                hook_subject=self.tool_subject,
+            ),
+            self.hooks,
+        )
+        self.model_invoker = LegacyModelInvoker(self.completion_client, self.max_new_tokens)
+        self.loop_history = LoopHistory(self.session, self.session_manager)
+        self.loop_status = LoopStatus(
+            event_handler_ref=self._event_handler_ref, subject=self.tool_subject
+        )
+        self.usage_store = UsageStore(self.root / ".codecub" / "usage")
+        self.loop_observer = LoopObserver(
+            run_store=self.run_store,
+            event_bus=self.event_bus,
+            session=self.session,
+            trace_context=self.spine_trace_context,
+            secret_values=[value for _, value in self.detected_secret_env_items()],
+            usage_store=self.usage_store,
+            event_sink=self.loop_status.emit_app_event,
+        )
+        self.loop_state_collaborator = LegacyLoopStateAdapter(
+            root=self.root, observer=self.loop_observer
+        )
+        self.protected_runtime_constraints = self.loop_state_collaborator.protected_constraints
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
-        self.context_manager = ContextManager(self)
         # Phase 2: Context Compiler（task-local Working State + 分层 Context）。
         self.working_state = WorkingState()
         self.context_compiler = self.build_context_compiler()
+        self.context_validator = context_validator or ContextValidator(
+            token_counter=self.token_counter,
+            workspace_root=self.root,
+            max_validation_attempts=1,
+        )
         self.resume_state = self.evaluate_resume_state()
-        self.session_path = self.session_store.save(self.session)
+        self.session_path = self.session_manager.save(self.session)
         self.current_task_state = None
+        self._tool_state_ref["current"] = self.current_task_state
+        if (
+            hasattr(self.model_gateway, "event_sink")
+            and self.model_gateway.event_sink is None
+        ):
+            self.model_gateway.event_sink = self._emit_gateway_event
         self.current_run_dir = None
-        self.last_prompt_metadata = {}
-        self.last_completion_metadata = {}
         self.current_run_usage = []
         self.current_run_source_reads = []
-        self.current_planning = {}
+        self.current_planning = self.new_planning_state()
+        self._planning_state_ref["current"] = self.current_planning
         self.watchdog = ProgressWatchdog(file_hash_fn=self._file_freshness)
         self.edit_decision_watchdog = EditDecisionWatchdog(
             file_hash_fn=self._file_freshness
         )
-        self.usage_store = UsageStore(self.root / ".codecub" / "usage")
+        self.loop_state_collaborator.bind_turn(
+            working_state=self.working_state,
+            planning=self.current_planning,
+            watchdog=self.watchdog,
+        )
+        self._working_state_ref["current"] = self.working_state
         self.last_model_error = {}
         self.last_durable_promotions = []
         self.last_durable_rejections = []
         self.last_durable_superseded = []
-        self._last_tool_result_metadata = {}
+        self._last_tool_result_metadata = self._tool_metadata_ref["value"]
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -339,31 +1130,141 @@ class Pico:
         self.last_memory_v2_superseded = []
         self.last_memory_v2_conflicts = []
 
+        # Context construction is explicit: the loop receives one assembler
+        # boundary and state ports, never this composition root.
+        self.context_assembler = ContextAssembler(
+            context_compiler=self.context_compiler,
+        )
+        self._loop_metadata = {
+            "prompt": {},
+            "completion": {},
+            "compression_count": 0,
+        }
+        self.last_prompt_metadata = self._loop_metadata["prompt"]
+        self.last_completion_metadata = self._loop_metadata["completion"]
+        self.context_collaborator = LegacyContextAdapter(
+            root=self.root,
+            workspace=self.workspace,
+            prefix_state=self.prefix_state,
+            tools=self.tools,
+            session=self.session,
+            session_manager=self.session_manager,
+            memory=self.memory,
+            memory_v2=self.memory_v2,
+            context_compiler=self.context_compiler,
+            loop_state=self.loop_state_collaborator,
+            model_client=self.model_client,
+            token_counter=self.token_counter,
+            approval_policy=self.approval_policy,
+            read_only=self.read_only,
+            runtime_mode=self.runtime_mode,
+            execution_mode=self.execution_mode,
+            effective_step_budget=self.effective_step_budget,
+            max_steps=self.max_steps,
+            emergency_cap=self.emergency_cap,
+            context_window=self.context_window,
+            max_new_tokens=self.max_new_tokens,
+            safety_margin_tokens=self.safety_margin_tokens,
+            requires_workspace_change=self.requires_workspace_change,
+            feature_flags=self.feature_flags,
+            hooks=self.hooks,
+            observer=self.loop_observer,
+            tool_validation=self.tool_executor.context.validation,
+            secret_env_names=self.secret_env_names,
+            metadata_state=self._loop_metadata,
+            resume_state=self.resume_state,
+            context_assembler=self.context_assembler,
+            context_validator=self.context_validator,
+            instruction_resolver=self.instruction_resolver,
+            instruction_loader=self.instruction_loader,
+            agent_role=self.agent_role,
+            repository_id=self.repository_id,
+            user_instructions=self.user_instructions,
+            repository_instructions=self.repository_instructions,
+            agent_instructions=self.agent_instructions,
+            tool_instructions=self.tool_instructions,
+        )
+        # Preserve the public compatibility handle without constructing a
+        # second context builder bound to the Runtime.
+        self.context_manager = self.context_collaborator.legacy_context_manager
+        self.agent_loop = AgentLoop(
+            self.loop_observer, self.loop_state_collaborator,
+            self.context_collaborator, self.model_invoker, self.tool_executor,
+            self.injection_provider, self.cancellation_source, self.loop_history, self.run_store,
+            self.loop_status, self.hooks, self.model_client, self.requires_workspace_change,
+            self.effective_step_budget, self.emergency_cap, self.runtime_mode,
+            self.feature_enabled("prompt_cache"),
+            self.tools, self.prefix,
+        )
+        self.turn_runner = TurnRunner(
+            _RuntimeTurnLifecycle(self, self.run_store), self.agent_loop, self.hooks
+        )
+
+    @property
+    def approval_handler(self):
+        return self._approval_handler_ref.get("value")
+
+    @approval_handler.setter
+    def approval_handler(self, handler):
+        if hasattr(self, "_approval_handler_ref"):
+            self._approval_handler_ref["value"] = handler
+
+    @property
+    def cancel_checker(self):
+        return self._cancel_checker_ref.get("value")
+
+    @cancel_checker.setter
+    def cancel_checker(self, checker):
+        if hasattr(self, "_cancel_checker_ref"):
+            self._cancel_checker_ref["value"] = checker
+
+    @property
+    def event_handler(self):
+        return self._event_handler_ref.get("value")
+
+    @event_handler.setter
+    def event_handler(self, handler):
+        if hasattr(self, "_event_handler_ref"):
+            self._event_handler_ref["value"] = handler
+
+    @property
+    def current_task_state(self):
+        if hasattr(self, "_tool_state_ref"):
+            return self._tool_state_ref.get("current")
+        return getattr(self, "_current_task_state", None)
+
+    @current_task_state.setter
+    def current_task_state(self, state):
+        self._current_task_state = state
+        if hasattr(self, "_tool_state_ref"):
+            self._tool_state_ref["current"] = state
+
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
         return cls(
             model_client=model_client,
             workspace=workspace,
             session_store=session_store,
-            session=session_store.load(session_id),
+            session=SessionManager(session_store, workspace.repo_root, memorylib.default_memory_state).load(session_id),
             **kwargs,
         )
 
+    @staticmethod
+    def normalize_execution_mode(value):
+        mode = str(value or EXECUTION_MODE_SINGLE).strip().replace("-", "_").lower()
+        if mode in {"multi", "multiagent"}:
+            mode = EXECUTION_MODE_MULTI_AGENT
+        if mode not in EXECUTION_MODES:
+            raise ValueError(
+                "execution_mode must be 'single' or 'multi_agent'"
+            )
+        return mode
+
+    def multi_agent_enabled(self):
+        return self.execution_mode == EXECUTION_MODE_MULTI_AGENT
+
     def _ensure_session_shape(self):
-        self.session.setdefault("history", [])
-        self.session.setdefault("memory", memorylib.default_memory_state())
-        checkpoints = self.session.setdefault("checkpoints", {})
-        if not isinstance(checkpoints, dict):
-            checkpoints = {}
-            self.session["checkpoints"] = checkpoints
-        checkpoints.setdefault("current_id", "")
-        checkpoints.setdefault("items", {})
-        runtime_identity = self.session.setdefault("runtime_identity", {})
-        if not isinstance(runtime_identity, dict):
-            self.session["runtime_identity"] = {}
-        resume_state = self.session.setdefault("resume_state", {})
-        if not isinstance(resume_state, dict):
-            self.session["resume_state"] = {}
+        return self.session_manager.ensure_shape(self.session)
 
     def current_runtime_identity(self):
         return {
@@ -375,6 +1276,7 @@ class Pico:
             "read_only": bool(self.read_only),
             "max_steps": self.max_steps,
             "runtime_mode": self.runtime_mode,
+            "execution_mode": self.execution_mode,
             "emergency_cap": int(self.emergency_cap or 0),
             "max_new_tokens": int(self.max_new_tokens),
             "feature_flags": dict(self.feature_flags),
@@ -399,14 +1301,11 @@ class Pico:
 
     def checkpoint_state(self):
         self._ensure_session_shape()
-        return self.session["checkpoints"]
+        return self.session_manager.checkpoint_state(self.session)
 
     def current_checkpoint(self):
-        state = self.checkpoint_state()
-        checkpoint_id = str(state.get("current_id", "")).strip()
-        if not checkpoint_id:
-            return None
-        return state.get("items", {}).get(checkpoint_id)
+        self._ensure_session_shape()
+        return self.session_manager.current_checkpoint(self.session)
 
     def invalidate_stale_memory(self):
         invalidated = self.memory.invalidate_stale_file_summaries()
@@ -414,7 +1313,6 @@ class Pico:
         return invalidated
 
     def evaluate_resume_state(self):
-        previous_resume_state = dict(self.session.get("resume_state", {}) or {})
         invalidated = self.invalidate_stale_memory()
         # Phase 3: Evidence freshness 对照 live workspace 重算（stale/missing）。
         if self.memory_v2_enabled():
@@ -422,70 +1320,20 @@ class Pico:
                 self.memory_v2.refresh_freshness()
             except Exception:
                 pass
-        checkpoint = self.current_checkpoint()
-        status = CHECKPOINT_NONE_STATUS
-        stale_paths = list(invalidated)
-        mismatch_fields = []
-        if checkpoint:
-            if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-                status = CHECKPOINT_SCHEMA_MISMATCH_STATUS
-            else:
-                for item in checkpoint.get("key_files", []):
-                    path = str(item.get("path", "")).strip()
-                    if not path:
-                        continue
-                    expected = item.get("freshness")
-                    current = memorylib.file_freshness(path, self.root)
-                    if expected != current and path not in stale_paths:
-                        stale_paths.append(path)
-                saved_identity = dict(
-                    checkpoint.get("runtime_identity", {})
-                    or self.session.get("runtime_identity", {})
-                    or {}
-                )
-                current_identity = self.current_runtime_identity()
-                identity_keys = (
-                    "cwd",
-                    "model",
-                    "model_client",
-                    "approval_policy",
-                    "read_only",
-                    "max_steps",
-                    "runtime_mode",
-                    "emergency_cap",
-                    "max_new_tokens",
-                    "feature_flags",
-                    "shell_env_allowlist",
-                    "workspace_fingerprint",
-                    "tool_signature",
-                )
-                for key in identity_keys:
-                    if key not in saved_identity:
-                        continue
-                    if saved_identity.get(key) != current_identity.get(key):
-                        mismatch_fields.append(key)
-                mismatch_fields.sort()
-                if stale_paths:
-                    status = CHECKPOINT_PARTIAL_STALE_STATUS
-                elif mismatch_fields:
-                    status = CHECKPOINT_WORKSPACE_MISMATCH_STATUS
-                else:
-                    status = CHECKPOINT_FULL_VALID_STATUS
-
-        resume_state = {
-            "status": status,
-            "stale_paths": stale_paths,
-            "runtime_identity_mismatch_fields": mismatch_fields,
-            "stale_summary_invalidations": max(
-                len(invalidated),
-                int(previous_resume_state.get("stale_summary_invalidations", 0))
-                if status == CHECKPOINT_PARTIAL_STALE_STATUS
-                else 0,
-            ),
-        }
-        self.session["resume_state"] = resume_state
-        self.session["runtime_identity"] = self.current_runtime_identity()
-        return resume_state
+        return self.session_manager.evaluate_resume(
+            self.session,
+            invalidated=invalidated,
+            file_freshness=lambda path: memorylib.file_freshness(path, self.root),
+            runtime_identity=self.current_runtime_identity,
+            schema_version=CHECKPOINT_SCHEMA_VERSION,
+            statuses={
+                "none": CHECKPOINT_NONE_STATUS,
+                "schema_mismatch": CHECKPOINT_SCHEMA_MISMATCH_STATUS,
+                "partial_stale": CHECKPOINT_PARTIAL_STALE_STATUS,
+                "workspace_mismatch": CHECKPOINT_WORKSPACE_MISMATCH_STATUS,
+                "full_valid": CHECKPOINT_FULL_VALID_STATUS,
+            },
+        )
 
     def render_checkpoint_text(self):
         checkpoint = self.current_checkpoint()
@@ -540,7 +1388,8 @@ class Pico:
             return None
 
     def build_tools(self):
-        tools = toolkit.build_tool_registry(self)
+        subject = getattr(self, "tool_subject", self)
+        tools = toolkit.build_tool_registry(subject)
         if self.allowed_tools is None:
             return tools
         return {
@@ -573,47 +1422,13 @@ class Pico:
             code_index=self.code_index,
             redact_fn=self.redact_text,
             workspace_root=self.root,
+            hybrid_context_enabled=self.feature_enabled("hybrid_context_enabled"),
         )
 
     def _pinned_extra(self, user_message=None):
-        extras = {
-            PINNED_PROJECT_RULES: self.prefix,
-            PINNED_SAFETY: (
-                f"Approval policy: {self.approval_policy}; read_only: {self.read_only}"
-            ),
-            PINNED_RUNTIME_MODE: (
-                f"runtime_mode: {self.runtime_mode}; "
-                f"effective_step_budget: {self.effective_step_budget}; "
-                f"emergency_cap: {self.emergency_cap}"
-            ),
-        }
-        ledger_text = self.evidence_ledger_text()
-        if ledger_text:
-            extras["pinned:evidence-ledger"] = ledger_text
-        try:
-            checkpoint_text = str(self.render_checkpoint_text() or "").strip()
-        except Exception:
-            checkpoint_text = ""
-        if checkpoint_text:
-            extras["pinned:checkpoint"] = checkpoint_text
-        # Phase 3: memory_v2 ON 时检索走 Context Compiler 的 bounded memory layer，
-        # 这里不再注入 v1 relevant-memory，避免两套记忆同时进 Prompt。
-        if (
-            not self.memory_v2_enabled()
-            and self.feature_enabled("memory")
-            and self.feature_enabled("relevant_memory")
-        ):
-            try:
-                notes = self.memory.retrieval_candidates(
-                    str(user_message or ""), limit=3
-                )
-            except Exception:
-                notes = []
-            if notes:
-                lines = ["Relevant memory:"]
-                lines.extend(f"- {str(note.get('text', ''))}" for note in notes)
-                extras["pinned:relevant-memory"] = "\n".join(lines)
-        return extras
+        """Compatibility source accessor; final composition lives in ContextAssembler."""
+
+        return self.context_collaborator.pinned_extra(user_message)
 
     def tool_signature(self):
         payload = []
@@ -844,9 +1659,7 @@ class Pico:
 
     def _memory_signature(self):
         ws = self.working_state or WorkingState()
-        blockers = "|".join(
-            str(item.get("text", "")) for item in (ws.blockers or [])
-        )
+        blockers = "|".join(str(item.get("text", "")) for item in (ws.blockers or []))
         symbols = "|".join(
             f"{item.get('path', '')}:{item.get('name', '')}"
             for item in (ws.relevant_symbols or [])
@@ -870,24 +1683,13 @@ class Pico:
         return result
 
     def _memory_layer(self):
-        """Context Compiler 的 bounded memory layer（文本 + 元数据）。"""
-        if not self.memory_v2_enabled():
-            return "", {}
-        result = getattr(self, "_current_memory_result", None)
-        if result is None or not result.items:
-            return "", {}
-        return result.render(), {
-            "evidence_count": len(result.evidence_items),
-            "durable_count": len(result.durable_items),
-            "stale_count": result.stale_count,
-            "token_budget": result.token_budget,
-        }
+        """Compatibility source accessor owned by the context collaborator."""
+
+        return self.context_collaborator.memory_layer()
 
     def record_memory_v2_evidence(self, name, args, result):
         """客观工具事件 → Evidence Store（read/symbol/outline/references/verification）。"""
-        if not self.memory_v2_enabled() or not self.feature_enabled(
-            "evidence_memory"
-        ):
+        if not self.memory_v2_enabled() or not self.feature_enabled("evidence_memory"):
             return []
         try:
             created = self.memory_v2.record_tool_evidence(
@@ -907,7 +1709,9 @@ class Pico:
         if not self.memory_v2_enabled() or not self.feature_enabled("durable_memory"):
             return None
         run_id = (
-            self.current_task_state.run_id if self.current_task_state is not None else ""
+            self.current_task_state.run_id
+            if self.current_task_state is not None
+            else ""
         )
         promoted, rejections, superseded, conflicts, _duplicates = (
             self.memory_v2.extract_and_persist(
@@ -1030,302 +1834,50 @@ class Pico:
         return metadata
 
     def _add_legacy_metadata_compat(self, metadata, prompt, user_message):
-        """Context Compiler 产出兼容旧 ContextManager 的 metadata 字段。
+        """Compatibility hook delegated to the context collaborator."""
 
-        旧 metrics / read_guard / 实验分析脚本依赖这些字段；字段语义与
-        旧实现保持一致，避免破坏 Phase 1 及更早的分析链路。
-        """
-        unit = "tokens" if self.token_counter is not None else "chars"
-        estimated = metadata.get("compiled_context_tokens") or 0
-        evidence_entries = []
-        if hasattr(self, "evidence_ledger_entries"):
-            for entry in self.evidence_ledger_entries():
-                marker = str(entry.get("marker", ""))
-                evidence_entries.append(
-                    {
-                        "path": str(entry.get("path", "")),
-                        "start": int(entry.get("start", 1)),
-                        "end": int(entry.get("end", 200)),
-                        "freshness": str(entry.get("freshness", "")),
-                        "last_read_step": entry.get("last_read_step"),
-                        "visible": bool(marker and marker in prompt),
-                    }
-                )
-        # Phase 3: memory_v2 ON 时，legacy relevant_memory 兼容块反映 v2 检索结果，
-        # 保持旧 metrics 脚本（selected_count / rendered_notes 等）可继续读取。
-        if self.memory_v2_enabled() and getattr(self, "_current_memory_result", None):
-            result = self._current_memory_result
-            rendered_notes = []
-            for item in result.items:
-                rendered_notes.append(
-                    {
-                        "text": item.text,
-                        "kind": item.kind,
-                        "marker": item.marker,
-                        "source": item.path or item.topic or "",
-                        "reason": item.reason,
-                        "score": item.score,
-                        "status": item.status,
-                    }
-                )
-            metadata["relevant_memory"] = {
-                "limit": result.evidence_top_k + result.durable_top_k,
-                "selected_count": len(result.items),
-                "selected_notes": [item.text for item in result.items],
-                "selected_sources": [
-                    item.path or item.topic for item in result.items
-                ],
-                "selected_kinds": [item.kind for item in result.items],
-                "selected_reasons": [item.reason for item in result.items],
-                "selected_scores": [round(item.score, 1) for item in result.items],
-                "selected_matches": [],
-                "selected_durable_count": len(result.durable_items),
-                "raw_chars": result.total_tokens,
-                "rendered_chars": result.total_tokens,
-                "rendered_notes": rendered_notes,
-                "rendered_count": len(rendered_notes),
-                "stale_count": result.stale_count,
-                "missing_count": result.missing_count,
-            }
-        metadata.update(
-            {
-                "prompt_chars": len(prompt),
-                "prompt_budget_chars": self.context_manager.total_budget,
-                "prompt_over_budget": False,
-                "budget_mode": "token" if self.token_counter is not None else "char",
-                "budget_unit": unit,
-                "estimated_prompt_tokens": estimated,
-                "prompt_tokens": estimated,
-                "section_order": [
-                    "prefix",
-                    "memory",
-                    "relevant_memory",
-                    "history",
-                    "current_request",
-                ],
-                "section_budgets": {
-                    "prefix": None,
-                    "memory": None,
-                    "relevant_memory": None,
-                    "history": None,
-                    "current_request": None,
-                },
-                "sections": {
-                    "pinned": {
-                        "raw_chars": 0,
-                        "budget_chars": None,
-                        "rendered_chars": metadata.get("pinned_tokens", 0),
-                    },
-                    "working_state": {
-                        "raw_chars": 0,
-                        "budget_chars": None,
-                        "rendered_chars": metadata.get("working_state_tokens", 0),
-                    },
-                    "recent_verbatim": {
-                        "raw_chars": 0,
-                        "budget_chars": None,
-                        "rendered_chars": metadata.get("recent_verbatim_tokens", 0),
-                    },
-                    "compressed_history": {
-                        "raw_chars": 0,
-                        "budget_chars": None,
-                        "rendered_chars": metadata.get("compressed_history_tokens", 0),
-                    },
-                },
-                "inspected_evidence": {
-                    "entry_count": len(evidence_entries),
-                    "visible_entry_count": sum(
-                        1 for entry in evidence_entries if entry["visible"]
-                    ),
-                    "entries": evidence_entries,
-                },
-                "budget_reductions": [],
-                "reduction_order": [],
-                "relevant_memory": {
-                    "limit": 3,
-                    "selected_count": 0,
-                    "selected_notes": [],
-                    "selected_sources": [],
-                    "selected_kinds": [],
-                    "selected_reasons": [],
-                    "selected_scores": [],
-                    "selected_matches": [],
-                    "selected_durable_count": 0,
-                    "raw_chars": 0,
-                    "rendered_chars": 0,
-                    "rendered_notes": [],
-                    "rendered_count": 0,
-                },
-                "history": {
-                    "raw_chars": metadata.get("raw_history_tokens", 0),
-                    "rendered_chars": metadata.get("recent_verbatim_tokens", 0),
-                    "older_entries_count": 0,
-                    "collapsed_duplicate_reads": 0,
-                    "reused_file_summary_count": 0,
-                    "summarized_tool_count": 0,
-                },
-                "current_request": {
-                    "text": str(user_message),
-                    "raw_chars": len(str(user_message)),
-                    "rendered_chars": len(str(user_message)),
-                    "section_chars": len(str(user_message)),
-                },
-            }
+        return self.context_collaborator._add_legacy_metadata_compat(
+            metadata, prompt, user_message
         )
-        return metadata
 
-    def _build_prompt_and_metadata(self, user_message, status_callback=None, task_state=None):
-        if status_callback is not None:
-            status_callback(
-                "checking_workspace", "Checking repository state", str(self.root)
-            )
-        refresh = self.refresh_prefix()
-        if status_callback is not None:
-            status_callback("loading_memory", "Loading session memory", "")
-        self.resume_state = self.evaluate_resume_state()
-        if status_callback is not None:
-            status_callback("building_prompt", "Building prompt", "")
-        # Phase 2: Interactive/默认路径走 Context Compiler（Pinned + Working State +
-        # Recent Verbatim + Compressed History + Repo Map）；旧 ContextManager 作为
-        # legacy adapter（feature flag 关闭时使用）。
-        if self.context_compiler is not None:
-            if task_state is not None:
-                self.emit_trace(
-                    task_state,
-                    "context_compile_started",
-                    {
-                        "step": task_state.tool_steps,
-                        "history_entries": len(self.session.get("history", [])),
-                        "working_state_facts": len(self.working_state.known_facts),
-                    },
-                )
-            self.working_state.refresh_fact_freshness(self.root)
-            stale_count = len(self.working_state.stale_facts())
-            memory_layer, memory_meta = self._memory_layer()
-            prompt, metadata = self.context_compiler.compile_text(
-                user_message,
-                working_state=self.working_state,
-                history=self.session.get("history", []),
-                pinned_extra=self._pinned_extra(user_message),
-                memory_layer=memory_layer,
-                memory_meta=memory_meta,
-            )
-            self._add_legacy_metadata_compat(metadata, prompt, user_message)
-            if task_state is not None:
-                if stale_count:
-                    self.emit_trace(
-                        task_state,
-                        "context_fact_stale",
-                        {"stale_fact_count": stale_count, "step": task_state.tool_steps},
-                    )
-                if metadata.get("should_compress"):
-                    self.emit_trace(
-                        task_state,
-                        "compression_triggered",
-                        {
-                            "mode": "legacy",
-                            "estimated_tokens": metadata.get(
-                                "candidate_context_tokens"
-                            ),
-                            "usable_input_budget": metadata.get("usable_input_budget"),
-                            "compression_count": metadata.get("compression_count"),
-                        },
-                    )
-                    self.emit_trace(
-                        task_state,
-                        "compression_started",
-                        {"mode": "legacy"},
-                    )
-                    self.emit_trace(
-                        task_state,
-                        "history_span_compacted",
-                        {
-                            "raw_history_tokens": metadata.get(
-                                "raw_history_tokens"
-                            ),
-                            "compressed_history_tokens": metadata.get(
-                                "compressed_history_tokens"
-                            ),
-                        },
-                    )
-                if metadata.get("repo_map_selection", {}).get("selected_files"):
-                    self.emit_trace(
-                        task_state,
-                        "repo_map_selected",
-                        {
-                            "selected_files": metadata["repo_map_selection"][
-                                "selected_files"
-                            ],
-                            "estimated_tokens": metadata["repo_map_selection"].get(
-                                "estimated_tokens"
-                            ),
-                        },
-                    )
-                self.emit_trace(
-                    task_state,
-                    "context_compile_finished",
-                    {
-                        "compilation_metadata": metadata,
-                    },
-                )
-        else:
-            prompt, metadata = self.context_manager.build(user_message)
-        available_prompt_tokens = resolve_prompt_budget(
-            self.context_window, self.max_new_tokens, self.safety_margin_tokens
+    def _build_prompt_and_metadata(
+        self, user_message, status_callback=None, task_state=None
+    ):
+        """Compatibility facade; ContextAssembler owns context construction."""
+
+        result = self.context_collaborator.build(
+            user_message,
+            status_callback=status_callback,
+            task_state=task_state,
         )
-        # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
-        # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
-        metadata.update(
-            {
-                "prefix_chars": len(self.prefix),
-                "workspace_chars": len(self.workspace.text()),
-                "memory_chars": len(self.memory_text()),
-                "history_chars": len(self.history_text()),
-                "request_chars": len(user_message),
-                "tool_count": len(self.tools),
-                "workspace_docs": len(self.workspace.project_docs),
-                "recent_commits": len(self.workspace.recent_commits),
-                "prefix_hash": self.prefix_state.hash,
-                "prompt_cache_key": self.prefix_state.hash,
-                "workspace_fingerprint": self.prefix_state.workspace_fingerprint,
-                "tool_signature": self.prefix_state.tool_signature,
-                "workspace_changed": refresh["workspace_changed"],
-                "prefix_changed": refresh["prefix_changed"],
-                "prompt_cache_supported": bool(
-                    getattr(self.model_client, "supports_prompt_cache", False)
-                ),
-                "resume_status": self.resume_state.get(
-                    "status", CHECKPOINT_NONE_STATUS
-                ),
-                "stale_summary_invalidations": int(
-                    self.resume_state.get("stale_summary_invalidations", 0)
-                ),
-                "stale_paths": list(self.resume_state.get("stale_paths", [])),
-                "runtime_identity_mismatch_fields": list(
-                    self.resume_state.get("runtime_identity_mismatch_fields", [])
-                ),
-                "context_window": self.context_window,
-                "max_new_tokens": int(self.max_new_tokens),
-                "safety_margin_tokens": self.safety_margin_tokens,
-                "available_prompt_tokens": available_prompt_tokens,
-                "token_counter_source": getattr(
-                    self.token_counter, "source", "unavailable"
-                ),
-                "token_counter_quality": getattr(
-                    self.token_counter, "quality", "unavailable"
-                ),
-            }
-        )
-        metadata.update(self.detected_secret_env_summary())
-        return prompt, metadata
+        # The deprecated Pico facade still exposes prefix/workspace attributes;
+        # mirror the explicit context collaborator's refreshed values without
+        # giving the assembler a Runtime callback or reference.
+        self._apply_prefix_state(self.context_collaborator.prefix_state)
+        self.workspace = self.context_collaborator.workspace
+        return result
 
     def emit_trace(self, task_state, event, payload=None):
-        payload = self.redact_artifact(payload or {})
-        payload["event"] = event
-        payload["created_at"] = now()
-        # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
-        self.run_store.append_trace(task_state, payload)
-        return payload
+        return self.loop_observer.emit(task_state, event, payload)
+
+    def _emit_gateway_event(self, event, payload):
+        if self.current_task_state is not None:
+            self.emit_trace(self.current_task_state, event, payload)
+
+    @property
+    def completion_client(self):
+        return self.model_gateway or self.model_client
+
+    @staticmethod
+    def _canonical_event_name(event):
+        mapping = {
+            "run_started": "run.started",
+            "run_completed": "run.completed",
+            "model_requested": "model.started",
+            "tool_executed": "tool.completed",
+            "workspace_changed": "workspace.changed",
+        }
+        return mapping.get(event, str(event).replace("_", "."))
 
     def emit_app_event(self, event_name, task_state, payload=None):
         if self.event_handler is not None:
@@ -1402,7 +1954,7 @@ class Pico:
         if self.memory_v2_enabled():
             ws_paths = []
             ws_paths.extend(str(p) for p in (self.working_state.changed_files or []))
-            for item in (self.working_state.relevant_symbols or []):
+            for item in self.working_state.relevant_symbols or []:
                 path = str(item.get("path", "") or "")
                 if path and path not in ws_paths:
                     ws_paths.append(path)
@@ -1432,6 +1984,9 @@ class Pico:
             "freshness": freshness,
             "summary": f"{trigger}: {clip(str(user_message), 120)}",
             "runtime_identity": self.current_runtime_identity(),
+            # Checkpoint resume remains in the same logical task scope, so the
+            # durable side-effect ledger must not be discarded on resume.
+            "side_effect_operations": dict(task_state.side_effect_operations or {}),
         }
         state["items"][checkpoint_id] = checkpoint
         state["current_id"] = checkpoint_id
@@ -1477,7 +2032,22 @@ class Pico:
         if name in {"read_file", "write_file", "patch_file"}:
             self.memory.remember_file(canonical_path)
         if name == "read_file":
-            summary = memorylib.summarize_read_result(result)
+            try:
+                content_hash = hashlib.sha256(
+                    self.path(path).read_bytes()
+                ).hexdigest()
+            except OSError:
+                content_hash = ""
+            key = file_summary_cache_key(
+                canonical_path,
+                content_hash,
+                getattr(self.model_client, "model", "local"),
+                "read-summary-v1",
+            )
+            summary = self.file_summary_cache.get(key)
+            if summary is None:
+                summary = memorylib.summarize_read_result(result)
+                self.file_summary_cache.set(key, summary)
             self.memory.set_file_summary(canonical_path, summary)
             self.memory.append_note(
                 summary, tags=(canonical_path,), source=canonical_path
@@ -1578,1218 +2148,22 @@ class Pico:
         return promoted, rejections, superseded
 
     def ask(self, user_message, run_id=""):
-        """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
+        """Public compatibility facade for the Phase 6 TurnRunner boundary."""
+        return self.turn_runner.run(user_message, run_id=run_id)
 
-        为什么存在：
-        `ask()` 是整个 runtime 的总调度器。它把“用户提一个请求”扩展成一条
-        可持续推进的控制循环：记录会话、组 prompt、调用模型、执行工具、
-        写 trace/report、更新状态，直到模型给出最终答案或系统主动停下。
-
-        输入 / 输出：
-        - 输入：`user_message`，即用户这一次的任务描述
-        - 输出：字符串形式的最终回答；如果中途达到步数上限或重试上限，
-          返回的是一条停止原因说明
-
-        在 agent 链路里的位置：
-        它是 CLI 和底层工具/模型之间的核心桥梁。CLI 收到用户输入后基本只做
-        一件事：调用 `agent.ask()`。而 `ask()` 内部再去驱动 `ContextManager`
-        组 prompt、`model_client.complete()` 调模型、`run_tool()` 执行动作。
-        如果新人想理解 pico 是怎么“从一句话跑成一个 agent 流程”的，
-        这里就是最关键的入口。
-        """
-        run_started_at = time.monotonic()
-        run_started_wall = now()
-        self.memory.set_task_summary(user_message)
-        self.record({"role": "user", "content": user_message, "created_at": now()})
-
-        task_run_id = (
-            self.validate_external_run_id(run_id) if run_id else self.new_run_id()
-        )
-        task_state = TaskState.create(
-            run_id=task_run_id, task_id=self.new_task_id(), user_request=user_message
-        )
-        task_state.resume_status = self.resume_state.get(
-            "status", CHECKPOINT_NONE_STATUS
-        )
-        self.current_task_state = task_state
-        self.current_run_usage = []
-        self.current_run_source_reads = []
-        self.current_planning = self.new_planning_state()
-        if self.working_state is not None:
-            # Phase 2: Task-local Working State 生命周期 = 本次 ask。
-            self.working_state = WorkingState()
-            self.working_state.set_goal(user_message)
-        if self.context_compiler is not None:
-            # Phase 2.6: 压缩计数 / summary 栈 / hysteresis 状态同样 task-local。
-            self.context_compiler.reset_run_state()
-        if self.memory_v2_enabled():
-            # Phase 3: Memory 2.0 run-local 状态清零；task-start retrieval 在
-            # run_started trace 之后执行（保持事件顺序契约）。
-            self.memory_v2.reset_run_state()
-            self.memory_v2.set_run_context(
-                task_id=task_state.task_id, run_id=task_state.run_id
-            )
-        self.current_run_dir = self.run_store.start_run(task_state)
-        self.emit_run_status(
-            task_state,
-            "building_context",
-            "Building context",
-            started_at=run_started_wall,
-            run_started_at=run_started_at,
-        )
-        self.emit_trace(
-            task_state,
-            "run_started",
-            {
-                "task_id": task_state.task_id,
-                "user_request": clip(user_message, 300),
-            },
-        )
-        # Phase 3: task-start retrieval（run_started 之后，保持 trace 顺序）。
-        if self.memory_v2_enabled():
-            self._refresh_memory_retrieval(user_message, force=True)
-
-        tool_steps = 0
-        attempts = 0
-        research_steps = 0
-        research_budget = task_policy.research_tool_budget(user_message)
-        finalization_required = False
-        finalization_rejections = 0
-        # Phase 1: 每次 ask() 独立跟踪 stuck 状态，不跨 run 累积。
-        self.watchdog = ProgressWatchdog(file_hash_fn=self._file_freshness)
-        # Phase 2.6: edit-decision 进展跟踪同样 task-local。
-        self.edit_decision_watchdog = EditDecisionWatchdog(
-            file_hash_fn=self._file_freshness
-        )
-        step_budget = self.effective_step_budget
-        attempt_cap = (
-            max(step_budget * 3, step_budget + 4)
-            if step_budget is not None
-            else DEFAULT_INTERACTIVE_ATTEMPT_CAP
-        )
-        emergency_cap = (
-            None
-            if step_budget is not None
-            else int(self.emergency_cap or DEFAULT_INTERACTIVE_EMERGENCY_CAP)
-        )
-        native_mode = bool(getattr(self.model_client, "supports_native_tools", False))
-        native_messages = []
-        pending_native_calls = []
-        if native_mode:
-            native_messages = [
-                {
-                    "role": "system",
-                    "content": "You are CodeCub, a local coding agent. Use the supplied tools when workspace evidence or changes are required. Do not emit XML tool syntax.",
-                }
-            ]
-            self.emit_trace(
-                task_state,
-                "model_protocol_selected",
-                {
-                    "model_protocol": "native_tools",
-                    "provider_protocol": getattr(
-                        getattr(self.model_client, "connection_profile", None),
-                        "protocol",
-                        "",
-                    ),
-                },
-            )
-        else:
-            self.emit_trace(
-                task_state,
-                "model_protocol_selected",
-                {
-                    "model_protocol": "legacy_text",
-                    "provider_protocol": getattr(
-                        getattr(self.model_client, "connection_profile", None),
-                        "protocol",
-                        "",
-                    ),
-                },
-            )
-
-        # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
-        # 1. 感知：重新组 prompt，把当前状态整理给模型看
-        # 2. 决策：让模型返回一个工具调用，或一个最终答案
-        # 3. 行动：如果是工具调用，就执行工具
-        # 4. 记录：把结果写回 history / task_state / trace / memory
-        # 然后进入下一轮，直到停机条件满足。
-        #
-        # Phase 1 停机语义：
-        # - experiment / 显式 max_steps：固定预算 + retry 上限，语义不变；
-        # - interactive：没有小固定步数预算，只由 emergency cap（兜底）
-        #   与 Progress Watchdog（stuck 判定）决定停止。
-        while True:
-            if self.cancellation_requested(task_state):
-                return self.stop_user_canceled_run(
-                    task_state, run_started_wall, run_started_at
-                )
-            if step_budget is not None:
-                if tool_steps >= step_budget or attempts >= attempt_cap:
-                    return self.stop_limited_run(
-                        task_state,
-                        user_message,
-                        attempts,
-                        attempt_cap,
-                        tool_steps,
-                        run_started_wall,
-                        run_started_at,
-                    )
-            else:
-                if tool_steps >= emergency_cap:
-                    return self.stop_emergency_cap_run(
-                        task_state,
-                        user_message,
-                        emergency_cap,
-                        run_started_wall,
-                        run_started_at,
-                    )
-                if attempts >= attempt_cap:
-                    return self.stop_limited_run(
-                        task_state,
-                        user_message,
-                        attempts,
-                        attempt_cap,
-                        tool_steps,
-                        run_started_wall,
-                        run_started_at,
-                    )
-            attempts += 1
-            task_state.record_attempt()
-            self.run_store.write_task_state(task_state)
-            self.emit_run_status(
-                task_state,
-                "building_context",
-                "Building context",
-                started_at=run_started_wall,
-                run_started_at=run_started_at,
-            )
-            prompt_started_at = time.monotonic()
-
-            def emit_context_status(phase, label, detail=""):
-                self.emit_run_status(
-                    task_state,
-                    phase,
-                    label,
-                    detail=detail,
-                    started_at=run_started_wall,
-                    run_started_at=run_started_at,
-                )
-                self.emit_trace(
-                    task_state,
-                    "context_step_started",
-                    {
-                        "phase": phase,
-                        "detail": clip(detail, 300),
-                    },
-                )
-
-            prompt, prompt_metadata = self._build_prompt_and_metadata(
-                user_message,
-                status_callback=emit_context_status,
-                task_state=task_state,
-            )
-            if native_mode:
-                prompt_metadata["model_protocol"] = "native_tools"
-                if len(native_messages) == 1:
-                    native_messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "For file tools, use workspace-relative paths; "
-                                "shell commands already execute at the workspace root.\n\n"
-                                + user_message
-                            ),
-                        }
-                    )
-            self.emit_trace(
-                task_state,
-                "prompt_built",
-                {
-                    "prompt_metadata": prompt_metadata,
-                    "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
-                },
-            )
-            # 说明已有检查点的关键文件部分过期（内容变了）
-            if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
-                checkpoint = self.create_checkpoint(
-                    task_state, user_message, trigger="freshness_mismatch"
-                )
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "freshness_mismatch",
-                    },
-                )
-            # 说明运行环境/工作区指纹不一致（如 cwd、模型、工具签名等变化）
-            elif (
-                prompt_metadata.get("resume_status")
-                == CHECKPOINT_WORKSPACE_MISMATCH_STATUS
-            ):
-                self.emit_trace(
-                    task_state,
-                    "runtime_identity_mismatch",
-                    {
-                        "fields": list(
-                            prompt_metadata.get("runtime_identity_mismatch_fields", [])
-                        ),
-                    },
-                )
-                checkpoint = self.create_checkpoint(
-                    task_state, user_message, trigger="workspace_mismatch"
-                )
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "workspace_mismatch",
-                    },
-                )
-            # 当 prompt 预算被削减（旧 context_reduction 或 Phase 2 Compiler 压缩）时，
-            # 也会创建检查点，保证 resume 不变量。
-            compiler_compression = False
-            if self.context_compiler is not None:
-                current_count = self.context_compiler.compression_count
-                compiler_compression = current_count > getattr(
-                    self, "_last_compiler_compression_count", 0
-                )
-                self._last_compiler_compression_count = current_count
-            if prompt_metadata.get("budget_reductions") or compiler_compression:
-                checkpoint = self.create_checkpoint(
-                    task_state, user_message, trigger="context_reduction"
-                )
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "context_reduction",
-                    },
-                )
-            self.emit_trace(
-                task_state,
-                "model_requested",
-                {
-                    "attempts": task_state.attempts,
-                    "tool_steps": task_state.tool_steps,
-                    "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
-                },
-            )
-            if self.cancellation_requested(task_state):
-                return self.stop_user_canceled_run(
-                    task_state, run_started_wall, run_started_at
-                )
-            self.emit_run_status(
-                task_state,
-                "model_request",
-                "Requesting model response",
-                detail=str(getattr(self.model_client, "model", "")),
-                started_at=run_started_wall,
-                run_started_at=run_started_at,
-            )
-            prompt_cache_key = None
-            prompt_cache_retention = None
-            if self.feature_enabled("prompt_cache") and getattr(
-                self.model_client, "supports_prompt_cache", False
-            ):
-                # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
-                prompt_cache_key = prompt_metadata.get("prompt_cache_key")
-                prompt_cache_retention = "in_memory"
-            model_started_at = time.monotonic()
-            self.emit_run_status(
-                task_state,
-                "model_streaming",
-                "Receiving model response",
-                detail=str(getattr(self.model_client, "model", "")),
-                started_at=run_started_wall,
-                run_started_at=run_started_at,
-            )
-            stream_filter = FinalAnswerDeltaFilter(
-                lambda text: self.emit_app_event(
-                    "assistant_delta", task_state, {"text": text}
-                )
-            )
-            self.last_prompt_metadata = prompt_metadata
-            try:
-                model_kwargs = {
-                    "prompt_cache_key": prompt_cache_key,
-                    "prompt_cache_retention": prompt_cache_retention,
-                }
-                if getattr(
-                    self.model_client, "supports_structured_prompt_cache", False
-                ):
-                    model_kwargs["stable_prefix"] = self.prefix
-                if native_mode:
-                    connection_profile = getattr(
-                        self.model_client, "connection_profile", None
-                    )
-                    supports_tool_choice = bool(
-                        getattr(connection_profile, "supports_tool_choice", False)
-                    )
-                    edit_decision = (
-                        self.requires_workspace_change
-                        and self.current_planning.get("action_readiness")
-                        == "action_expected"
-                        and not self.current_planning.get("workspace_change_count")
-                    )
-                    native_tools = toolkit.native_tool_definitions(self.tools)
-                    tool_choice = (
-                        "auto"
-                        if connection_profile is None or supports_tool_choice
-                        else None
-                    )
-                    # Do not insert an edit-decision user turn until every
-                    # result for an earlier native tool-call batch is present.
-                    if edit_decision and not pending_native_calls:
-                        if connection_profile is None or supports_tool_choice:
-                            native_tools = [
-                                {
-                                    "type": "function",
-                                    "function": {
-                                        "name": "submit_edit_decision",
-                                        "description": "Submit exactly one edit proposal or one bounded evidence request.",
-                                        "parameters": {
-                                            "type": "object",
-                                            "properties": {
-                                                "decision": {
-                                                    "type": "string",
-                                                    "enum": ["edit", "need_evidence"],
-                                                },
-                                                "tool": {"type": "string"},
-                                                "arguments": {"type": "object"},
-                                            },
-                                            "required": ["decision", "tool", "arguments"],
-                                            "additionalProperties": False,
-                                        },
-                                    },
-                                }
-                            ]
-                            tool_choice = (
-                                "required" if supports_tool_choice else tool_choice
-                            )
-                        else:
-                            # Some OpenAI-compatible providers accept native tools but
-                            # reject tool_choice.  Keep the real tool schema in this
-                            # phase: replacing it with a synthetic decision function
-                            # can yield stale calls to tools that are no longer listed.
-                            # The direct-call compatibility branch below still records
-                            # the same bounded edit or evidence decision.
-                            native_messages.append(
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "Edit-decision phase: choose one direct native "
-                                        "tool call. Use patch_file or write_file for the "
-                                        "smallest justified edit; request read_file, search, "
-                                        "or symbol_search only for essential missing evidence."
-                                    ),
-                                }
-                            )
-                        self.emit_trace(
-                            task_state,
-                            "phase_transition",
-                            {
-                                "phase": "edit_decision",
-                                "edit_decision_index": self.current_planning.get(
-                                    "edit_decision_count", 0
-                                )
-                                + 1,
-                                "compatibility_mode": not supports_tool_choice,
-                            },
-                        )
-                    if pending_native_calls:
-                        raw = pending_native_calls.pop(0)
-                    else:
-                        # Phase 2: native 消息经 Context Compiler 编译（不压缩时
-                        # 原样返回，超预算时保持 assistant/tool 原子组压缩）。
-                        if self.context_compiler is not None:
-                            self.working_state.refresh_fact_freshness(self.root)
-                            memory_layer, memory_meta = self._memory_layer()
-                            compiled_native, compiler_meta = self.context_compiler.compile_native(
-                                user_message,
-                                working_state=self.working_state,
-                                native_messages=native_messages,
-                                pinned_extra=self._pinned_extra(user_message),
-                                memory_layer=memory_layer,
-                                memory_meta=memory_meta,
-                            )
-                            if compiler_meta.get("should_compress"):
-                                self.emit_trace(
-                                    task_state,
-                                    "compression_triggered",
-                                    {
-                                        "mode": "native",
-                                        "estimated_tokens": compiler_meta.get(
-                                            "candidate_context_tokens"
-                                        ),
-                                        "usable_input_budget": compiler_meta.get(
-                                            "usable_input_budget"
-                                        ),
-                                        "compression_count": compiler_meta.get(
-                                            "compression_count"
-                                        ),
-                                    },
-                                )
-                                self.emit_trace(
-                                    task_state,
-                                    "compression_started",
-                                    {"mode": "native"},
-                                )
-                                self.emit_trace(
-                                    task_state,
-                                    "compression_finished",
-                                    {
-                                        "mode": "native",
-                                        "compiled_tokens": compiler_meta.get(
-                                            "compiled_context_tokens"
-                                        ),
-                                        "compression_count": compiler_meta.get(
-                                            "compression_count"
-                                        ),
-                                    },
-                                )
-                            native_messages = compiled_native
-                            prompt_metadata.update(
-                                {
-                                    "context_compiler": compiler_meta,
-                                    "compression_count": compiler_meta.get(
-                                        "compression_count", 0
-                                    ),
-                                }
-                            )
-                        raw = self.model_client.complete_with_tools(
-                            native_messages,
-                            native_tools,
-                            self.max_new_tokens,
-                            tool_choice=tool_choice,
-                        )
-                elif hasattr(self.model_client, "stream_complete"):
-                    raw = self.model_client.stream_complete(
-                        prompt,
-                        self.max_new_tokens,
-                        on_delta=stream_filter.feed,
-                        **model_kwargs,
-                    )
-                else:
-                    raw = self.model_client.complete(
-                        prompt,
-                        self.max_new_tokens,
-                        **model_kwargs,
-                    )
-            except Exception as exc:
-                return self.stop_model_error_run(
-                    task_state, exc, model_started_at, run_started_wall, run_started_at
-                )
-            completion_metadata = dict(
-                getattr(self.model_client, "last_completion_metadata", {}) or {}
-            )
-            if self.cancellation_requested(task_state):
-                return self.stop_user_canceled_run(
-                    task_state, run_started_wall, run_started_at
-                )
-            if completion_metadata:
-                # 把后端返回的 usage/cache 统计并回 prompt_metadata，
-                # 方便统一写入 report 和 trace。
-                prompt_metadata.update(completion_metadata)
-            estimated_tokens = prompt_metadata.get("estimated_prompt_tokens")
-            actual_tokens = completion_metadata.get("input_tokens")
-            if (
-                isinstance(estimated_tokens, int)
-                and isinstance(actual_tokens, int)
-                and actual_tokens > 0
-            ):
-                prompt_metadata["actual_input_tokens"] = actual_tokens
-                # Phase 2.6: provider 实际 input tokens（与 raw/compiled 估计同场对比）。
-                prompt_metadata["provider_actual_input_tokens"] = actual_tokens
-                compiler_meta = prompt_metadata.get("context_compiler")
-                if isinstance(compiler_meta, dict):
-                    compiler_meta["provider_actual_input_tokens"] = actual_tokens
-                prompt_metadata["token_estimation_error"] = (
-                    abs(actual_tokens - estimated_tokens) / actual_tokens
-                )
-                if prompt_metadata.get("available_prompt_tokens"):
-                    prompt_metadata["context_utilization"] = (
-                        estimated_tokens / prompt_metadata["available_prompt_tokens"]
-                    )
-            usage_record = completion_metadata.get("usage_record")
-            if isinstance(usage_record, dict):
-                usage_record = dict(usage_record)
-                usage_record.update(
-                    {
-                        "usage_id": f"{task_state.run_id}-request-{attempts}",
-                        "session_id": self.session.get("id", ""),
-                        "run_id": task_state.run_id,
-                        "turn_id": task_state.task_id,
-                        "request_index": attempts,
-                        "recorded_at": now(),
-                        "duration_ms": int(
-                            (time.monotonic() - model_started_at) * 1000
-                        ),
-                        "status": "completed",
-                    }
-                )
-                usage_record = self.redact_artifact(usage_record)
-                self.run_store.append_usage(task_state, usage_record)
-                self.current_run_usage.append(usage_record)
-                try:
-                    stored = self.usage_store.record(usage_record)
-                    run_snapshot = build_usage_snapshot(
-                        self.current_run_usage,
-                        "run",
-                        session_id=self.session.get("id", ""),
-                        run_id=task_state.run_id,
-                    )
-                    session_snapshot = (
-                        (stored or {}).get("snapshot")
-                        if isinstance(stored, dict)
-                        else None
-                    )
-                    if isinstance(session_snapshot, dict):
-                        self.emit_app_event(
-                            "usage_updated",
-                            task_state,
-                            {
-                                "schema_version": 2,
-                                "usage_id": usage_record["usage_id"],
-                                "run_snapshot": run_snapshot,
-                                "session_snapshot": session_snapshot,
-                            },
-                        )
-                except Exception as exc:
-                    self.emit_trace(
-                        task_state,
-                        "usage_persistence_warning",
-                        {
-                            "error_type": exc.__class__.__name__,
-                            "message": self.redact_text(str(exc)),
-                        },
-                    )
-                self.emit_trace(
-                    task_state,
-                    "model_usage_recorded",
-                    {
-                        "usage_id": usage_record["usage_id"],
-                        "connection_profile_id": usage_record.get(
-                            "connection_profile_id", ""
-                        ),
-                    },
-                )
-            self.last_completion_metadata = completion_metadata
-            self.last_prompt_metadata = prompt_metadata
-            if native_mode:
-                if raw.tool_calls:
-                    # Providers may return a batch even when asked not to.  Preserve
-                    # every call id and make the batch boundary explicit instead of
-                    # silently executing concurrent mutations.  The first call is
-                    # processed through the normal guarded path; remaining calls are
-                    # returned as deferred so the next structured decision is based
-                    # on the refreshed workspace.
-                    call = raw.tool_calls[0]
-                    fallback_direct_decision = (
-                        not supports_tool_choice
-                        and self.requires_workspace_change
-                        and self.current_planning.get("action_readiness")
-                        == "action_expected"
-                        and not self.current_planning.get("workspace_change_count")
-                        and call.name
-                        in {
-                            "patch_file",
-                            "write_file",
-                            "read_file",
-                            "search",
-                            "symbol_search",
-                        }
-                    )
-                    if call.name == "submit_edit_decision" or fallback_direct_decision:
-                        if fallback_direct_decision:
-                            decision = (
-                                "edit"
-                                if call.name in {"patch_file", "write_file"}
-                                else "need_evidence"
-                            )
-                            requested_name = call.name
-                            requested_args = call.arguments
-                            self.emit_trace(
-                                task_state,
-                                "native_direct_edit_decision",
-                                {
-                                    "decision": decision,
-                                    "tool": requested_name,
-                                    "compatibility_reason": "provider_omits_tool_choice",
-                                },
-                            )
-                        else:
-                            decision = call.arguments.get("decision")
-                            requested_name = call.arguments.get("tool")
-                            requested_args = call.arguments.get("arguments")
-                        # Phase 2.6：取消小固定 hard-stop（edit_decision = 4）。
-                        # 是否继续由“真实进展”决定（EditDecisionWatchdog 分类 +
-                        # ProgressWatchdog suspected/recovery/confirmed 状态机）。
-                        self.current_planning["edit_decision_count"] = (
-                            self.current_planning.get("edit_decision_count", 0) + 1
-                        )
-                        self.edit_decision_watchdog.record_decision(decision)
-                        allowed = (
-                            {"patch_file", "write_file"}
-                            if decision == "edit"
-                            else {"read_file", "search", "symbol_search"}
-                        )
-                        if (
-                            decision not in {"edit", "need_evidence"}
-                            or requested_name not in allowed
-                            or not isinstance(requested_args, dict)
-                        ):
-                            self.current_planning["invalid_edit_decision_count"] = (
-                                self.current_planning.get(
-                                    "invalid_edit_decision_count", 0
-                                )
-                                + 1
-                            )
-                            kind, payload = (
-                                "retry",
-                                "Invalid edit decision; submit one allowed structured decision.",
-                            )
-                        elif decision == "need_evidence":
-                            # 单次 need_evidence 仍只能使用受控 read/search/symbol 工具
-                            # （安全边界不变）；取消的是“第几次”的小固定上限。
-                            classification = (
-                                self.edit_decision_watchdog.classify_evidence_request(
-                                    requested_name, requested_args, task_state.tool_steps
-                                )
-                            )
-                            if classification.progress:
-                                self.current_planning["evidence_request_count"] = (
-                                    self.current_planning.get(
-                                        "evidence_request_count", 0
-                                    )
-                                    + 1
-                                )
-                                kind, payload = (
-                                    "tool",
-                                    {
-                                        "name": requested_name,
-                                        "args": requested_args,
-                                        "tool_call_id": call.id,
-                                        "edit_decision": decision,
-                                    },
-                                )
-                            else:
-                                # 重复 evidence 且无 workspace change / 文件 hash 未变：
-                                # 拒绝执行（不烧真实工具步），并把 no-progress 事件喂给主
-                                # Watchdog，使“重复 evidence”也能 suspected -> recovery
-                                # -> stuck_confirmed。
-                                self.edit_decision_watchdog.record_no_progress(
-                                    classification
-                                )
-                                self.emit_trace(
-                                    task_state,
-                                    "edit_decision_no_progress",
-                                    {
-                                        "tool": requested_name,
-                                        "reason": classification.reason,
-                                        "edit_decision_count": self.current_planning.get(
-                                            "edit_decision_count", 0
-                                        ),
-                                        "no_progress_streak": self.edit_decision_watchdog.no_progress_streak,
-                                    },
-                                )
-                                rejected_meta = {
-                                    "tool_status": "rejected",
-                                    "tool_error_code": "repeated_evidence",
-                                    "security_event_type": "",
-                                    "risk_level": "low",
-                                    "read_only": True,
-                                    "affected_paths": [],
-                                    "workspace_changed": False,
-                                    "diff_summary": [],
-                                }
-                                watchdog_decision = self._advance_watchdog(
-                                    task_state,
-                                    requested_name,
-                                    requested_args,
-                                    "rejected: repeated evidence request",
-                                    # 拒绝的事件没有真实工具执行，tool_steps 不前进；
-                                    # 用单调递增的 attempts 作为 watchdog step，
-                                    # 保证 recovery 窗口能正常计时。
-                                    task_state.attempts,
-                                    metadata=rejected_meta,
-                                )
-                                if watchdog_decision.suspected_now:
-                                    # 重复 evidence 触发 stuck suspected：注入 Recovery
-                                    # Turn（与工具执行路径一致），继续运行。
-                                    self.record(
-                                        {
-                                            "role": "assistant",
-                                            "content": RECOVERY_TURN_PROMPT,
-                                            "created_at": now(),
-                                        }
-                                    )
-                                    native_messages.append(
-                                        {"role": "user", "content": RECOVERY_TURN_PROMPT}
-                                    )
-                                    self.emit_run_status(
-                                        task_state,
-                                        "stuck_suspected",
-                                        "Recovery turn",
-                                        detail=watchdog_decision.stuck_pattern,
-                                        started_at=run_started_wall,
-                                        run_started_at=run_started_at,
-                                    )
-                                    self.run_store.write_task_state(task_state)
-                                    continue
-                                if watchdog_decision.confirmed_now:
-                                    return self.stop_stuck_confirmed_run(
-                                        task_state,
-                                        user_message,
-                                        run_started_wall,
-                                        run_started_at,
-                                    )
-                                kind, payload = (
-                                    "retry",
-                                    "Repeated evidence request: this read/search/symbol "
-                                    "repeats already-observed evidence without a workspace "
-                                    "change. Make the smallest justified edit now, or "
-                                    "request genuinely new evidence (new file, new range, "
-                                    "new symbol, new search, or a re-read after a file change).",
-                                )
-                        else:
-                            kind, payload = (
-                                "tool",
-                                {
-                                    "name": requested_name,
-                                    "args": requested_args,
-                                    "tool_call_id": call.id,
-                                    "edit_decision": decision,
-                                },
-                            )
-                    else:
-                        kind, payload = (
-                            "tool",
-                            {
-                                "name": call.name,
-                                "args": call.arguments,
-                                "tool_call_id": call.id,
-                            },
-                        )
-                    if kind == "retry":
-                        # A rejected first call is not retained in native
-                        # history, so the next model request cannot contain an
-                        # unanswered assistant tool call.  A rejected queued
-                        # call, however, already belongs to an accepted batch
-                        # and must receive a matching tool result.
-                        if raw.raw_metadata.get("queued_native_call"):
-                            native_messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": call.id,
-                                    "content": f"error: {payload}",
-                                }
-                            )
-                        else:
-                            # Phase 2.6: 拒绝原因要能被 native 模型看到（不保留
-                            # 未应答的 assistant tool call，因此补一条 user 消息）。
-                            native_messages.append(
-                                {"role": "user", "content": str(payload)}
-                            )
-                    elif not raw.raw_metadata.get("queued_native_call"):
-                        native_messages.append(
-                            {
-                                "role": "assistant",
-                                "content": raw.text or None,
-                                "tool_calls": [
-                                    {
-                                        "id": item.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": item.name,
-                                            "arguments": json.dumps(item.arguments),
-                                        },
-                                    }
-                                    for item in raw.tool_calls
-                                ],
-                            }
-                        )
-                        pending_native_calls.extend(
-                            type(raw)(
-                                tool_calls=(item,),
-                                raw_metadata={"queued_native_call": True},
-                            )
-                            for item in raw.tool_calls[1:]
-                        )
-                    if len(raw.tool_calls) > 1:
-                        self.emit_trace(
-                            task_state,
-                            "native_tool_batch_queued",
-                            {
-                                "received": len(raw.tool_calls),
-                                "queued": len(raw.tool_calls) - 1,
-                            },
-                        )
-                else:
-                    final_text = str(raw.text or "").strip()
-                    if not final_text:
-                        # Phase 2.6（Probe B/C 暴露）：native 路径与 legacy 一致，
-                        # 空 final 不算成功完成——拒绝并要求模型给出非空答案或工具
-                        # 调用，避免“completed 但 final_answer 为空”的误导记录。
-                        kind, payload = (
-                            "retry",
-                            Pico.retry_notice("model returned an empty final response"),
-                        )
-                        # 让 native 模型看到拒绝原因（空 final 没有未应答的
-                        # assistant tool call，直接补一条 user 消息）。
-                        native_messages.append(
-                            {"role": "user", "content": str(payload)}
-                        )
-                    else:
-                        kind, payload = "final", final_text
-            else:
-                kind, payload = self.parse(raw)
-            self.emit_trace(
-                task_state,
-                "model_parsed",
-                {
-                    "kind": kind,
-                    "completion_metadata": completion_metadata,
-                    "duration_ms": int((time.monotonic() - model_started_at) * 1000),
-                },
-            )
-
-            if kind == "tool":
-                name = payload.get("name", "")
-                args = payload.get("args", {})
-                if finalization_required and task_policy.is_research_tool(name):
-                    finalization_rejections += 1
-                    notice = task_policy.finalization_notice(
-                        self.current_run_source_reads, research_steps, research_budget
-                    )
-                    self.record(
-                        {"role": "assistant", "content": notice, "created_at": now()}
-                    )
-                    self.emit_trace(
-                        task_state,
-                        "research_budget_exhausted",
-                        {
-                            "tool_name": name,
-                            "research_steps": research_steps,
-                            "research_budget": research_budget,
-                            "finalization_rejections": finalization_rejections,
-                        },
-                    )
-                    if finalization_rejections >= 2:
-                        return self.stop_finalization_failed_run(
-                            task_state, user_message, run_started_wall, run_started_at
-                        )
-                    self.run_store.write_task_state(task_state)
-                    continue
-                tool_steps += 1
-                task_state.record_tool(name)
-                tool_started_at = time.monotonic()
-                self.emit_run_status(
-                    task_state,
-                    "tool_running",
-                    f"Executing tool: {name}",
-                    detail=name,
-                    started_at=run_started_wall,
-                    run_started_at=run_started_at,
-                )
-                read_notice = ""
-                read_classification = "new"
-                if name == "read_file":
-                    read_notice, read_classification = self.read_guard_notice(args)
-                result = self.run_tool(name, args)
-                if read_notice:
-                    result = f"{read_notice}\n\n{result}"
-                if name == "read_file":
-                    self._last_tool_result_metadata["read_evidence_classification"] = (
-                        read_classification
-                    )
-                    if read_classification == "avoidable_repeated_read":
-                        self.current_planning["avoidable_repeated_read_calls"] += 1
-                    elif read_classification == "evidence_evicted_reread":
-                        self.current_planning["evidence_evicted_reread_calls"] += 1
-                    self.record_read_evidence(args, result, task_state.tool_steps)
-                elif bool(
-                    (self._last_tool_result_metadata or {}).get("workspace_changed")
-                ):
-                    self.invalidate_evidence_for_paths(
-                        (self._last_tool_result_metadata or {}).get("affected_paths")
-                    )
-                if self.cancellation_requested(task_state):
-                    return self.stop_user_canceled_run(
-                        task_state, run_started_wall, run_started_at
-                    )
-                self.record(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
-                        "created_at": now(),
-                    }
-                )
-                if native_mode:
-                    native_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": payload.get("tool_call_id", ""),
-                            "content": result,
-                        }
-                    )
-                if name == "read_file" and task_policy.is_source_path(args.get("path")):
-                    self.current_run_source_reads.append(str(args.get("path")))
-                if research_budget is not None and task_policy.is_research_tool(name):
-                    research_steps += 1
-                self.run_store.write_task_state(task_state)
-                tool_event_payload = {
-                    "name": name,
-                    "args": args,
-                    "result": clip(result, 500),
-                    "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
-                    **dict(self._last_tool_result_metadata or {}),
-                }
-                self.emit_trace(task_state, "tool_executed", tool_event_payload)
-                if self.event_handler is not None:
-                    self.event_handler(
-                        "tool_executed", dict(tool_event_payload), self, task_state
-                    )
-                semantic_repeat = self.update_planning_state(
-                    name, args, self._last_tool_result_metadata, task_state.tool_steps
-                )
-                if self.working_state is not None:
-                    self.working_state.update_from_tool_event(
-                        name,
-                        args,
-                        self._last_tool_result_metadata,
-                        result,
-                        task_state.tool_steps,
-                        self.root,
-                    )
-                    self.emit_trace(
-                        task_state,
-                        "working_state_updated",
-                        {
-                            "step": task_state.tool_steps,
-                            "changed_files": list(self.working_state.changed_files),
-                            "verification_status": (
-                                self.working_state.verification[-1].get("status", "")
-                                if self.working_state.verification
-                                else ""
-                            ),
-                        },
-                    )
-                # Phase 3: blocker / relevant-symbol / changed-file 实质变化时
-                # 重新 retrieval（避免每 tool step 全库检索）。
-                if self.memory_v2_enabled() and (
-                    self._memory_signature() != self._memory_retrieval_signature
-                ):
-                    self._refresh_memory_retrieval(user_message)
-                # A native assistant tool-call message must be followed by a
-                # tool result for every call before any user message.  Providers
-                # can return a batch despite advertising no parallel support;
-                # defer decision feedback until its queued calls are drained.
-                if (
-                    native_mode
-                    and payload.get("edit_decision")
-                    and not pending_native_calls
-                ):
-                    decision = payload["edit_decision"]
-                    if decision == "need_evidence":
-                        # 真实执行的 evidence 登记进 EditDecisionWatchdog，
-                        # 供后续重复检测（同范围 / 同 search / 同 symbol）。
-                        self.edit_decision_watchdog.mark_evidence_executed(
-                            name, args, task_state.tool_steps
-                        )
-                        notice = (
-                            "Edit decision recorded as need_evidence and executed. "
-                            "Continue while each request adds genuinely new evidence "
-                            "(new file, new range, new symbol, new search, or a re-read "
-                            "after a file change); repeated evidence with no workspace "
-                            "change will be rejected. When the evidence is sufficient, "
-                            "make the smallest justified edit."
-                        )
-                    else:
-                        notice = (
-                            "Edit decision recorded as edit. "
-                            "Run a focused verification command before finalizing."
-                        )
-                    native_messages.append({"role": "user", "content": notice})
-                    self.emit_trace(
-                        task_state,
-                        "edit_decision_feedback",
-                        {"decision": decision, "tool": name},
-                    )
-                if semantic_repeat:
-                    self.emit_trace(
-                        task_state,
-                        "semantic_redundant_exploration",
-                        {"tool_name": name, "tool_step": task_state.tool_steps},
-                    )
-                # 纯 observability：exploration / implementation warning 仍会发出，
-                # 但它们不再直接导致停机。是否卡住只由 Progress Watchdog 判定。
-                self.maybe_emit_exploration_warning(task_state)
-                self.maybe_emit_implementation_warning(task_state)
-                checkpoint = self.create_checkpoint(
-                    task_state, user_message, trigger="tool_executed"
-                )
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "tool_executed",
-                    },
-                )
-                # Phase 1: Progress Watchdog 是唯一的 stuck 决策来源。
-                watchdog_decision = self._advance_watchdog(
-                    task_state, name, args, result, task_state.tool_steps
-                )
-                if watchdog_decision.suspected_now:
-                    # 第一次疑似卡住：注入 Recovery Turn 提示（不含任务答案），
-                    # 继续运行，不直接结束。
-                    self.record(
-                        {
-                            "role": "assistant",
-                            "content": RECOVERY_TURN_PROMPT,
-                            "created_at": now(),
-                        }
-                    )
-                    if native_mode:
-                        native_messages.append(
-                            {"role": "user", "content": RECOVERY_TURN_PROMPT}
-                        )
-                    # Phase 3: recovery turn 是 retrieval trigger。
-                    if self.memory_v2_enabled():
-                        self._refresh_memory_retrieval(user_message)
-                    self.emit_run_status(
-                        task_state,
-                        "stuck_suspected",
-                        "Recovery turn",
-                        detail=watchdog_decision.stuck_pattern,
-                        started_at=run_started_wall,
-                        run_started_at=run_started_at,
-                    )
-                    self.run_store.write_task_state(task_state)
-                    continue
-                if watchdog_decision.confirmed_now:
-                    return self.stop_stuck_confirmed_run(
-                        task_state,
-                        user_message,
-                        run_started_wall,
-                        run_started_at,
-                    )
-                if research_budget is not None and research_steps >= research_budget:
-                    finalization_required = True
-                    notice = task_policy.finalization_notice(
-                        self.current_run_source_reads, research_steps, research_budget
-                    )
-                    self.record(
-                        {"role": "assistant", "content": notice, "created_at": now()}
-                    )
-                    self.emit_trace(
-                        task_state,
-                        "finalization_required",
-                        {
-                            "source_reads": list(self.current_run_source_reads),
-                            "research_steps": research_steps,
-                            "research_budget": research_budget,
-                        },
-                    )
-                    self.emit_run_status(
-                        task_state,
-                        "finalization_required",
-                        "Generating answer from collected evidence",
-                        detail=f"{research_steps}/{research_budget}",
-                        started_at=run_started_wall,
-                        run_started_at=run_started_at,
-                    )
-                continue
-
-            if kind == "retry":
-                self.record(
-                    {"role": "assistant", "content": payload, "created_at": now()}
-                )
-                self.run_store.write_task_state(task_state)
-                continue
-
-            if (
-                task_policy.requires_source_evidence(user_message)
-                and not self.current_run_source_reads
-            ):
-                notice = task_policy.evidence_retry_notice()
-                self.record(
-                    {"role": "assistant", "content": notice, "created_at": now()}
-                )
-                self.emit_trace(
-                    task_state,
-                    "evidence_insufficient",
-                    {"required": "source_file_read", "source_reads": []},
-                )
-                self.run_store.write_task_state(task_state)
-                continue
-            if (
-                native_mode
-                and self.requires_workspace_change
-                and self.current_planning["workspace_change_count"]
-                > self.current_planning["last_verified_change_count"]
-            ):
-                notice = (
-                    "A workspace change was made but has not been verified. "
-                    "Run one focused verification command now, then provide the final answer."
-                )
-                self.record(
-                    {"role": "assistant", "content": notice, "created_at": now()}
-                )
-                if native_mode:
-                    native_messages.append({"role": "user", "content": notice})
-                self.emit_trace(
-                    task_state,
-                    "verification_required_after_change",
-                    {
-                        "workspace_change_count": self.current_planning[
-                            "workspace_change_count"
-                        ],
-                        "last_verified_change_count": self.current_planning[
-                            "last_verified_change_count"
-                        ],
-                    },
-                )
-                self.run_store.write_task_state(task_state)
-                continue
-            # Native providers may return a normal finish with an empty text
-            # field.  `raw` is a ModelResponse in that mode, never fallback
-            # content for a final answer.
-            final = str(payload or "").strip()
-            return self.finish_successful_run(
-                task_state, user_message, final, run_started_wall, run_started_at
-            )
+    def _ask_legacy(self, user_message, run_id="", preparation=None):
+        """Compatibility entry point; AgentLoop owns the model/tool loop."""
+        if preparation is None:
+            preparation = self.turn_runner.lifecycle.initialize(user_message, run_id)
+        self.turn_runner.lifecycle.bind_loop(self.agent_loop)
+        return self.agent_loop.run(user_message, run_id=run_id, preparation=preparation)
 
     def stop_finalization_failed_run(
         self, task_state, user_message, run_started_wall, run_started_at
     ):
-        final = "Stopped because the model did not produce a final answer after the research budget was exhausted."
-        task_state.stop("finalization_failed", final_answer=final)
-        self.record({"role": "assistant", "content": final, "created_at": now()})
-        self.promote_durable_memory(user_message, final)
-        self.extract_memory_v2(user_message, final)
-        self.run_store.write_task_state(task_state)
-        self.emit_run_finished(task_state, final, run_started_at)
-        self.emit_run_status(
-            task_state,
-            "failed",
-            "Failed",
-            detail="finalization_failed",
-            started_at=run_started_wall,
-            run_started_at=run_started_at,
+        return AgentLoop.finalization_failed(
+            task_state, user_message, run_started_at, run_started_wall,
         )
-        self.write_final_report(task_state)
-        return final
 
     def write_final_report(self, task_state):
         # Phase 3: run 结束时的 stale-revalidation 记账（在 report 生成前）。
@@ -2824,36 +2198,6 @@ class Pico:
             },
         )
 
-    def finish_successful_run(
-        self, task_state, user_message, final, run_started_wall, run_started_at
-    ):
-        self.emit_run_status(
-            task_state,
-            "finalizing",
-            "Finalizing response",
-            started_at=run_started_wall,
-            run_started_at=run_started_at,
-        )
-        self.record({"role": "assistant", "content": final, "created_at": now()})
-        task_state.finish_success(final)
-        self.promote_durable_memory(user_message, final)
-        self.extract_memory_v2(user_message, final)
-        checkpoint = self.create_checkpoint(
-            task_state, user_message, trigger="run_finished"
-        )
-        self.run_store.write_task_state(task_state)
-        self.emit_checkpoint_created(task_state, checkpoint, "run_finished")
-        self.emit_run_finished(task_state, final, run_started_at)
-        self.emit_run_status(
-            task_state,
-            "completed",
-            "Completed",
-            started_at=run_started_wall,
-            run_started_at=run_started_at,
-        )
-        self.write_final_report(task_state)
-        return final
-
     def stop_limited_run(
         self,
         task_state,
@@ -2864,31 +2208,10 @@ class Pico:
         run_started_wall,
         run_started_at,
     ):
-        budget = self.effective_step_budget
-        if attempts >= attempt_cap and (budget is None or tool_steps < budget):
-            final = "Stopped after too many malformed model responses without a valid tool call or final answer."
-            task_state.stop_retry_limit(final)
-        else:
-            final = "Stopped after reaching the step limit without a final answer."
-            task_state.stop_step_limit(final)
-        self.record({"role": "assistant", "content": final, "created_at": now()})
-        self.promote_durable_memory(user_message, final)
-        self.extract_memory_v2(user_message, final)
-        self.run_store.write_task_state(task_state)
-        trigger = task_state.stop_reason or "run_stopped"
-        checkpoint = self.create_checkpoint(task_state, user_message, trigger=trigger)
-        self.emit_checkpoint_created(task_state, checkpoint, trigger)
-        self.emit_run_finished(task_state, final, run_started_at)
-        self.emit_run_status(
-            task_state,
-            "failed",
-            "Failed",
-            detail=task_state.stop_reason,
-            started_at=run_started_wall,
-            run_started_at=run_started_at,
+        return AgentLoop.limited(
+            task_state, user_message, attempts, attempt_cap, tool_steps,
+            self.effective_step_budget, run_started_at, run_started_wall,
         )
-        self.write_final_report(task_state)
-        return final
 
     def _advance_watchdog(self, task_state, name, args, result, step, metadata=None):
         """把一次工具事件交给 Progress Watchdog，并发射 trace 事件。
@@ -2900,63 +2223,11 @@ class Pico:
         也可显式传入（例如 EditDecisionWatchdog 拒绝重复 evidence 时合成的
         rejected 事件，此时没有真实工具执行）。
         """
-        decision = self.watchdog.record_tool_event(
-            name,
-            args,
+        return self.loop_state_collaborator.observe_watchdog(
+            task_state, name, args,
             self._last_tool_result_metadata if metadata is None else metadata,
-            result,
-            step,
+            result, step,
         )
-        for signal in decision.progress_signals:
-            self.emit_trace(
-                task_state,
-                "progress_detected",
-                {
-                    "kind": signal.kind,
-                    "reason": self.redact_text(signal.reason),
-                    "step": signal.step,
-                },
-            )
-        if decision.suspected_now:
-            self.emit_trace(
-                task_state,
-                "stuck_suspected",
-                {
-                    "pattern": decision.stuck_pattern,
-                    "step": step,
-                    "no_progress_score": self.watchdog.no_progress_score,
-                },
-            )
-            self.watchdog.begin_recovery(step)
-            self.emit_trace(
-                task_state,
-                "recovery_turn_started",
-                {
-                    "step": step,
-                    "recovery_turn_count": self.watchdog.recovery_turn_count,
-                },
-            )
-        elif decision.recovered_now:
-            self.emit_trace(
-                task_state,
-                "recovery_turn_finished",
-                {
-                    "success": True,
-                    "step": step,
-                    "recovery_success_count": self.watchdog.recovery_success_count,
-                },
-            )
-        elif decision.confirmed_now:
-            self.emit_trace(
-                task_state,
-                "stuck_confirmed",
-                {
-                    "pattern": decision.stuck_pattern,
-                    "step": step,
-                    "stuck_confirmed_count": self.watchdog.stuck_confirmed_count,
-                },
-            )
-        return decision
 
     def stop_stuck_confirmed_run(
         self,
@@ -2966,43 +2237,14 @@ class Pico:
         run_started_at,
     ):
         """STUCK_CONFIRMED：experiment 以 stop_reason 结束；interactive graceful stop。"""
-        pattern = self.watchdog.current_pattern or "no_progress_window"
-        if self.runtime_mode == RUNTIME_MODE_INTERACTIVE:
-            last_reason = self.watchdog.last_progress_reason or "the start of the task"
-            last_step = self.watchdog.last_progress_step or 0
-            final = (
-                "Agent paused because it appears stuck.\n"
-                f"Current blocker: repeated recovery turns did not produce new "
-                f"evidence, workspace changes, or verification information.\n"
-                f"Last useful progress: {last_reason} (step {last_step})."
-            )
-        else:
-            final = (
-                "Stopped because the agent appeared stuck and did not recover "
-                f"(pattern: {pattern})."
-            )
-        task_state.stop(STOP_REASON_STUCK_CONFIRMED, final_answer=final)
-        self.record({"role": "assistant", "content": final, "created_at": now()})
-        self.promote_durable_memory(user_message, final)
-        self.extract_memory_v2(user_message, final)
-        self.run_store.write_task_state(task_state)
-        checkpoint = self.create_checkpoint(
-            task_state, user_message, trigger=STOP_REASON_STUCK_CONFIRMED
+        return AgentLoop.stuck(
+            task_state, user_message, runtime_mode=self.runtime_mode,
+            pattern=self.watchdog.current_pattern,
+            last_reason=self.watchdog.last_progress_reason,
+            last_step=self.watchdog.last_progress_step,
+            interactive_mode=RUNTIME_MODE_INTERACTIVE,
+            started_at=run_started_at, started_wall=run_started_wall,
         )
-        self.emit_checkpoint_created(
-            task_state, checkpoint, STOP_REASON_STUCK_CONFIRMED
-        )
-        self.emit_run_finished(task_state, final, run_started_at)
-        self.emit_run_status(
-            task_state,
-            "failed",
-            "Stopped",
-            detail=task_state.stop_reason,
-            started_at=run_started_wall,
-            run_started_at=run_started_at,
-        )
-        self.write_final_report(task_state)
-        return final
 
     def stop_emergency_cap_run(
         self,
@@ -3013,194 +2255,36 @@ class Pico:
         run_started_at,
     ):
         """Interactive 模式的 emergency fuse：只兜 Runtime Bug / watchdog 漏检 / runaway。"""
-        final = (
-            "Stopped after reaching the emergency step cap "
-            f"({emergency_cap}) without a final answer."
+        return AgentLoop.emergency_cap(
+            task_state, user_message, emergency_cap, run_started_at, run_started_wall,
         )
-        task_state.stop(STOP_REASON_EMERGENCY_CAP_REACHED, final_answer=final)
-        self.record({"role": "assistant", "content": final, "created_at": now()})
-        self.promote_durable_memory(user_message, final)
-        self.extract_memory_v2(user_message, final)
-        self.run_store.write_task_state(task_state)
-        self.emit_trace(
-            task_state,
-            "emergency_cap_reached",
-            {
-                "cap": int(emergency_cap or 0),
-                "tool_steps": task_state.tool_steps,
-            },
-        )
-        checkpoint = self.create_checkpoint(
-            task_state, user_message, trigger=STOP_REASON_EMERGENCY_CAP_REACHED
-        )
-        self.emit_checkpoint_created(
-            task_state, checkpoint, STOP_REASON_EMERGENCY_CAP_REACHED
-        )
-        self.emit_run_finished(task_state, final, run_started_at)
-        self.emit_run_status(
-            task_state,
-            "failed",
-            "Stopped",
-            detail=task_state.stop_reason,
-            started_at=run_started_wall,
-            run_started_at=run_started_at,
-        )
-        self.write_final_report(task_state)
-        return final
 
-    def run_tool(self, name, args):
-        """执行一次工具调用，并在执行前后套上完整护栏。
+    @staticmethod
+    def _side_effect_args_digest(args):
+        normalized = json.dumps(args or {}, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-        为什么存在：
-        在 agent 系统里，真正危险的不是“模型会不会想调用工具”，而是
-        “平台有没有在执行前把边界守住”。这个函数就是工具层的总闸口：
-        所有工具调用都必须先经过它，不能让模型直接碰到底层函数。
+    @staticmethod
+    def _side_effect_result_metadata(metadata):
+        return {
+            key: (metadata or {}).get(key)
+            for key in (
+                "tool_status",
+                "tool_error_code",
+                "tool_execution_success",
+                "tool_business_success",
+                "tool_result_validation_failed",
+                "tool_result_failure_reason",
+                "workspace_changed",
+            )
+        }
 
-        输入 / 输出：
-        - 输入：工具名 `name`，参数字典 `args`
-        - 输出：字符串结果。无论是成功结果还是错误信息，都会统一返回文本，
-          这样模型下一轮都能继续消费这份反馈。
+    def run_tool(self, name, args, operation_key=""):
+        return self.tool_executor.execute(name, args, operation_key=operation_key)
 
-        在 agent 链路里的位置：
-        它位于 `ask()` 的“模型决定要调用工具”之后，是控制循环里真正把模型
-        意图落到外部世界的一步。因此这里串起了几乎所有安全与可控设计：
-        工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
-        是否需要回写记忆。
-        """
-        # 工具执行不是“直接调函数”，而是一条带护栏的流水线：
-        # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
-        # -> 真正执行 -> 更新记忆。
-        tool = self.tools.get(name)
-        if tool is None:
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "unknown_tool",
-                "security_event_type": "",
-                "risk_level": "high",
-                "read_only": False,
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return f"error: unknown tool '{name}'"
-        try:
-            self.validate_tool(name, args)
-        except Exception as exc:
-            example = self.tool_example(name)
-            message = f"error: invalid arguments for {name}: {exc}"
-            if example:
-                message += f"\nexample: {example}"
-            security_event_type = (
-                "path_escape" if "path escapes workspace" in str(exc) else ""
-            )
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "invalid_arguments",
-                "security_event_type": security_event_type,
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return message
-        if self.repeated_tool_call(name, args):
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "repeated_identical_call",
-                "security_event_type": "",
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return (
-                f"error: repeated identical tool call for {name}; "
-                f"same no-progress action reached {REPEATED_NO_PROGRESS_LIMIT} consecutive attempts"
-            )
-        if tool["risky"] and not self.approve(name, args):
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "approval_denied",
-                "security_event_type": "read_only_block"
-                if self.read_only
-                else "approval_denied",
-                "risk_level": "high",
-                "read_only": False,
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return f"error: approval denied for {name}"
-        before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
-        after_snapshot = before_snapshot
-        try:
-            result = clip(tool["run"](args))
-            after_snapshot = (
-                self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
-            )
-            affected_paths, diff_summary = self.diff_workspace_snapshots(
-                before_snapshot, after_snapshot
-            )
-            workspace_changed = bool(affected_paths)
-            tool_status = "ok"
-            tool_error_code = ""
-            if name == "run_shell":
-                match = re.search(r"exit_code:\s*(-?\d+)", result)
-                exit_code = int(match.group(1)) if match else 0
-                if exit_code != 0 and workspace_changed:
-                    tool_status = "partial_success"
-                    tool_error_code = "tool_partial_success"
-                elif exit_code != 0:
-                    tool_status = "error"
-                    tool_error_code = "tool_failed"
-            self.update_memory_after_tool(name, args, result)
-            self._last_tool_result_metadata = {
-                "tool_status": tool_status,
-                "tool_error_code": tool_error_code,
-                "security_event_type": "",
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": affected_paths,
-                "workspace_changed": workspace_changed,
-                "workspace_fingerprint": self.workspace.fingerprint(),
-                "diff_summary": diff_summary,
-            }
-            if workspace_changed:
-                self._last_tool_result_metadata["code_index_refresh"] = (
-                    self.code_index.refresh(affected_paths)
-                )
-            # Phase 3: 客观工具事件 → Evidence Store。
-            self.record_memory_v2_evidence(name, args, result)
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
-            return result
-        except Exception as exc:
-            after_snapshot = (
-                self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
-            )
-            affected_paths, diff_summary = self.diff_workspace_snapshots(
-                before_snapshot, after_snapshot
-            )
-            workspace_changed = bool(affected_paths)
-            security_event_type = (
-                "path_escape" if "path escapes workspace" in str(exc) else ""
-            )
-            self._last_tool_result_metadata = {
-                "tool_status": "partial_success" if workspace_changed else "error",
-                "tool_error_code": "tool_partial_success"
-                if workspace_changed
-                else "tool_failed",
-                "security_event_type": security_event_type,
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": affected_paths,
-                "workspace_changed": workspace_changed,
-                "workspace_fingerprint": self.workspace.fingerprint(),
-                "diff_summary": diff_summary,
-            }
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
-            return f"error: tool {name} failed: {exc}"
+    def _run_tool_legacy(self, name, args, operation_key=""):
+        """Compatibility entry point; ToolExecutor owns the implementation."""
+        return self.tool_executor.execute(name, args, operation_key=operation_key)
 
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
@@ -3251,6 +2335,14 @@ class Pico:
             "avoidable_repeated_read_calls": 0,
             "evidence_evicted_reread_calls": 0,
             "read_guard_notices": set(),
+            "read_range_ledger": [],
+            "read_guard_triggered": 0,
+            "redundant_read_suppressed": 0,
+            "redundant_read_forced": 0,
+            "read_range_ledger_entries": 0,
+            "read_guard_delta_reads": 0,
+            "read_guard_delta_lines_returned": 0,
+            "read_guard_covered_lines_skipped": 0,
             "action_readiness": "unknown",
             "action_readiness_transitions": [{"state": "unknown", "tool_step": 0}],
             "edit_decision_count": 0,
@@ -3269,90 +2361,95 @@ class Pico:
         return True
 
     def update_planning_state(self, name, args, metadata, tool_step):
-        state = self.current_planning
-        status = str((metadata or {}).get("tool_status", ""))
-        if name in task_policy.ACTION_TOOLS:
-            if state["first_action_step"] is None:
-                state["first_action_step"] = tool_step
-                state["exploration_steps_before_first_action"] = state[
-                    "consecutive_exploration"
-                ]
-            state["consecutive_exploration"] = 0
-            state["seen_reads"].clear()
-            state["seen_searches"].clear()
-            if bool((metadata or {}).get("workspace_changed")):
-                state["workspace_change_count"] += 1
-                if state["first_workspace_change_step"] is None:
-                    state["first_workspace_change_step"] = tool_step
-                self.set_action_readiness(state, "action_taken", tool_step)
-            if status == "rejected":
-                state["rejected_steps"] += 1
-            return False
-        if status == "rejected":
-            state["rejected_steps"] += 1
-            return False
-        if name == "run_shell":
-            state["verification_steps"] += 1
-            if state["first_execution_step"] is None:
-                state["first_execution_step"] = tool_step
-            if state["first_action_step"] is None:
-                state["verification_before_first_action"] += 1
-            epoch = state["workspace_change_count"]
-            signature = (task_policy.normalize_shell_command(args), epoch)
-            redundant = signature in state["seen_verifications"]
-            state["seen_verifications"].add(signature)
-            if redundant:
-                state["redundant_verification_steps"] += 1
-            else:
-                state["productive_verification_steps"] += 1
-            if epoch > state["last_verified_change_count"]:
-                if state["first_verification_after_change_step"] is None:
-                    state["first_verification_after_change_step"] = tool_step
-                state["last_verified_change_count"] = epoch
-            return redundant
-        if name not in task_policy.EXPLORATION_TOOLS:
-            return False
-        state["consecutive_exploration"] += 1
-        if (
-            status == "ok"
-            and self.requires_workspace_change
-            and not state["workspace_change_count"]
-        ):
-            if name == "read_file" and task_policy.is_source_path(args.get("path")):
-                profile = getattr(self.model_client, "connection_profile", None)
-                requires_two_source_reads = bool(
-                    getattr(self.model_client, "supports_native_tools", False)
-                    and profile is not None
-                    and not getattr(profile, "supports_tool_choice", False)
-                )
-                if (
-                    not requires_two_source_reads
-                    or len(self.current_run_source_reads) >= 2
-                ):
-                    self.set_action_readiness(state, "action_expected", tool_step)
-            elif state["action_readiness"] == "unknown":
-                self.set_action_readiness(state, "evidence_gathering", tool_step)
-        redundant = False
-        if name == "search":
-            signature = task_policy.normalize_search(args)
-            redundant = signature in state["seen_searches"]
-            state["seen_searches"].add(signature)
-        elif name == "read_file":
-            path = task_policy.canonical_path(args.get("path"))
-            prior = state["seen_reads"].setdefault(path, [])
-            redundant = any(
-                task_policy.read_overlap_ratio(args, previous) >= READ_OVERLAP_THRESHOLD
-                for previous in prior
-            )
-            prior.append(dict(args))
-        if redundant:
-            state["redundant_exploration_steps"] += 1
-        else:
-            state["productive_exploration_steps"] += 1
-        return redundant
+        self.loop_state_collaborator.synchronize(planning=self.current_planning)
+        profile = getattr(self.model_client, "connection_profile", None)
+        requires_two_source_reads = bool(
+            getattr(self.model_client, "supports_native_tools", False)
+            and profile is not None
+            and not getattr(profile, "supports_tool_choice", False)
+        )
+        return self.loop_state_collaborator.update_planning_state(
+            name, args, metadata, tool_step,
+            requires_workspace_change=self.requires_workspace_change,
+            source_read_count=len(self.current_run_source_reads),
+            requires_two_source_reads=requires_two_source_reads,
+        )
 
     def evidence_ledger_entries(self):
         return list(self.current_planning.get("evidence_ledger", []))
+
+    def read_range_ledger_entries(self):
+        return list(self.current_planning.get("read_range_ledger", []))
+
+    def _read_range_version(self, path):
+        return memorylib.file_freshness(task_policy.canonical_path(path), self.root)
+
+    def assess_read_range(self, args):
+        path = task_policy.canonical_path((args or {}).get("path"))
+        if not path:
+            return None, ""
+        freshness = self._read_range_version(path)
+        coverage = analyze_read_coverage(
+            path,
+            int((args or {}).get("start", 1)),
+            int((args or {}).get("end", 200)),
+            self.current_planning.get("read_range_ledger", []),
+            freshness,
+        )
+        return coverage, freshness
+
+    def record_read_range(self, args, step):
+        path = task_policy.canonical_path((args or {}).get("path"))
+        if not path:
+            return
+        record = ReadRangeRecord(
+            path=path,
+            start_line=int((args or {}).get("start", 1)),
+            end_line=int((args or {}).get("end", 200)),
+            freshness=self._read_range_version(path),
+            step=int(step or 0),
+        )
+        ledger = self.current_planning.setdefault("read_range_ledger", [])
+        previous = [
+            item if isinstance(item, ReadRangeRecord) else ReadRangeRecord(**item)
+            for item in ledger
+        ]
+        ledger[:] = [
+            {
+                "path": item.path,
+                "start_line": item.start_line,
+                "end_line": item.end_line,
+                "freshness": item.freshness,
+                "step": item.step,
+            }
+            for item in merge_read_ranges(previous, record)[-READ_RANGE_LEDGER_LIMIT:]
+        ]
+        self.current_planning["read_range_ledger_entries"] = len(ledger)
+
+    def invalidate_read_ranges(self, paths):
+        changed = {task_policy.canonical_path(path) for path in (paths or [])}
+        if not changed:
+            return
+        # Keep old-version records as stale history.  Freshness filtering prevents
+        # them from suppressing a new read, while preserving the stale_read trace.
+        ledger = self.current_planning.get("read_range_ledger", [])
+        self.current_planning["read_range_ledger_entries"] = len(
+            ledger
+        )
+
+    def redundant_read_notice(self, args, coverage, action):
+        path = task_policy.canonical_path((args or {}).get("path"))
+        start, end = int((args or {}).get("start", 1)), int((args or {}).get("end", 200))
+        covered = ", ".join(
+            f"L{range_start}-L{range_end}"
+            for range_start, range_end in coverage.covered_ranges
+        )
+        return (
+            f"Read guard: {path} L{start}-L{end} is already covered by previous "
+            f"read evidence ({covered}) at step {coverage.previous_step}; unchanged=true. "
+            f"No source was returned; if raw source is specifically needed, call "
+            f"read_file(..., force=True). action={action}."
+        )
 
     def assess_read_evidence(self, args):
         """Classify a read against evidence rendered in the prompt that chose it."""
@@ -3406,6 +2503,7 @@ class Pico:
         return clip(hint, EVIDENCE_HINT_LIMIT)
 
     def record_read_evidence(self, args, result, tool_step):
+        self.loop_state_collaborator.synchronize(planning=self.current_planning)
         path = task_policy.canonical_path((args or {}).get("path"))
         if not path:
             return
@@ -3422,30 +2520,17 @@ class Pico:
                 "utf-8"
             )
         ).hexdigest()[:12]
+        self.loop_state_collaborator.record_read_evidence(
+            args, result, tool_step, freshness=entry["freshness"], hint=entry["hint"]
+        )
         ledger = self.current_planning["evidence_ledger"]
-        ledger[:] = [
-            prior
-            for prior in ledger
-            if not (
-                prior["path"] == entry["path"]
-                and prior["start"] == entry["start"]
-                and prior["end"] == entry["end"]
-                and prior["freshness"] == entry["freshness"]
-            )
-        ]
-        ledger.append(entry)
         if len(ledger) > EVIDENCE_LEDGER_LIMIT:
             del ledger[: len(ledger) - EVIDENCE_LEDGER_LIMIT]
             self.current_planning["evidence_eviction_count"] += 1
 
     def invalidate_evidence_for_paths(self, paths):
-        changed = {task_policy.canonical_path(path) for path in (paths or [])}
-        if not changed:
-            return
-        ledger = self.current_planning.get("evidence_ledger", [])
-        retained = [entry for entry in ledger if entry["path"] not in changed]
-        self.current_planning["evidence_eviction_count"] += len(ledger) - len(retained)
-        self.current_planning["evidence_ledger"] = retained
+        self.loop_state_collaborator.synchronize(planning=self.current_planning)
+        return self.loop_state_collaborator.invalidate_evidence_for_paths(paths)
 
     def maybe_emit_exploration_warning(self, task_state):
         state = self.current_planning
@@ -3517,6 +2602,24 @@ class Pico:
             + uuid.uuid4().hex[:6]
         )
 
+    def drain_runtime_injections(self, task_state):
+        provider = getattr(self, "injection_provider", None)
+        if provider is None:
+            return []
+        injected = list(provider() or [])
+        for item in injected:
+            message = str(getattr(item, "message", item)).strip()
+            if not message:
+                continue
+            self.loop_state_collaborator.adopt_protected_constraint(task_state, message)
+        return injected
+
+    def user_message_with_runtime_constraints(self, user_message):
+        if not self.protected_runtime_constraints:
+            return user_message
+        constraints = "\n".join(f"- {item}" for item in self.protected_runtime_constraints)
+        return f"{user_message}\n\nProtected runtime constraints (must obey):\n{constraints}"
+
     def cancellation_requested(self, task_state):
         checker = getattr(self, "cancel_checker", None)
         if checker is None:
@@ -3524,65 +2627,19 @@ class Pico:
         return bool(checker(self, task_state))
 
     def stop_user_canceled_run(self, task_state, run_started_wall, run_started_at):
-        final = "Canceled by user."
-        task_state.stop_user_canceled(final)
-        self.run_store.write_task_state(task_state)
-        self.emit_trace(
-            task_state,
-            "run_canceled",
-            {
-                "status": task_state.status,
-                "stop_reason": task_state.stop_reason,
-                "final_answer": final,
-                "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
-            },
+        return AgentLoop.cancelled(
+            task_state, task_state.user_request, run_started_at, run_started_wall,
         )
-        self.emit_run_status(
-            task_state,
-            "canceled",
-            "Canceled",
-            started_at=run_started_wall,
-            run_started_at=run_started_at,
-        )
-        self.write_final_report(task_state)
-        return final
 
     def stop_model_error_run(
         self, task_state, exc, model_started_at, run_started_wall, run_started_at
     ):
         error_message = self.redact_text(str(exc))
         error_type = exc.__class__.__name__
-        final = (
-            f"Model error: {error_message}"
-            if error_message
-            else f"Model error: {error_type}"
+        return AgentLoop.model_error(
+            task_state, task_state.user_request, error_type, error_message,
+            model_started_at, run_started_at, run_started_wall,
         )
-        self.last_model_error = {
-            "error_type": error_type,
-            "message": error_message,
-        }
-        task_state.stop_model_error(final)
-        self.run_store.write_task_state(task_state)
-        self.emit_trace(
-            task_state,
-            "model_error",
-            {
-                "error_type": error_type,
-                "message": error_message,
-                "duration_ms": int((time.monotonic() - model_started_at) * 1000),
-            },
-        )
-        self.emit_run_status(
-            task_state,
-            "failed",
-            "Failed",
-            detail="model_error",
-            started_at=run_started_wall,
-            run_started_at=run_started_at,
-        )
-        self.emit_run_finished(task_state, final, run_started_at)
-        self.write_final_report(task_state)
-        return final
 
     @staticmethod
     def validate_external_run_id(run_id):
@@ -3703,6 +2760,66 @@ class Pico:
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}
+
+    def _recover_native_text_tool_call(self, content):
+        """Strictly recover one legacy JSON tool envelope for native providers.
+
+        This is deliberately narrower than the legacy text protocol.  It only
+        turns an otherwise unambiguous textual intent into a normal ToolCall;
+        approval and execution remain in ``run_tool``.
+        """
+        text = str(content or "")
+        opening_tags = text.count("<tool")
+        closing_tags = text.count("</tool>")
+        if opening_tags > 1:
+            return None, "multiple_open_tags"
+        if closing_tags > 1:
+            return None, "multiple_close_tags"
+        if opening_tags == 0 and closing_tags == 1:
+            return None, "missing_opening_tag"
+        if opening_tags == 1 and closing_tags == 0:
+            return None, "missing_closing_tag"
+        if opening_tags == 0:
+            return None, None
+        match = re.fullmatch(r"\s*<tool>\s*(?P<body>.*?)\s*</tool>\s*", text, re.S)
+        if not match:
+            return None, "ambiguous_content"
+        try:
+            payload = json.loads(match.group("body"))
+        except json.JSONDecodeError:
+            return None, "malformed_json"
+        if not isinstance(payload, dict):
+            return None, "schema_failure"
+        if set(payload) != {"name", "args"}:
+            return None, "schema_failure"
+        name = payload.get("name")
+        args = payload.get("args")
+        if not isinstance(name, str) or not name.strip():
+            return None, "schema_failure"
+        if not isinstance(args, dict):
+            return None, "invalid_args"
+        name = name.strip()
+        tool = self.tools.get(name)
+        if tool is None:
+            return None, "unknown_tool"
+        declared = tool.get("schema", {})
+        if set(args) - set(declared):
+            return None, "schema_failure"
+        for key, value in args.items():
+            type_name = str(declared[key]).partition("=")[0]
+            valid = {
+                "str": isinstance(value, str),
+                "int": isinstance(value, int) and not isinstance(value, bool),
+                "float": isinstance(value, (int, float)) and not isinstance(value, bool),
+                "bool": isinstance(value, bool),
+            }.get(type_name, False)
+            if not valid:
+                return None, "schema_failure"
+        try:
+            self.validate_tool(name, args)
+        except Exception:
+            return None, "invalid_args"
+        return ToolCall(f"legacy-recovered-{uuid.uuid4().hex}", name, args), None
 
     @staticmethod
     def parse(raw):

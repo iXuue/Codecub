@@ -93,6 +93,7 @@ WORKING_STATE_MAX_BLOCKERS = 6
 WORKING_STATE_MAX_SYMBOLS = 16
 WORKING_STATE_MAX_FAILED_APPROACHES = 6
 WORKING_STATE_MAX_PENDING_QUESTIONS = 4
+WORKING_STATE_MAX_READ_RANGES = 20
 
 # Compressed History 中保留的条目上限（Recursive Condensation 时 summary 自身也受限）。
 MAX_COMPRESSED_HISTORY_ENTRIES = 40
@@ -113,6 +114,7 @@ PROVENANCE_FIELDS = (
 ITEM_KIND_PINNED = "pinned"
 ITEM_KIND_WORKING_STATE = "working_state"
 ITEM_KIND_RECENT_VERBATIM = "recent_verbatim"
+ITEM_KIND_RAW_EVIDENCE = "raw_evidence"
 ITEM_KIND_COMPRESSED_HISTORY = "compressed_history"
 ITEM_KIND_REPO_MAP = "repo_map"
 
@@ -160,6 +162,7 @@ class WorkingState:
     relevant_symbols: list = field(default_factory=list)  # [{name, path, kind}]
     failed_approaches: list = field(default_factory=list)  # [{text, step}]
     pending_questions: list = field(default_factory=list)  # [str]
+    read_ranges: list = field(default_factory=list)  # [{path, start_line, end_line, step, freshness}]
     last_updated_step: int = 0
 
     # ------------------------------------------------------------------
@@ -177,6 +180,7 @@ class WorkingState:
             changed = {canonical_path(str(p)) for p in (metadata.get("affected_paths") or [])}
             if changed:
                 self.invalidate_facts_for_paths(changed)
+                self.invalidate_read_ranges_for_paths(changed)
         status = str(metadata.get("tool_status", ""))
         if name == "run_shell":
             command = normalize_shell_command(args)
@@ -192,6 +196,16 @@ class WorkingState:
             path = str(args.get("path", "")).strip()
             if path:
                 self.add_relevant_symbol(path=path, name="", kind="file")
+            guard = metadata.get("read_range_guard") or {}
+            requested = guard.get("requested_range") or []
+            if path and len(requested) == 2 and guard.get("action") != "suppressed":
+                self.add_read_range(
+                    path,
+                    requested[0],
+                    requested[1],
+                    step,
+                    "stale_read" if guard.get("file_changed") else "unchanged",
+                )
         if name == "symbol_search" and status != "rejected":
             query = str(args.get("query", "")).strip()
             if query:
@@ -302,6 +316,35 @@ class WorkingState:
         self.pending_questions.append(question[:200])
         del self.pending_questions[:-WORKING_STATE_MAX_PENDING_QUESTIONS]
 
+    def add_read_range(self, path, start_line, end_line, step=0, freshness="unchanged"):
+        canonical = canonical_path(str(path))
+        if not canonical:
+            return
+        entry = {
+            "path": canonical,
+            "start_line": int(start_line),
+            "end_line": int(end_line),
+            "step": int(step or 0),
+            "freshness": str(freshness or "unchanged"),
+        }
+        self.read_ranges = [
+            item
+            for item in self.read_ranges
+            if not (
+                item.get("path") == canonical
+                and item.get("start_line") == entry["start_line"]
+                and item.get("end_line") == entry["end_line"]
+            )
+        ]
+        self.read_ranges.append(entry)
+        del self.read_ranges[:-WORKING_STATE_MAX_READ_RANGES]
+
+    def invalidate_read_ranges_for_paths(self, changed_paths):
+        changed = {canonical_path(str(path)) for path in (changed_paths or [])}
+        self.read_ranges = [
+            item for item in self.read_ranges if item.get("path") not in changed
+        ]
+
     def invalidate_facts_for_paths(self, changed_paths):
         """文件修改后，来源指向这些路径的 fact 标记 stale。"""
         changed = {canonical_path(str(p)) for p in (changed_paths or [])}
@@ -385,6 +428,13 @@ class WorkingState:
                 }
             )[:WORKING_STATE_MAX_SYMBOLS]
             lines.append("- Relevant Symbols: " + ", ".join(symbols))
+        if self.read_ranges:
+            lines.append("- Read Evidence:")
+            for item in self.read_ranges[-WORKING_STATE_MAX_READ_RANGES:]:
+                lines.append(
+                    f"  * {item['path']} L{item['start_line']}-L{item['end_line']} "
+                    f"@ step {item['step']}, {item['freshness']}"
+                )
         if self.failed_approaches:
             lines.append("- Failed Approaches:")
             for approach in self.failed_approaches:
@@ -406,6 +456,7 @@ class WorkingState:
             "relevant_symbols": list(self.relevant_symbols),
             "failed_approaches": list(self.failed_approaches),
             "pending_questions": list(self.pending_questions),
+            "read_ranges": list(self.read_ranges),
             "last_updated_step": self.last_updated_step,
         }
 
@@ -421,6 +472,7 @@ class WorkingState:
         state.relevant_symbols = list((data or {}).get("relevant_symbols", []))
         state.failed_approaches = list((data or {}).get("failed_approaches", []))
         state.pending_questions = list((data or {}).get("pending_questions", []))
+        state.read_ranges = list((data or {}).get("read_ranges", []))[-WORKING_STATE_MAX_READ_RANGES:]
         state.last_updated_step = int((data or {}).get("last_updated_step", 0))
         return state
 
@@ -772,7 +824,7 @@ class HistoryCondenser:
     # 公开入口
     # ------------------------------------------------------------------
 
-    def condense(self, history, goal="", step=0):
+    def condense(self, history, goal="", step=0, max_output_tokens=None, excluded_facts=None):
         """把旧 history 压缩为结构化 summary。失败时回退 deterministic 且保留 raw。
 
         返回 (summary_text, meta)：
@@ -780,7 +832,9 @@ class HistoryCondenser:
         - meta 记录 mode（llm/deterministic/fallback）、错误、token 估算。
         """
         raw_count = len(history)
-        deterministic = self._deterministic_condense(history, goal, step)
+        deterministic = self._deterministic_condense(
+            history, goal, step, max_output_tokens, excluded_facts
+        )
         if self.model_client is None:
             meta = {
                 "mode": "deterministic",
@@ -809,8 +863,72 @@ class HistoryCondenser:
     # Deterministic 模式
     # ------------------------------------------------------------------
 
-    def _deterministic_condense(self, history, goal, step):
+    @staticmethod
+    def _normalize_fact(text):
+        return re.sub(r"[\W_]+", "", str(text).lower())
+
+    def _extract_high_signal_facts(self, text, role):
+        if role not in {"user", "assistant"}:
+            return []
+        facts = []
+        # Do not split on every period: it is common inside file and symbol
+        # names (for example ``retrieval.py``).  A period is a sentence
+        # boundary here only when followed by whitespace and an uppercase
+        # sentence start; the other sentence terminators are unambiguous.
+        for fragment in re.split(
+            r"\n+|(?<=[!?。！？])\s+|(?<=\.)\s+(?=[A-Z])", str(text or "")
+        ):
+            value = " ".join(fragment.strip().split())
+            if not value:
+                continue
+            lower = value.lower()
+            if re.search(r"\b(do not|don't|must not|leave .+ unchanged)\b|禁止修改|不要修改|不得修改", lower):
+                category = "Constraints"
+            elif re.search(r"\b(must|require|should continue to|must remain|keep .+ compatible)\b|必须|需要|保持.*兼容", lower):
+                category = "Requirements"
+            elif re.search(r"\b(decision:|use .+ rather than|rather than)\b|决定|使用.+而不是", lower):
+                category = "Decisions"
+            elif re.search(r"\b(we confirmed|confirmed|caused by|not caused by|relevant implementation)\b|已确认|问题.*原因|不是.*导致", lower):
+                category = "Confirmed Facts"
+            elif re.search(r"\b(before|after|only|exactly|at least|at most|and|or|not)\b", lower):
+                category = "Logical Constraints"
+            else:
+                continue
+            facts.append((category, value[:360]))
+        return facts
+
+    def _fit_sections(self, sections, max_output_tokens):
+        lines = []
+        for title, entries in sections:
+            if not entries and title != "Earlier Investigation:":
+                continue
+            candidate = [title] + [f"- {entry}" for entry in entries]
+            if max_output_tokens is None:
+                lines.extend(candidate)
+                continue
+            if self.token_counter is None:
+                fits_title = len("\n".join(lines + [title])) <= max_output_tokens
+            else:
+                fits_title = self.token_counter.count("\n".join(lines + [title])) <= max_output_tokens
+            if not fits_title:
+                break
+            lines.append(title)
+            for entry in entries:
+                candidate_text = "\n".join(lines + [f"- {entry}"])
+                count = self.token_counter.count(candidate_text) if self.token_counter else len(candidate_text)
+                if count > max_output_tokens:
+                    return "\n".join(lines)
+                lines.append(f"- {entry}")
+        return "\n".join(lines)
+
+    def _deterministic_condense(self, history, goal, step, max_output_tokens=None, excluded_facts=None):
         findings, changed, verification, failed, decisions, symbols = [], [], [], [], [], []
+        high_signal = {
+            "Constraints": [], "Requirements": [], "Decisions": [],
+            "Confirmed Facts": [], "Logical Constraints": [],
+        }
+        excluded = set(excluded_facts or [])
+        seen_signal = set()
         seen_files = set()
         redact = self.redact_fn or (lambda text: text)
         for index, item in enumerate(history):
@@ -818,6 +936,11 @@ class HistoryCondenser:
             name = str(item.get("name", ""))
             args = item.get("args") or {}
             content = str(item.get("content", ""))
+            for category, fact in self._extract_high_signal_facts(content, role):
+                normalized = self._normalize_fact(fact)
+                if normalized and normalized not in seen_signal and normalized not in excluded:
+                    seen_signal.add(normalized)
+                    high_signal[category].append(redact(fact))
             if role == "tool" and name == "read_file":
                 path = str(args.get("path", "")).strip()
                 if path and path not in seen_files:
@@ -837,6 +960,12 @@ class HistoryCondenser:
                 changed.append(redact(str(args.get("path", ""))[:80]))
                 if "error" in content.lower():
                     failed.append(f"{name} on {redact(str(args.get('path', ''))[:60])} rejected")
+        sections = []
+        for category in (
+            "Constraints", "Requirements", "Decisions", "Confirmed Facts", "Logical Constraints"
+        ):
+            if high_signal[category]:
+                sections.append((f"[{category}]", high_signal[category]))
         lines = ["Earlier Investigation:"]
         if goal:
             lines.append(f"- Goal: {goal[:200]}")
@@ -864,9 +993,15 @@ class HistoryCondenser:
             lines.append("- Failed Approaches:")
             for failure in failed[-8:]:
                 lines.append(f"  * {failure}")
-        if not (findings or changed or verification or failed):
+        if not (findings or changed or verification or failed or any(high_signal.values())):
             lines.append("- (no structured signals captured)")
-        return "\n".join(lines)
+        tool_sections = [
+            ("[Tool Evidence]", [line.lstrip("- ").strip() for line in lines[1:]])
+        ]
+        return self._fit_sections(
+            [("Earlier Investigation:", [])] + sections + tool_sections,
+            max_output_tokens,
+        ) or "Earlier Investigation:\n- (compression budget exhausted)"
 
     # ------------------------------------------------------------------
     # LLM 模式（与主 Agent 隔离）
@@ -953,6 +1088,7 @@ class ContextCompiler:
         layer_ratios=None,
         recent_floor_groups=DEFAULT_RECENT_VERBATIM_FLOOR_GROUPS,
         workspace_root=None,
+        hybrid_context_enabled=False,
     ):
         self.token_counter = token_counter
         self.budget = budget or ContextBudget.resolve()
@@ -965,11 +1101,15 @@ class ContextCompiler:
             self.layer_ratios.update({str(k): float(v) for k, v in layer_ratios.items()})
         self.recent_floor_groups = int(recent_floor_groups)
         self.workspace_root = workspace_root
+        # State-Preserving Compression 是 production default；Hybrid Raw Evidence
+        # 为 experimental / opt-in，且不改变 condenser 或 layer ratios。
+        self.hybrid_context_enabled = bool(hybrid_context_enabled)
         # 状态（每轮 compile 更新，供 observability）。
         self.last_compile_metadata = {}
         self.compression_count = 0
         self.compression_failure_count = 0
         self.compressed_summaries = []  # recursive condensation 栈
+        self.last_compiled_context = None
 
     # ------------------------------------------------------------------
     # Task-local 生命周期
@@ -986,6 +1126,7 @@ class ContextCompiler:
         self.compression_failure_count = 0
         self.compressed_summaries = []
         self.last_native_messages = None
+        self.last_compiled_context = None
         if self.budget is not None:
             self.budget.reset_hysteresis()
         return self
@@ -1027,18 +1168,20 @@ class ContextCompiler:
             estimated, len(history), history_fingerprint, mode="legacy"
         )
         compressed_history = []
+        raw_evidence_items = []
+        hybrid_details = self._empty_hybrid_details()
         recent_items = []
         if should_compress:
             self.compression_count += 1
-            compressed_history, recent_items = self._partition_history(
-                history, working_state
+            compressed_history, raw_evidence_items, recent_items, hybrid_details = self._partition_history(
+                history, working_state, user_message, pinned, memory_layer
             )
         elif over_high:
             # Phase 2.6 hysteresis skip：仍分区 + 压缩，保持 model-visible 有界
             # （避免两次计次压缩之间上下文无界增长），但不计为一次 compression
             # （不触发 checkpoint / 不重置 span / 不计数）。
-            compressed_history, recent_items = self._partition_history(
-                history, working_state
+            compressed_history, raw_evidence_items, recent_items, hybrid_details = self._partition_history(
+                history, working_state, user_message, pinned, memory_layer
             )
         else:
             recent_items = self._history_items(history)
@@ -1047,10 +1190,23 @@ class ContextCompiler:
             pinned=pinned,
             working_state=working_state,
             recent_items=recent_items,
+            raw_evidence_items=raw_evidence_items,
             compressed_history_items=compressed_history,
             repo_map_items=repo_map_items,
             memory_layer=memory_layer,
         )
+        compiled, memory_layer, budget_enforced = self._enforce_legacy_budget(
+            pinned=pinned,
+            working_state=working_state,
+            recent_items=recent_items,
+            raw_evidence_items=raw_evidence_items,
+            compressed_history_items=compressed_history,
+            repo_map_items=repo_map_items,
+            memory_layer=memory_layer,
+            user_message=user_message,
+            compiled=compiled,
+        )
+        self.last_compiled_context = compiled
         compiled_tokens = self._count(compiled.text)
         self.budget.note_compiled(compiled_tokens, mode="legacy")
         if should_compress:
@@ -1063,6 +1219,7 @@ class ContextCompiler:
             history=history,
             pinned=pinned,
             recent_items=recent_items,
+            raw_evidence_items=raw_evidence_items,
             compressed_history_items=compressed_history,
             repo_map_items=repo_map_items,
             repo_map_details=repo_map_details,
@@ -1071,10 +1228,21 @@ class ContextCompiler:
             compiled=compiled,
             memory_layer=memory_layer,
             memory_meta=memory_meta,
+            hybrid_details=hybrid_details,
+            budget_enforcement_triggered=budget_enforced,
         )
         return compiled.text, self.last_compile_metadata
 
-    def compile_native(self, user_message, working_state=None, native_messages=None, pinned_extra=None, memory_layer=None, memory_meta=None):
+    def compile_native(
+        self,
+        user_message,
+        working_state=None,
+        native_messages=None,
+        pinned_extra=None,
+        memory_layer=None,
+        memory_meta=None,
+        include_context=False,
+    ):
         """native 模式：压缩 native_messages，保持 assistant.tool_calls + tool result 原子性。
 
         返回 (messages, metadata)；messages 始终以合法 native 顺序：
@@ -1085,16 +1253,22 @@ class ContextCompiler:
         native_messages = list(native_messages or [])
         pinned_extra = pinned_extra or {}
         memory_meta = memory_meta or {}
-        pinned = self._build_pinned(user_message, pinned_extra)
+        self.last_compiled_context = None
+        pinned = self._build_pinned(
+            user_message,
+            pinned_extra,
+            include_user_task=not include_context,
+        )
         estimated = self._estimate_native_tokens(native_messages)
         history_fingerprint = self._history_span_fingerprint(native_messages)
         over_high = self.budget.utilization(estimated) >= self.budget.high_watermark
         should_compress = self.budget.should_compress(
             estimated, len(native_messages), history_fingerprint, mode="native"
         )
-        if not should_compress and not over_high:
+        if not should_compress and not over_high and not include_context:
             # 未超 HIGH：消息量小，无需压缩；返回原列表引用，保持 runtime 的
-            # 追加语义不变。
+            # 追加语义不变。直接使用 compiler 的旧 API 时保留这个契约；
+            # provider-facing ContextAssembler 会显式要求加入 pinned/state。
             self.last_native_messages = native_messages
             self.budget.note_compiled(estimated, mode="native")
             self.last_compile_metadata = self._metadata(
@@ -1103,6 +1277,7 @@ class ContextCompiler:
                 history=native_messages,
                 pinned=pinned,
                 recent_items=self._native_items(native_messages),
+                raw_evidence_items=[],
                 compressed_history_items=[],
                 repo_map_items=[],
                 repo_map_details={},
@@ -1112,19 +1287,185 @@ class ContextCompiler:
                 native_mode=True,
                 memory_layer=memory_layer,
                 memory_meta=memory_meta,
+                hybrid_details=self._empty_hybrid_details(),
             )
             return (
                 original_messages if original_messages is not None else native_messages,
                 self.last_compile_metadata,
             )
+        if include_context and not should_compress and not over_high:
+            # Native protocol still needs the same pinned / WorkingState /
+            # memory preamble as legacy text, even when history is too small to
+            # trigger compression.  Keep native messages structured and let
+            # the existing final budget guard trim only atomic mutable groups.
+            recent_groups = self._group_native_messages(native_messages)
+            repo_map_items, repo_map_details = self._build_repo_map(
+                user_message, working_state
+            )
+            messages = self._assemble_native_messages(
+                pinned,
+                working_state,
+                memory_layer,
+                [],
+                repo_map_items,
+                [],
+                recent_groups,
+            )
+            # Preserve the native protocol seed as the first system message
+            # for the provider-facing path.  The compiled context remains a
+            # system message immediately after it, before the first user turn;
+            # this keeps legacy XML instructions out of the native seed while
+            # retaining the existing direct compiler ordering for compressed
+            # calls and the complete pinned context for the assembler.
+            if (
+                native_messages
+                and str(native_messages[0].get("role", "")) == "system"
+                and len(messages) >= 2
+                and messages[1] is native_messages[0]
+            ):
+                messages = [messages[1], messages[0], *messages[2:]]
+            messages, raw_evidence_groups, recent_groups, older_groups, compressed_history_items, budget_enforced = (
+                self._enforce_native_budget(
+                    messages,
+                    pinned,
+                    working_state,
+                    memory_layer,
+                    repo_map_items,
+                    [],
+                    recent_groups,
+                    [],
+                    [],
+                )
+            )
+            self.last_native_messages = messages
+            self.last_compiled_context = CompiledContext(
+                text="",
+                pinned=pinned,
+                working_state=working_state,
+                recent_items=self._native_items(recent_groups),
+                raw_evidence_items=[],
+                compressed_history_items=compressed_history_items,
+                repo_map_items=repo_map_items,
+            )
+            compiled_tokens = self._estimate_native_tokens(messages)
+            self.budget.note_compiled(compiled_tokens, mode="native")
+            self.last_compile_metadata = self._metadata(
+                user_message=user_message,
+                working_state=working_state,
+                history=native_messages,
+                pinned=pinned,
+                recent_items=self._native_items(recent_groups),
+                raw_evidence_items=[],
+                compressed_history_items=compressed_history_items,
+                repo_map_items=repo_map_items,
+                repo_map_details=repo_map_details,
+                should_compress=False,
+                estimated_tokens=estimated,
+                compiled=None,
+                native_mode=True,
+                memory_layer=memory_layer,
+                memory_meta=memory_meta,
+                budget_enforcement_triggered=budget_enforced,
+                hybrid_details=self._empty_hybrid_details(),
+            )
+            return messages, self.last_compile_metadata
         counted = should_compress
         if counted:
             self.compression_count += 1
         groups = self._group_native_messages(native_messages)
         recent_groups, older_groups = self._partition_native_groups(groups)
-        compressed_history_items, older_raw = self._compress_older_groups(older_groups, working_state)
+        preliminary_history_items, preliminary_raw = self._compress_older_groups(
+            older_groups, working_state
+        )
+        reclaim_baseline = self._estimate_native_tokens(self._assemble_native_messages(
+            pinned, working_state, memory_layer, preliminary_history_items, [], [], recent_groups
+        ))
+        raw_evidence_groups, older_groups, hybrid_details = self._select_native_raw_evidence(
+            older_groups, working_state, user_message, reclaim_baseline
+        )
+        if raw_evidence_groups:
+            compressed_history_items, older_raw = self._compress_older_groups(
+                older_groups, working_state
+            )
+        else:
+            compressed_history_items, older_raw = preliminary_history_items, preliminary_raw
         repo_map_items, repo_map_details = self._build_repo_map(user_message, working_state)
-        # 组装消息：system(pinned + working state + memory + compressed) + recent groups
+        messages = self._assemble_native_messages(
+            pinned, working_state, memory_layer, compressed_history_items,
+            repo_map_items, raw_evidence_groups, recent_groups,
+        )
+        messages, raw_evidence_groups, recent_groups, older_groups, compressed_history_items, budget_enforced = (
+            self._enforce_native_budget(
+                messages,
+                pinned,
+                working_state,
+                memory_layer,
+                repo_map_items,
+                raw_evidence_groups,
+                recent_groups,
+                older_groups,
+                compressed_history_items,
+            )
+        )
+        self.last_native_messages = messages
+        self.last_compiled_context = CompiledContext(
+            text="",
+            pinned=pinned,
+            working_state=working_state,
+            recent_items=self._native_items(recent_groups),
+            raw_evidence_items=self._native_items(
+                raw_evidence_groups, kind=ITEM_KIND_RAW_EVIDENCE
+            ),
+            compressed_history_items=compressed_history_items,
+            repo_map_items=repo_map_items,
+        )
+        selected_signatures = {
+            group.get("_hybrid_signature", "") for group in raw_evidence_groups
+        }
+        hybrid_details["selected"] = [
+            item for item in hybrid_details["selected"]
+            if item.get("signature", "") in selected_signatures
+        ]
+        hybrid_details["raw_reclaim_tokens"] = sum(
+            self._estimate_native_group_tokens(group) for group in raw_evidence_groups
+        )
+        compiled_tokens = self._estimate_native_tokens(messages)
+        self.budget.note_compiled(compiled_tokens, mode="native")
+        if counted:
+            self.budget.mark_compressed(
+                len(native_messages), history_fingerprint, compiled_tokens, estimated, mode="native"
+            )
+        self.last_compile_metadata = self._metadata(
+            user_message=user_message,
+            working_state=working_state,
+            history=native_messages,
+            pinned=pinned,
+            recent_items=self._native_items(recent_groups),
+            raw_evidence_items=self._native_items(raw_evidence_groups, kind=ITEM_KIND_RAW_EVIDENCE),
+            raw_evidence_token_count=sum(
+                self._estimate_native_group_tokens(group) for group in raw_evidence_groups
+            ),
+            compressed_history_items=compressed_history_items,
+            repo_map_items=repo_map_items,
+            repo_map_details=repo_map_details,
+            should_compress=counted,
+            estimated_tokens=estimated,
+            compiled=None,
+            native_mode=True,
+            older_raw_entries=len(older_raw),
+            memory_layer=memory_layer,
+            memory_meta=memory_meta,
+            budget_enforcement_triggered=budget_enforced,
+            hybrid_details=hybrid_details,
+        )
+        return messages, self.last_compile_metadata
+
+    def _assemble_native_messages(
+        self, pinned, working_state, memory_layer, compressed_history_items,
+        repo_map_items, raw_evidence_groups, recent_groups,
+    ):
+        """Render exactly the native message fields that will be provider-bound."""
+
         messages = []
         pinned_text = self._render_pinned(pinned)
         working_text = working_state.to_text()
@@ -1151,47 +1492,207 @@ class ContextCompiler:
                     "content": "\n\n".join(preamble_parts),
                 }
             )
+        for group in raw_evidence_groups:
+            messages.append(group["message"])
+            messages.extend(group.get("results", []))
         for group in recent_groups:
             messages.append(group["message"])
             messages.extend(group.get("results", []))
-        self.last_native_messages = messages
-        compiled_tokens = self._estimate_native_tokens(messages)
-        self.budget.note_compiled(compiled_tokens, mode="native")
-        if counted:
-            self.budget.mark_compressed(
-                len(native_messages), history_fingerprint, compiled_tokens, estimated, mode="native"
+        return messages
+
+    def _enforce_native_budget(
+        self, messages, pinned, working_state, memory_layer, repo_map_items,
+        raw_evidence_groups, recent_groups, older_groups, compressed_history_items,
+    ):
+        """Final provider-bound invariant; trim oldest mutable atomic groups first."""
+
+        enforced = False
+        while (
+            self._estimate_native_tokens(messages) > self.budget.usable_input_budget
+            and (raw_evidence_groups or recent_groups)
+        ):
+            if raw_evidence_groups:
+                # 先移除最低分 raw evidence，并交回既有 condenser；never split a
+                # native tool-call/result group.
+                removable_index = min(
+                    range(len(raw_evidence_groups)),
+                    key=lambda index: (
+                        raw_evidence_groups[index].get("_hybrid_score", 0),
+                        raw_evidence_groups[index].get("index", 0),
+                    ),
+                )
+                enforced = True
+                older_groups = [raw_evidence_groups.pop(removable_index), *older_groups]
+                compressed_history_items, _ = self._compress_older_groups(
+                    older_groups, working_state
+                )
+                messages = self._assemble_native_messages(
+                    pinned, working_state, memory_layer, compressed_history_items,
+                    repo_map_items, raw_evidence_groups, recent_groups,
+                )
+                continue
+            removable_index = next(
+                (
+                    index
+                    for index, group in enumerate(recent_groups)
+                    if str(group.get("message", {}).get("role", "")) not in {"system", "user"}
+                ),
+                None,
             )
-        self.last_compile_metadata = self._metadata(
-            user_message=user_message,
-            working_state=working_state,
-            history=native_messages,
-            pinned=pinned,
-            recent_items=self._native_items(recent_groups),
-            compressed_history_items=compressed_history_items,
-            repo_map_items=repo_map_items,
-            repo_map_details=repo_map_details,
-            should_compress=counted,
-            estimated_tokens=estimated,
-            compiled=None,
-            native_mode=True,
-            older_raw_entries=len(older_raw),
-            memory_layer=memory_layer,
-            memory_meta=memory_meta,
+            if removable_index is None:
+                break
+            enforced = True
+            older_groups = [recent_groups.pop(removable_index), *older_groups]
+            compressed_history_items, _ = self._compress_older_groups(
+                older_groups, working_state
+            )
+            messages = self._assemble_native_messages(
+                pinned, working_state, memory_layer, compressed_history_items,
+                repo_map_items, raw_evidence_groups, recent_groups,
+            )
+        return (
+            messages,
+            raw_evidence_groups,
+            recent_groups,
+            older_groups,
+            compressed_history_items,
+            enforced,
         )
-        return messages, self.last_compile_metadata
+
+    def _enforce_legacy_budget(
+        self,
+        *,
+        pinned,
+        working_state,
+        recent_items,
+        raw_evidence_items,
+        compressed_history_items,
+        repo_map_items,
+        memory_layer,
+        user_message,
+        compiled,
+    ):
+        """Apply the final legacy bound after layered compression.
+
+        Legacy text historically relied on ``ContextManager`` to shrink the
+        prompt.  The production compiler now owns that path, so a compiler
+        result must receive the same final provider-bound guard as native
+        messages.  The guard is deterministic and only drops mutable layers;
+        user task, Working State, and protected pinned segments are retained.
+        If those required parts alone cannot fit, preserve them and let the
+        independent validator reject the request with explicit evidence.
+        """
+
+        budget = int(getattr(self.budget, "usable_input_budget", 0) or 0)
+        # An unknown provider window uses a conservative fallback whose unit
+        # is not a provider token count when no tokenizer is available.  Keep
+        # the bounded memory layer visible in that case and let validation
+        # record the fallback explicitly; configured/explicit budgets still
+        # receive a hard final bound here.
+        if (
+            budget <= 0
+            or getattr(self.budget, "budget_source", "") == "fallback"
+            or self._count(compiled.text) <= budget
+        ):
+            return compiled, memory_layer, False
+
+        pinned = list(pinned or [])
+        recent_items = list(recent_items or [])
+        raw_evidence_items = list(raw_evidence_items or [])
+        compressed_history_items = list(compressed_history_items or [])
+        repo_map_items = list(repo_map_items or [])
+
+        def is_required_pinned(item):
+            key = str(getattr(item, "key", ""))
+            provenance = getattr(item, "provenance", {}) or {}
+            return (
+                key == PINNED_USER_TASK
+                or key.startswith("pinned:runtime-constraints")
+                or (
+                    key.startswith("instruction:")
+                    and not key.startswith("instruction:legacy:")
+                )
+                or bool(provenance.get("protected"))
+            )
+
+        required_pinned = [item for item in pinned if is_required_pinned(item)]
+        required_base = self._assemble(
+            pinned=required_pinned,
+            working_state=working_state,
+            recent_items=[],
+            raw_evidence_items=[],
+            compressed_history_items=[],
+            repo_map_items=[],
+            memory_layer="",
+        )
+        if self._count(required_base.text) > budget:
+            # Keep the complete required context.  The validator must see the
+            # real overflow instead of silently losing the task or a runtime
+            # constraint while trying to satisfy an impossible bound.
+            return compiled, memory_layer, False
+
+        def rebuild():
+            return self._assemble(
+                pinned=pinned,
+                working_state=working_state,
+                recent_items=recent_items,
+                raw_evidence_items=raw_evidence_items,
+                compressed_history_items=compressed_history_items,
+                repo_map_items=repo_map_items,
+                memory_layer=memory_layer,
+            )
+
+        enforced = False
+
+        # Remove mutable evidence from the oldest/lowest-priority layers first
+        # and re-render after each step so the metadata matches the payload.
+        while self._count(compiled.text) > budget and raw_evidence_items:
+            raw_evidence_items.pop(0)
+            compiled = rebuild()
+            enforced = True
+        while self._count(compiled.text) > budget and recent_items:
+            recent_items.pop(0)
+            compiled = rebuild()
+            enforced = True
+        while self._count(compiled.text) > budget and repo_map_items:
+            repo_map_items.pop(0)
+            compiled = rebuild()
+            enforced = True
+        if self._count(compiled.text) > budget and compressed_history_items:
+            compressed_history_items.clear()
+            compiled = rebuild()
+            enforced = True
+        if self._count(compiled.text) > budget and str(memory_layer or "").strip():
+            memory_layer = ""
+            compiled = rebuild()
+            enforced = True
+
+        # Pinned values are normally invariant.  Under a genuinely small
+        # budget, remove only non-protected extras as the last bounded fallback.
+        for item in reversed(pinned):
+            if self._count(compiled.text) <= budget:
+                break
+            if is_required_pinned(item):
+                continue
+            pinned.remove(item)
+            compiled = rebuild()
+            enforced = True
+
+        return compiled, memory_layer, enforced
 
     # ------------------------------------------------------------------
     # Pinned Context
     # ------------------------------------------------------------------
 
-    def _build_pinned(self, user_message, pinned_extra):
+    def _build_pinned(self, user_message, pinned_extra, include_user_task=True):
         items = OrderedDict()
-        items[PINNED_USER_TASK] = ContextItem(
-            key=PINNED_USER_TASK,
-            kind=ITEM_KIND_PINNED,
-            text=f"User task: {str(user_message).strip()}",
-            provenance={"step": 0},
-        )
+        if include_user_task:
+            items[PINNED_USER_TASK] = ContextItem(
+                key=PINNED_USER_TASK,
+                kind=ITEM_KIND_PINNED,
+                text=f"User task: {str(user_message).strip()}",
+                provenance={"step": 0},
+            )
         for key, value in (pinned_extra or {}).items():
             text = str(value or "").strip()
             if not text:
@@ -1235,7 +1736,7 @@ class ContextCompiler:
         content = self.redact_fn(str(item.get("content", "")))
         return f"[{role}] {content}"
 
-    def _native_items(self, groups):
+    def _native_items(self, groups, kind=ITEM_KIND_RECENT_VERBATIM):
         items = []
         for group in groups:
             message = group.get("message", {})
@@ -1243,7 +1744,7 @@ class ContextCompiler:
             items.append(
                 ContextItem(
                     key=f"native:{group.get('index', 0)}",
-                    kind=ITEM_KIND_RECENT_VERBATIM,
+                    kind=kind,
                     text=str(text)[:400],
                 )
             )
@@ -1294,7 +1795,7 @@ class ContextCompiler:
         # 先保 floor：最近 N 个完整 group。
         for group in reversed(groups):
             recent.append(group)
-            used += self._count(self._group_text(group))
+            used += self._estimate_native_group_tokens(group)
             if len(recent) >= self.recent_floor_groups:
                 break
         recent.reverse()
@@ -1302,7 +1803,7 @@ class ContextCompiler:
         for group in reversed(groups):
             if any(item is group for item in recent):
                 continue
-            cost = self._count(self._group_text(group))
+            cost = self._estimate_native_group_tokens(group)
             if used + cost <= budget_tokens:
                 recent.insert(0, group)
                 used += cost
@@ -1311,6 +1812,188 @@ class ContextCompiler:
         recent_ids = {id(item) for item in recent}
         older = [group for group in groups if id(group) not in recent_ids]
         return recent, older
+
+    @staticmethod
+    def _empty_hybrid_details():
+        return {
+            "candidates": [], "candidate_count": 0, "selected": [],
+            "dropped": [], "raw_reclaim_tokens": 0,
+        }
+
+    def _safe_raw_reclaim_limit(self, baseline_tokens):
+        """Use existing usable budget and HIGH watermark; never fill usable budget."""
+        safe_target = int(
+            self.budget.usable_input_budget * self.budget.high_watermark
+        )
+        return max(0, safe_target - int(baseline_tokens or 0))
+
+    @staticmethod
+    def _normalized_path(value):
+        return canonical_path(str(value or ""))
+
+    def _evidence_descriptor(self, entry, index, native=False):
+        """Extract deterministic, local-only evidence from one atomic entry/group."""
+        if native:
+            message = entry.get("message", {})
+            calls = message.get("tool_calls") or []
+            tools = []
+            for call in calls:
+                function = call.get("function") or call
+                arguments = function.get("arguments", {}) or {}
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except ValueError:
+                        arguments = {}
+                tools.append((str(function.get("name", "")), dict(arguments)))
+            content = "\n".join(
+                [str(message.get("content", ""))]
+                + [str(result.get("content", "")) for result in entry.get("results", [])]
+            )
+            role = str(message.get("role", ""))
+        else:
+            tools = [(str(entry.get("name", "")), dict(entry.get("args", {}) or {}))]
+            content = str(entry.get("content", ""))
+            role = str(entry.get("role", ""))
+        paths = {
+            self._normalized_path(args.get("path", ""))
+            for _, args in tools
+            if args.get("path")
+        }
+        paths.discard("")
+        names = {name for name, _ in tools if name}
+        signature = hashlib.sha256(
+            ("|".join(sorted(names)) + "|" + "|".join(sorted(paths)) + "|" + content[:800]).encode("utf-8")
+        ).hexdigest()[:16]
+        return {
+            "entry": entry, "index": index, "native": native, "role": role,
+            "tools": names, "paths": paths, "content": content,
+            "signature": signature,
+        }
+
+    def _score_raw_evidence(self, descriptor, user_message, working_state):
+        """Explainable evidence score.  Stale and duplicate evidence is never raw."""
+        reasons = []
+        score = 0
+        paths = descriptor["paths"]
+        changed = {self._normalized_path(path) for path in working_state.changed_files}
+        changed.discard("")
+        relevant = changed | {
+            self._normalized_path(item.get("path", ""))
+            for item in working_state.relevant_symbols + working_state.read_ranges
+        }
+        relevant.discard("")
+        task_lower = str(user_message or "").lower()
+        content_lower = descriptor["content"].lower()
+        tool_names = descriptor["tools"]
+        if paths & changed and "read_file" in tool_names:
+            return 0, ["stale_changed_file"], "stale"
+        if paths & relevant:
+            score += 4
+            reasons.append("current_target_file")
+        if any(path and path.lower() in task_lower for path in paths):
+            score += 3
+            reasons.append("task_path_affinity")
+        if "run_shell" in tool_names and (
+            "traceback" in content_lower or "assertionerror" in content_lower
+            or "exit_code: 1" in content_lower or "failed" in content_lower
+        ):
+            score += 5
+            reasons.append("recent_failed_test")
+        if "patch_file" in tool_names or "write_file" in tool_names:
+            if paths & changed:
+                score += 3
+                reasons.append("current_patch_evidence")
+        if "read_file" in tool_names and paths & relevant:
+            score += 2
+            reasons.append("fresh_read_current_target")
+        if descriptor["role"] == "user" and any(
+            marker in content_lower for marker in ("do not", "must", "compatibility", "contract")
+        ):
+            score += 3
+            reasons.append("explicit_constraint_context")
+        return score, reasons, "fresh"
+
+    def _select_raw_descriptors(self, descriptors, user_message, working_state, baseline_tokens, cost_for):
+        details = self._empty_hybrid_details()
+        if not self.hybrid_context_enabled:
+            return [], descriptors, details
+        latest_by_signature = {}
+        for descriptor in descriptors:
+            latest_by_signature[descriptor["signature"]] = descriptor["index"]
+        candidates = []
+        remainder = []
+        for descriptor in descriptors:
+            score, reasons, freshness = self._score_raw_evidence(
+                descriptor, user_message, working_state
+            )
+            debug = {
+                "index": descriptor["index"], "score": score,
+                "reasons": reasons, "freshness": freshness,
+            }
+            if latest_by_signature[descriptor["signature"]] != descriptor["index"]:
+                details["dropped"].append({**debug, "reason": "duplicate"})
+                remainder.append(descriptor)
+                continue
+            if freshness == "stale":
+                details["dropped"].append({**debug, "reason": "stale"})
+                remainder.append(descriptor)
+                continue
+            if score <= 0:
+                remainder.append(descriptor)
+                continue
+            descriptor["_hybrid_score"] = score
+            descriptor["_hybrid_reasons"] = reasons
+            descriptor["_hybrid_freshness"] = freshness
+            descriptor["_hybrid_cost"] = cost_for(descriptor)
+            details["candidates"].append({**debug, "tokens": descriptor["_hybrid_cost"]})
+            candidates.append(descriptor)
+        limit = self._safe_raw_reclaim_limit(baseline_tokens)
+        selected = []
+        used = 0
+        for descriptor in sorted(candidates, key=lambda item: (-item["_hybrid_score"], -item["index"])):
+            cost = descriptor["_hybrid_cost"]
+            if used + cost <= limit:
+                selected.append(descriptor)
+                used += cost
+            else:
+                remainder.append(descriptor)
+                details["dropped"].append({
+                    "index": descriptor["index"], "score": descriptor["_hybrid_score"],
+                    "reasons": descriptor["_hybrid_reasons"], "freshness": descriptor["_hybrid_freshness"],
+                    "reason": "reclaim_limit",
+                })
+        selected.sort(key=lambda item: item["index"])
+        selected_ids = {id(item) for item in selected}
+        remainder.extend(item for item in candidates if id(item) not in selected_ids and item not in remainder)
+        details["candidate_count"] = len(candidates)
+        details["selected"] = [
+            {"index": item["index"], "score": item["_hybrid_score"],
+             "reasons": item["_hybrid_reasons"], "freshness": item["_hybrid_freshness"],
+             "tokens": item["_hybrid_cost"], "signature": item["signature"]}
+            for item in selected
+        ]
+        details["raw_reclaim_tokens"] = used
+        return selected, sorted(remainder, key=lambda item: item["index"]), details
+
+    def _select_native_raw_evidence(self, older_groups, working_state, user_message, baseline_tokens):
+        descriptors = [
+            self._evidence_descriptor(group, index, native=True)
+            for index, group in enumerate(older_groups)
+        ]
+        selected, remainder, details = self._select_raw_descriptors(
+            descriptors, user_message, working_state, baseline_tokens,
+            lambda item: self._estimate_native_group_tokens(item["entry"]),
+        )
+        selected_groups = []
+        for item in selected:
+            group = item["entry"]
+            group["_hybrid_score"] = item["_hybrid_score"]
+            group["_hybrid_reasons"] = item["_hybrid_reasons"]
+            group["_hybrid_freshness"] = item["_hybrid_freshness"]
+            group["_hybrid_signature"] = item["signature"]
+            selected_groups.append(group)
+        return selected_groups, [item["entry"] for item in remainder], details
 
     def _group_text(self, group):
         message = group.get("message", {})
@@ -1322,6 +2005,13 @@ class ContextCompiler:
         for result in group.get("results", []):
             parts.append(str(result.get("content", ""))[:400])
         return "\n".join(parts)
+
+    def _estimate_native_group_tokens(self, group):
+        """Provider-bound accounting for a full atomic native group, without previews."""
+
+        return self._estimate_native_tokens(
+            [group.get("message", {}), *(group.get("results", []) or [])]
+        )
 
     def _compress_older_groups(self, older_groups, working_state):
         """对更旧 native groups 做结构化压缩（Stage C）。"""
@@ -1335,11 +2025,33 @@ class ContextCompiler:
                     "role": str(message.get("role", "")),
                     "name": "",
                     "args": {},
-                    "content": self._group_text(group),
+                    "content": str(message.get("content", "")),
                 }
             )
+            for call, result in zip(
+                message.get("tool_calls") or [], group.get("results", []) or []
+            ):
+                function = call.get("function") or call
+                arguments = function.get("arguments", {}) or {}
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except ValueError:
+                        arguments = {}
+                raw_items.append(
+                    {
+                        "role": "tool",
+                        "name": str(function.get("name", "")),
+                        "args": arguments,
+                        "content": str(result.get("content", ""))[:400],
+                    }
+                )
         summary, meta = self.condenser.condense(
-            raw_items, goal=working_state.goal, step=working_state.last_updated_step
+            raw_items,
+            goal=working_state.goal,
+            step=working_state.last_updated_step,
+            max_output_tokens=self._compressed_history_budget(),
+            excluded_facts=self._working_state_fact_keys(working_state),
         )
         if meta.get("mode") == "deterministic_fallback":
             self.compression_failure_count += 1
@@ -1352,7 +2064,21 @@ class ContextCompiler:
             )
         ], raw_items
 
-    def _partition_history(self, history, working_state):
+    def _compressed_history_budget(self):
+        return int(
+            self.budget.usable_input_budget
+            * self.layer_ratios.get("compressed_history", 0.20)
+        )
+
+    @staticmethod
+    def _working_state_fact_keys(working_state):
+        return {
+            HistoryCondenser._normalize_fact(item.get("text", ""))
+            for item in getattr(working_state, "known_facts", [])
+            if item.get("text")
+        }
+
+    def _partition_history(self, history, working_state, user_message, pinned, memory_layer):
         """legacy：把 history 分为 older（可压缩）与 recent（原文）。
 
         Phase 2.6 修正：recent 必须受 recent_verbatim 层预算约束（至少保留
@@ -1376,21 +2102,68 @@ class ContextCompiler:
                 older.append(item)
         recent.reverse()
         older.reverse()
+        details = self._empty_hybrid_details()
+        raw_evidence_items = []
         if older:
             summary, meta = self.condenser.condense(
-                older, goal=working_state.goal, step=working_state.last_updated_step
+                older,
+                goal=working_state.goal,
+                step=working_state.last_updated_step,
+                max_output_tokens=self._compressed_history_budget(),
+                excluded_facts=self._working_state_fact_keys(working_state),
             )
             if meta.get("mode") == "deterministic_fallback":
                 self.compression_failure_count += 1
             self.compressed_summaries.append({"summary": summary, "meta": meta})
-            return [
+            compressed_items = [
                 ContextItem(
                     key=f"condensed:{len(self.compressed_summaries)}",
                     kind=ITEM_KIND_COMPRESSED_HISTORY,
                     text=summary,
                 )
-            ], self._history_items(recent)
-        return [], self._history_items(recent)
+            ]
+            preliminary = self._assemble(
+                pinned, working_state, self._history_items(recent), [],
+                compressed_items, [], memory_layer,
+            )
+            descriptors = [
+                self._evidence_descriptor(item, index, native=False)
+                for index, item in enumerate(older)
+            ]
+            selected, remainder, details = self._select_raw_descriptors(
+                descriptors, user_message, working_state, self._count(preliminary.text),
+                lambda item: self._count(self._render_history_item(item["entry"])),
+            )
+            if selected:
+                raw_evidence_items = [
+                    ContextItem(
+                        key=f"raw-evidence:{item['index']}",
+                        kind=ITEM_KIND_RAW_EVIDENCE,
+                        text=self._render_history_item(item["entry"]),
+                        provenance={"why_raw_preserved": item["_hybrid_reasons"], "freshness": item["_hybrid_freshness"]},
+                    )
+                    for item in selected
+                ]
+                remaining_history = [item["entry"] for item in remainder]
+                summary, meta = self.condenser.condense(
+                    remaining_history,
+                    goal=working_state.goal,
+                    step=working_state.last_updated_step,
+                    max_output_tokens=self._compressed_history_budget(),
+                    excluded_facts=self._working_state_fact_keys(working_state),
+                )
+                if meta.get("mode") == "deterministic_fallback":
+                    self.compression_failure_count += 1
+                self.compressed_summaries.append({"summary": summary, "meta": meta})
+                compressed_items = [
+                    ContextItem(
+                        key=f"condensed:{len(self.compressed_summaries)}",
+                        kind=ITEM_KIND_COMPRESSED_HISTORY,
+                        text=summary,
+                    )
+                ]
+            return compressed_items, raw_evidence_items, self._history_items(recent), details
+        return [], raw_evidence_items, self._history_items(recent), details
 
     @staticmethod
     def _render_compressed_items(items):
@@ -1419,7 +2192,7 @@ class ContextCompiler:
     # 组装与估算
     # ------------------------------------------------------------------
 
-    def _assemble(self, pinned, working_state, recent_items, compressed_history_items, repo_map_items, memory_layer=None):
+    def _assemble(self, pinned, working_state, recent_items, raw_evidence_items, compressed_history_items, repo_map_items, memory_layer=None):
         parts = []
         pinned_text = self._render_pinned(pinned)
         if pinned_text:
@@ -1432,6 +2205,11 @@ class ContextCompiler:
             parts.append(memory_text)
         if compressed_history_items:
             parts.append(self._render_compressed_items(compressed_history_items))
+        if raw_evidence_items:
+            parts.append(
+                "High-value raw evidence:\n"
+                + "\n\n".join(item.text for item in raw_evidence_items)
+            )
         if repo_map_items:
             parts.append("Repository map:\n" + "\n".join(item.text for item in repo_map_items))
         if recent_items:
@@ -1442,6 +2220,7 @@ class ContextCompiler:
             pinned=pinned,
             working_state=working_state,
             recent_items=recent_items,
+            raw_evidence_items=raw_evidence_items,
             compressed_history_items=compressed_history_items,
             repo_map_items=repo_map_items,
         )
@@ -1453,15 +2232,17 @@ class ContextCompiler:
         return self._count(text)
 
     def _estimate_native_tokens(self, messages):
-        total = 0
-        for message in messages:
-            total += self._count(str(message.get("content") or ""))
-            for call in message.get("tool_calls") or []:
-                total += self._count(
-                    str(call.get("name", ""))
-                    + json.dumps(call.get("arguments", {}), sort_keys=True)
+        """Estimate the full serialized payload sent to a native provider."""
+
+        return sum(
+            self._count(
+                json.dumps(
+                    message, sort_keys=True, ensure_ascii=False,
+                    separators=(",", ":"), default=str,
                 )
-        return total
+            )
+            for message in messages
+        )
 
     def _count(self, text):
         if self.token_counter is not None:
@@ -1482,6 +2263,7 @@ class ContextCompiler:
         working_state = kwargs.get("working_state") or WorkingState()
         pinned = kwargs.get("pinned", [])
         recent_items = kwargs.get("recent_items", [])
+        raw_evidence_items = kwargs.get("raw_evidence_items", [])
         compressed_history_items = kwargs.get("compressed_history_items", [])
         repo_map_items = kwargs.get("repo_map_items", [])
         history = kwargs.get("history", [])
@@ -1490,6 +2272,10 @@ class ContextCompiler:
         repo_map_details = kwargs.get("repo_map_details", {})
         memory_layer = kwargs.get("memory_layer", None)
         memory_meta = kwargs.get("memory_meta", {}) or {}
+        budget_enforcement_triggered = bool(
+            kwargs.get("budget_enforcement_triggered", False)
+        )
+        hybrid_details = kwargs.get("hybrid_details", self._empty_hybrid_details())
         memory_text = str(memory_layer or "").strip()
         if native_mode:
             compiled_tokens = self._estimate_native_tokens(
@@ -1502,6 +2288,11 @@ class ContextCompiler:
         recent_verbatim_tokens = sum(
             item.token_count(self.token_counter) for item in recent_items
         )
+        raw_evidence_tokens = kwargs.get("raw_evidence_token_count")
+        if raw_evidence_tokens is None:
+            raw_evidence_tokens = sum(
+                item.token_count(self.token_counter) for item in raw_evidence_items
+            )
         compressed_history_tokens = sum(
             item.token_count(self.token_counter) for item in compressed_history_items
         )
@@ -1524,7 +2315,9 @@ class ContextCompiler:
                 if history
                 else 0
             )
-            compiled_history_tokens = recent_verbatim_tokens + compressed_history_tokens
+            compiled_history_tokens = (
+                recent_verbatim_tokens + raw_evidence_tokens + compressed_history_tokens
+            )
             raw_model_visible = (
                 pinned_tokens + working_state_tokens + raw_history_tokens + repo_map_tokens
             )
@@ -1542,6 +2335,8 @@ class ContextCompiler:
             if self.budget is not None
             else {}
         )
+        usable_budget = self.budget.usable_input_budget if self.budget is not None else None
+        budget_overflow = max(0, compiled_tokens - usable_budget) if usable_budget else 0
         return {
             "compiler": "context_compiler",
             "native_mode": native_mode,
@@ -1551,10 +2346,25 @@ class ContextCompiler:
             "should_compress": should_compress,
             "candidate_context_tokens": estimated,
             "compiled_context_tokens": compiled_tokens,
+            "provider_bound_prompt_tokens": compiled_tokens if native_mode else None,
+            "budget_overflow_tokens": budget_overflow if native_mode else 0,
+            "budget_enforcement_triggered": budget_enforcement_triggered,
+            "native_group_estimation_mode": (
+                "provider_bound_serialized_messages" if native_mode else "not_applicable"
+            ),
             "pinned_tokens": pinned_tokens,
             "working_state_tokens": working_state_tokens,
             "recent_verbatim_tokens": recent_verbatim_tokens,
+            "hybrid_context_enabled": self.hybrid_context_enabled,
+            "raw_evidence_candidates": hybrid_details.get("candidate_count", 0),
+            "raw_evidence_selected": hybrid_details.get("selected", []),
+            "raw_evidence_selected_count": len(hybrid_details.get("selected", [])),
+            "raw_evidence_tokens": raw_evidence_tokens,
             "compressed_history_tokens": compressed_history_tokens,
+            "dropped_history_groups": hybrid_details.get("dropped", []),
+            "raw_reclaim_tokens": hybrid_details.get("raw_reclaim_tokens", 0),
+            "unused_context_budget": max(0, (usable_budget or 0) - compiled_tokens),
+            "final_provider_bound_tokens": compiled_tokens if native_mode else None,
             "repo_map_tokens": repo_map_tokens,
             "raw_history_tokens": raw_history_tokens,
             "compiled_history_tokens": compiled_history_tokens,
@@ -1568,9 +2378,7 @@ class ContextCompiler:
             "stale_fact_count": len(working_state.stale_facts()),
             "estimated": True,
             "budget_source": self.budget.budget_source if self.budget is not None else "",
-            "usable_input_budget": (
-                self.budget.usable_input_budget if self.budget is not None else None
-            ),
+            "usable_input_budget": usable_budget,
             # legacy 别名：旧脚本读 trigger_threshold；实际决策用 high_watermark。
             "trigger_threshold": (
                 self.budget.high_watermark if self.budget is not None else None
@@ -1596,6 +2404,7 @@ class CompiledContext:
     pinned: list = field(default_factory=list)
     working_state: Optional[WorkingState] = None
     recent_items: list = field(default_factory=list)
+    raw_evidence_items: list = field(default_factory=list)
     compressed_history_items: list = field(default_factory=list)
     repo_map_items: list = field(default_factory=list)
 
@@ -1604,6 +2413,7 @@ class CompiledContext:
             "text": self.text,
             "pinned_keys": [item.key for item in self.pinned],
             "recent_keys": [item.key for item in self.recent_items],
+            "raw_evidence_keys": [item.key for item in self.raw_evidence_items],
             "compressed_keys": [item.key for item in self.compressed_history_items],
             "repo_map_keys": [item.key for item in self.repo_map_items],
         }

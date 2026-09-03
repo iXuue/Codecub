@@ -121,6 +121,17 @@ def test_parse_send_message_command():
     }
 
 
+def test_parse_send_message_accepts_only_documented_busy_policies():
+    command = parse_command_line(
+        '{"type":"send_message","message":"constraint","busy_policy":"inject"}'
+    )
+    assert command["busy_policy"] == "INJECT"
+    with pytest.raises(ValueError, match="busy_policy"):
+        parse_command_line(
+            '{"type":"send_message","message":"constraint","busy_policy":"CANCEL"}'
+        )
+
+
 def test_parse_approval_commands_require_approval_id():
     approve = parse_command_line(
         '{"type":"approve_operation","session_id":"session-1","run_id":"run-1","approval_id":"approval-1"}'

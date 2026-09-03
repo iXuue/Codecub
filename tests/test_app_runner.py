@@ -384,9 +384,109 @@ def test_app_runner_cancel_stops_active_runtime_and_writes_canceled_report(tmp_p
     assert len(canceled) == 1
     assert canceled[0]["run_id"] == "run-cancel-1"
     assert completed == []
+    phases = [
+        event["payload"].get("phase")
+        for event in events
+        if event["type"] == "run_status" and event["run_id"] == "run-cancel-1"
+    ]
+    assert phases.index("cancel_requested") < phases.index("cancelling") < phases.index("canceled")
     assert not (tmp_path / "canceled.txt").exists()
     assert report["stop_reason"] == "user_canceled"
     assert report["task_state"]["run_id"] == "run-cancel-1"
+
+
+def test_app_runner_appends_a_second_turn_without_busy_error(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    stdout = io.StringIO()
+    stdin = ApprovalAwareStdin(
+        stdout,
+        [
+            ("", '{"type":"send_message","run_id":"run-a","message":"first"}\n'),
+            ("", '{"type":"send_message","run_id":"run-b","message":"second","busy_policy":"APPEND"}\n'),
+            ('"run_id":"run-b","payload":{"final"', '{"type":"close"}\n'),
+        ],
+    )
+
+    def build(args):
+        workspace = WorkspaceContext.build(args.cwd)
+        return Pico(
+            model_client=SlowNonStreamingFakeModelClient(["<final>first done</final>", "<final>second done</final>"]),
+            workspace=workspace,
+            session_store=SessionStore(Path(args.cwd) / ".codecub" / "sessions"),
+            approval_policy=args.approval,
+            max_steps=args.max_steps,
+            max_new_tokens=args.max_new_tokens,
+        )
+
+    assert run_app_mode(make_args(tmp_path), stdin=stdin, stdout=stdout, agent_factory=build) == 0
+    events = parse_jsonl(stdout.getvalue())
+    assert not any("another run is already active" in str(event) for event in events)
+    completed = [event["run_id"] for event in events if event["type"] == "run_completed"]
+    assert completed == ["run-a", "run-b"]
+
+
+def test_app_runner_injects_constraint_into_next_model_call(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    stdout = io.StringIO()
+    client = SlowNonStreamingFakeModelClient(
+        [
+            '<tool name="read_file" path="README.md" start="1" end="1"></tool>',
+            "<final>constraint observed</final>",
+        ]
+    )
+    stdin = ApprovalAwareStdin(
+        stdout,
+        [
+            ("", '{"type":"send_message","run_id":"run-a","message":"inspect"}\n'),
+            ("", '{"type":"send_message","message":"Do not modify auth.py","busy_policy":"INJECT"}\n'),
+            ('"type":"run_completed"', '{"type":"close"}\n'),
+        ],
+    )
+
+    def build(args):
+        workspace = WorkspaceContext.build(args.cwd)
+        return Pico(
+            model_client=client,
+            workspace=workspace,
+            session_store=SessionStore(Path(args.cwd) / ".codecub" / "sessions"),
+            approval_policy=args.approval,
+            max_steps=args.max_steps,
+            max_new_tokens=args.max_new_tokens,
+        )
+
+    assert run_app_mode(make_args(tmp_path), stdin=stdin, stdout=stdout, agent_factory=build) == 0
+    assert len(client.prompts) >= 2
+    assert "Protected runtime constraints" in client.prompts[1]
+    assert "Do not modify auth.py" in client.prompts[1]
+
+
+def test_app_runner_interrupts_before_running_the_priority_turn(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    stdout = io.StringIO()
+    stdin = ApprovalAwareStdin(
+        stdout,
+        [
+            ("", '{"type":"send_message","run_id":"run-a","message":"first"}\n'),
+            ("", '{"type":"send_message","run_id":"run-b","message":"second","busy_policy":"INTERRUPT"}\n'),
+            ('"run_id":"run-b","payload":{"final"', '{"type":"close"}\n'),
+        ],
+    )
+
+    def build(args):
+        workspace = WorkspaceContext.build(args.cwd)
+        return Pico(
+            model_client=SlowNonStreamingFakeModelClient(["<final>discarded</final>", "<final>priority done</final>"]),
+            workspace=workspace,
+            session_store=SessionStore(Path(args.cwd) / ".codecub" / "sessions"),
+            approval_policy=args.approval,
+            max_steps=args.max_steps,
+            max_new_tokens=args.max_new_tokens,
+        )
+
+    assert run_app_mode(make_args(tmp_path), stdin=stdin, stdout=stdout, agent_factory=build) == 0
+    events = parse_jsonl(stdout.getvalue())
+    assert [event["run_id"] for event in events if event["type"] == "run_canceled"] == ["run-a"]
+    assert [event["run_id"] for event in events if event["type"] == "run_completed"] == ["run-b"]
 
 
 def test_app_runner_approves_pending_risky_tool_and_emits_diff_summary(tmp_path):

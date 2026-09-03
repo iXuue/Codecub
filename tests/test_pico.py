@@ -5,6 +5,7 @@ import json
 import subprocess
 import shlex
 import sys
+import threading
 import urllib.error
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +28,15 @@ from codecub.connections.presets import DEEPSEEK_OFFICIAL
 from codecub.experiments.tasks import tasks_for_suite
 from codecub import task_policy
 from codecub.models import ModelResponse, ToolCall
+from codecub.task_state import TaskState
+from codecub.runtime import (
+    EXECUTION_MODE_MULTI_AGENT,
+    EXECUTION_MODE_SINGLE,
+    ReadRangeRecord,
+    analyze_read_coverage,
+    is_redundant_read,
+    merge_read_ranges,
+)
 from codecub.tools import native_tool_definitions
 
 
@@ -65,6 +75,26 @@ def test_explicit_max_steps_override_still_creates_fixed_budget(tmp_path):
 
     assert agent.max_steps == 12
     assert agent.effective_step_budget == 12
+
+
+def test_single_agent_is_default_execution_mode(tmp_path):
+    agent = build_agent(tmp_path, [])
+    args = build_arg_parser().parse_args([])
+
+    assert agent.execution_mode == EXECUTION_MODE_SINGLE
+    assert "delegate" not in agent.tools
+    assert "dispatch" not in agent.tools
+    assert args.multi_agent is False
+
+
+def test_multi_agent_mode_is_explicit_opt_in(tmp_path):
+    agent = build_agent(tmp_path, [], execution_mode=EXECUTION_MODE_MULTI_AGENT)
+    args = build_arg_parser().parse_args(["--multi-agent"])
+
+    assert agent.execution_mode == EXECUTION_MODE_MULTI_AGENT
+    assert "delegate" in agent.tools
+    assert "dispatch" in agent.tools
+    assert args.multi_agent is True
 
 
 def test_allowed_tools_filter_prompt_visibility_but_runtime_still_rejects(tmp_path):
@@ -173,7 +203,7 @@ def test_native_tool_protocol_uses_structured_calls_and_runtime_validation(tmp_p
         allowed_tools=("patch_file", "run_shell"),
         requires_workspace_change=True,
     )
-    assert agent.ask("Update target.py") == "Done."
+    assert agent.ask("Update target.py", run_id="native-protocol") == "Done."
     assert (tmp_path / "target.py").read_text(encoding="utf-8") == "new = 1\n"
     assert client.requests[0][2] == "auto"
     assert {tool["function"]["name"] for tool in client.requests[0][1]} == {
@@ -186,6 +216,192 @@ def test_native_tool_protocol_uses_structured_calls_and_runtime_validation(tmp_p
         "tool_call_id": "call-1",
         "content": "patched target.py",
     } in client.requests[0][0]
+    trace = [
+        json.loads(line)
+        for line in agent.run_store.trace_path("native-protocol").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    assert any(
+        event["event"] == "tool_executed"
+        and event["tool_call_source"] == "native"
+        for event in trace
+    )
+    assert not any(
+        event["event"].startswith("legacy_tool_recovery") for event in trace
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_reason"),
+    [
+        ('{"name":"read_file","args":{"path":"codecub/a.py"}}', None),
+        ("<note>read codecub/a.py</note>", None),
+        (
+            '<tool>{"name":"read_file","args":{"path":"codecub/a.py"}}',
+            "missing_closing_tag",
+        ),
+        (
+            '{"name":"read_file","args":{"path":"codecub/a.py"}}</tool>',
+            "missing_opening_tag",
+        ),
+        ('<tool>{"name":"read_file", <arg_key>"path"}</tool>', "malformed_json"),
+        ('<tool>{"name":"delete_everything","args":{}}</tool>', "unknown_tool"),
+        ('<tool>{"name":"read_file","args":{"path":"missing.py"}}</tool>', "invalid_args"),
+        (
+            '<tool>{"name":"read_file","args":{"path":"codecub/a.py","dangerous":true}}</tool>',
+            "schema_failure",
+        ),
+        (
+            '<tool>{"name":"read_file","args":{"path":"codecub/a.py"}}</tool>'
+            '<tool>{"name":"read_file","args":{"path":"codecub/a.py"}}</tool>',
+            "multiple_open_tags",
+        ),
+        (
+            '<tool>{"name":"read_file","args":{"path":"codecub/a.py"}}</tool></tool>',
+            "multiple_close_tags",
+        ),
+        (
+            'Please inspect this: <tool>{"name":"read_file","args":{"path":"codecub/a.py"}}</tool>',
+            "ambiguous_content",
+        ),
+    ],
+)
+def test_native_legacy_tool_recovery_rejects_noncanonical_text(
+    tmp_path, content, expected_reason
+):
+    (tmp_path / "codecub").mkdir()
+    (tmp_path / "codecub" / "a.py").write_text("value = 1\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    call, reason = agent._recover_native_text_tool_call(content)
+
+    assert call is None
+    assert reason == expected_reason
+
+
+@pytest.mark.parametrize("path", ["codecub/token_budget.py", "codecub/telemetry/contracts.py"])
+def test_native_legacy_tool_recovery_replays_valid_captured_read_calls(tmp_path, path):
+    source = tmp_path / path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("value = 1\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    call, reason = agent._recover_native_text_tool_call(
+        f'<tool>{{"name":"read_file","args":{{"path":"{path}","start":1,"end":1}}}}</tool>'
+    )
+
+    assert reason is None
+    assert call is not None
+    assert call.name == "read_file"
+    assert call.arguments == {"path": path, "start": 1, "end": 1}
+
+
+@pytest.mark.parametrize("path", ["codecub/token_budget.py", "codecub/telemetry/contracts.py"])
+def test_native_legacy_recovered_read_call_executes_through_runtime(tmp_path, path):
+    class NativeTextClient:
+        supports_native_tools = True
+        supports_prompt_cache = False
+        model = "captured-native-text"
+        last_completion_metadata = {}
+
+        def __init__(self):
+            self.responses = [
+                ModelResponse(
+                    text=(
+                        f'<tool>{{"name":"read_file","args":{{"path":"{path}",'
+                        '"start":1,"end":1}}</tool>'
+                    )
+                ),
+                ModelResponse(text="Done."),
+            ]
+
+        def complete_with_tools(self, messages, tools, max_new_tokens, tool_choice=None):
+            return self.responses.pop(0)
+
+    source = tmp_path / path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("value = 1\n", encoding="utf-8")
+    agent = MiniAgent(
+        model_client=NativeTextClient(),
+        workspace=build_workspace(tmp_path),
+        session_store=SessionStore(tmp_path / ".codecub" / "sessions"),
+        approval_policy="auto",
+        allowed_tools=("read_file",),
+    )
+
+    assert agent.ask("inspect source", run_id="legacy-read") == "Done."
+    trace = [
+        json.loads(line)
+        for line in agent.run_store.trace_path("legacy-read").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    assert any(
+        event["event"] == "tool_executed"
+        and event["name"] == "read_file"
+        and event["tool_call_source"] == "legacy_recovered"
+        and event["tool_status"] == "ok"
+        for event in trace
+    )
+
+
+def test_native_legacy_tool_recovery_runs_through_approval_and_trace(tmp_path):
+    class NativeTextClient:
+        supports_native_tools = True
+        supports_prompt_cache = False
+        model = "captured-native-text"
+        last_completion_metadata = {}
+
+        def __init__(self):
+            self.responses = [
+                ModelResponse(
+                    text=(
+                        '<tool>{"name":"write_file","args":'
+                        '{"path":"blocked.txt","content":"nope"}}</tool>'
+                    )
+                ),
+                ModelResponse(text="Done."),
+            ]
+
+        def complete_with_tools(self, messages, tools, max_new_tokens, tool_choice=None):
+            return self.responses.pop(0)
+
+    agent = MiniAgent(
+        model_client=NativeTextClient(),
+        workspace=build_workspace(tmp_path),
+        session_store=SessionStore(tmp_path / ".codecub" / "sessions"),
+        approval_policy="never",
+        allowed_tools=("write_file",),
+    )
+
+    assert agent._recover_native_text_tool_call(
+        '<tool>{"name":"write_file","args":{"path":"blocked.txt","content":"nope"}}</tool>'
+    )[1] is None
+    result = agent.ask("write a file", run_id="legacy-recovery")
+    assert not (tmp_path / "blocked.txt").exists()
+    trace = [
+        json.loads(line)
+        for line in agent.run_store.trace_path("legacy-recovery").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    assert any(
+        event["event"] == "legacy_tool_recovery_success"
+        and event["tool_call_source"] == "legacy_recovered"
+        for event in trace
+    )
+    assert any(
+        event["event"] == "tool_executed"
+        and event["tool_call_source"] == "legacy_recovered"
+        and event["tool_status"] == "rejected"
+        and event["security_event_type"] == "approval_denied"
+        for event in trace
+    )
+    assert result == "Done."
 
 
 def test_native_multi_tool_batch_is_sequential_and_preserves_each_call_id(tmp_path):
@@ -686,6 +902,149 @@ def test_evidence_ledger_is_bounded_and_redacts_compact_hints(tmp_path):
     assert len(agent.evidence_ledger_text()) < 2200
 
 
+def test_read_range_overlap_detection_and_interval_merge():
+    first = ReadRangeRecord("source.py", 1, 200, "v1", 7)
+    assert is_redundant_read("source.py", 100, 200, [first], "v1") == first
+    assert is_redundant_read("source.py", 200, 300, [first], "v1") is None
+    assert is_redundant_read("other.py", 1, 200, [first], "v1") is None
+    assert is_redundant_read("source.py", 1, 200, [first], "v2") is None
+    merged = merge_read_ranges(
+        [ReadRangeRecord("source.py", 1, 100, "v1", 1)],
+        ReadRangeRecord("source.py", 50, 150, "v1", 2),
+    )
+    assert merged == [ReadRangeRecord("source.py", 1, 150, "v1", 2)]
+
+
+def test_read_range_guard_suppresses_unchanged_overlap_and_force_reads(tmp_path):
+    (tmp_path / "source.py").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+
+    first = agent.run_tool("read_file", {"path": "source.py", "start": 1, "end": 3})
+    suppressed = agent.run_tool("read_file", {"path": "source.py", "start": 1, "end": 3})
+    forced = agent.run_tool(
+        "read_file", {"path": "source.py", "start": 1, "end": 3, "force": True}
+    )
+
+    assert "1: alpha" in first
+    assert "Read guard:" in suppressed and "force=True" in suppressed and "alpha" not in suppressed
+    assert agent._last_tool_result_metadata["read_range_guard"]["action"] == "forced"
+    assert "1: alpha" in forced
+    assert agent.current_planning["redundant_read_suppressed"] == 1
+    assert agent.current_planning["redundant_read_forced"] == 1
+
+
+def _numbered_source(path, lines=240):
+    path.write_text(
+        "\n".join(f"line {number}" for number in range(1, lines + 1)) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_read_guard_returns_only_delta_for_partial_coverage(tmp_path):
+    source = tmp_path / "source.py"
+    _numbered_source(source)
+    agent = build_agent(tmp_path, [])
+    agent.run_tool("read_file", {"path": "source.py", "start": 1, "end": 200})
+
+    result = agent.run_tool("read_file", {"path": "source.py", "start": 110, "end": 220})
+
+    guard = agent._last_tool_result_metadata["read_range_guard"]
+    assert guard["action"] == "delta_read"
+    assert guard["covered_ranges"] == [[110, 200]]
+    assert guard["returned_ranges"] == [[201, 220]]
+    assert " 201: line 201" in result and " 110: line 110" not in result
+    assert agent.current_planning["read_guard_delta_lines_returned"] == 20
+    assert agent.current_planning["read_range_ledger"][0]["end_line"] == 220
+
+
+def test_read_guard_partial_overlap_retains_the_new_tail(tmp_path):
+    source = tmp_path / "source.py"
+    _numbered_source(source)
+    agent = build_agent(tmp_path, [])
+    agent.run_tool("read_file", {"path": "source.py", "start": 1, "end": 100})
+
+    result = agent.run_tool("read_file", {"path": "source.py", "start": 80, "end": 180})
+
+    guard = agent._last_tool_result_metadata["read_range_guard"]
+    assert guard["action"] == "delta_read"
+    assert guard["returned_ranges"] == [[101, 180]]
+    assert " 101: line 101" in result and " 80: line 80" not in result
+
+
+def test_read_guard_uses_union_of_multiple_historical_ranges(tmp_path):
+    source = tmp_path / "source.py"
+    _numbered_source(source)
+    agent = build_agent(tmp_path, [])
+    agent.run_tool("read_file", {"path": "source.py", "start": 1, "end": 100})
+    agent.run_tool("read_file", {"path": "source.py", "start": 150, "end": 200})
+
+    result = agent.run_tool("read_file", {"path": "source.py", "start": 50, "end": 180})
+
+    guard = agent._last_tool_result_metadata["read_range_guard"]
+    assert guard["action"] == "delta_read"
+    assert guard["covered_ranges"] == [[50, 100], [150, 180]]
+    assert guard["returned_ranges"] == [[101, 149]]
+    assert " 101: line 101" in result and " 150: line 150" not in result
+
+
+def test_read_guard_force_returns_full_partial_or_full_covered_range(tmp_path):
+    source = tmp_path / "source.py"
+    _numbered_source(source)
+    agent = build_agent(tmp_path, [])
+    agent.run_tool("read_file", {"path": "source.py", "start": 1, "end": 200})
+
+    full = agent.run_tool(
+        "read_file", {"path": "source.py", "start": 100, "end": 150, "force": True}
+    )
+    partial = agent.run_tool(
+        "read_file", {"path": "source.py", "start": 110, "end": 220, "force": True}
+    )
+
+    assert " 100: line 100" in full and " 150: line 150" in full
+    assert " 110: line 110" in partial and " 220: line 220" in partial
+    assert agent._last_tool_result_metadata["read_range_guard"]["action"] == "forced"
+
+
+def test_read_coverage_analysis_distinguishes_full_and_partial_ranges():
+    records = [ReadRangeRecord("source.py", 1, 200, "v1", 4)]
+    full = analyze_read_coverage("source.py", 100, 150, records, "v1")
+    partial = analyze_read_coverage("source.py", 110, 220, records, "v1")
+
+    assert full.fully_covered and full.uncovered_ranges == ()
+    assert partial.fully_covered is False
+    assert partial.uncovered_ranges == ((201, 220),)
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "patch_file"])
+def test_read_range_ledger_invalidates_after_file_write(tmp_path, tool_name):
+    (tmp_path / "source.py").write_text("old\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [])
+    agent.run_tool("read_file", {"path": "source.py", "start": 1, "end": 1})
+    args = (
+        {"path": "source.py", "content": "new\n"}
+        if tool_name == "write_file"
+        else {"path": "source.py", "old_text": "old", "new_text": "new"}
+    )
+    assert "error:" not in agent.run_tool(tool_name, args)
+
+    result = agent.run_tool("read_file", {"path": "source.py", "start": 1, "end": 1})
+
+    assert "1: new" in result
+    assert agent._last_tool_result_metadata["read_range_guard"]["action"] == "stale_read"
+
+
+def test_read_range_ledger_is_run_local(tmp_path):
+    (tmp_path / "source.py").write_text("alpha\n", encoding="utf-8")
+    first = build_agent(tmp_path, [])
+    second = build_agent(tmp_path, [])
+    first.run_tool("read_file", {"path": "source.py", "start": 1, "end": 1})
+
+    result = second.run_tool("read_file", {"path": "source.py", "start": 1, "end": 1})
+
+    assert "1: alpha" in result
+    assert second.current_planning["read_range_ledger"]
+
+
 def test_agent_runs_tool_then_final(tmp_path):
     (tmp_path / "hello.txt").write_text("alpha\nbeta\n", encoding="utf-8")
     agent = build_agent(
@@ -967,6 +1326,7 @@ def test_delegate_uses_child_agent(tmp_path):
             "<final>Child result.</final>",
             "<final>Parent incorporated the child result.</final>",
         ],
+        execution_mode=EXECUTION_MODE_MULTI_AGENT,
     )
 
     answer = agent.ask("Use delegation")
@@ -2009,6 +2369,20 @@ def test_main_interactive_cli_shows_activity_stream(monkeypatch, capsys):
     assert "done" in captured.out
 
 
+def test_main_one_shot_routes_the_cli_turn_through_spine(monkeypatch, capsys, tmp_path):
+    from codecub import cli
+
+    agent = build_agent(tmp_path, ["<final>routed</final>"])
+    monkeypatch.setattr(cli, "build_agent", lambda _args: agent)
+
+    assert cli.main(["route", "this"]) == 0
+
+    captured = capsys.readouterr()
+    assert "routed" in captured.out
+    assert agent.current_task_state.run_id.startswith("run_")
+    assert callable(agent.injection_provider)
+
+
 def test_build_agent_uses_anthropic_provider_and_openai_key_fallback(tmp_path):
     args = type(
         "Args",
@@ -2809,6 +3183,9 @@ def test_run_shell_nonzero_with_workspace_change_is_recorded_as_partial_success(
 
     assert "exit_code: 1" in result
     assert agent._last_tool_result_metadata["tool_status"] == "partial_success"
+    assert agent._last_tool_result_metadata["tool_execution_success"] is True
+    assert agent._last_tool_result_metadata["tool_business_success"] is False
+    assert agent._last_tool_result_metadata["tool_result_failure_reason"] == "nonzero_exit_code"
     assert agent._last_tool_result_metadata["affected_paths"] == ["README.md"]
     assert agent._last_tool_result_metadata["workspace_changed"] is True
 
@@ -3433,3 +3810,220 @@ def test_module_execution_help_works():
     assert result.returncode == 0
     assert "usage:" in result.stdout.lower()
     assert "--app-mode" in result.stdout
+
+
+def _register_result_contract_tool(agent, name, result, contract=None, risky=False):
+    agent.tools[name] = {
+        "schema": {},
+        "risky": risky,
+        "side_effect": risky,
+        "idempotent": not risky,
+        "retryable": not risky,
+        "timeout_seconds": 20,
+        "circuit_breaker": True,
+        "description": "deterministic result-contract test tool",
+        "run": lambda _args: result,
+        **({"result_contract": contract} if contract else {}),
+    }
+
+
+def test_declared_boolean_result_contract_separates_business_success(tmp_path):
+    agent = build_agent(tmp_path, [])
+    _register_result_contract_tool(
+        agent, "boolean_ok", '{"success": true}',
+        {"mode": "boolean_field", "success_field": "success"},
+    )
+    assert agent.run_tool("boolean_ok", {}) == '{"success": true}'
+    assert agent._last_tool_result_metadata["tool_execution_success"] is True
+    assert agent._last_tool_result_metadata["tool_business_success"] is True
+
+    _register_result_contract_tool(
+        agent, "boolean_false", '{"success": false}',
+        {"mode": "boolean_field", "success_field": "success"},
+    )
+    agent.run_tool("boolean_false", {})
+    metadata = agent._last_tool_result_metadata
+    assert metadata["tool_status"] == "error"
+    assert metadata["tool_execution_success"] is True
+    assert metadata["tool_business_success"] is False
+    assert metadata["tool_result_failure_reason"] == "business_flag_false"
+
+
+def test_undeclared_success_field_remains_compatible(tmp_path):
+    agent = build_agent(tmp_path, [])
+    _register_result_contract_tool(agent, "legacy_payload", '{"success": false}')
+    agent.run_tool("legacy_payload", {})
+    metadata = agent._last_tool_result_metadata
+    assert metadata["tool_status"] == "ok"
+    assert metadata["tool_business_success"] is True
+    assert metadata["tool_result_validation_failed"] is False
+
+
+def test_structured_and_required_result_contract_failures_are_explicit(tmp_path):
+    agent = build_agent(tmp_path, [])
+    _register_result_contract_tool(
+        agent, "structured", "not-json", {"mode": "structured_result"}
+    )
+    agent.run_tool("structured", {})
+    assert agent._last_tool_result_metadata["tool_result_failure_reason"] == "malformed_result"
+
+    _register_result_contract_tool(
+        agent, "postcondition", '{"status": "created"}',
+        {"mode": "required_fields", "required_fields": ["session_id"]},
+    )
+    agent.run_tool("postcondition", {})
+    assert agent._last_tool_result_metadata["tool_result_failure_reason"] == "missing_postcondition"
+
+    _register_result_contract_tool(
+        agent, "postcondition_ok", '{"session_id": "s-1"}',
+        {"mode": "required_fields", "required_fields": ["session_id"]},
+    )
+    agent.run_tool("postcondition_ok", {})
+    assert agent._last_tool_result_metadata["tool_business_success"] is True
+
+
+def test_business_validation_does_not_repeat_side_effect_or_bypass_approval(tmp_path):
+    agent = build_agent(tmp_path, [])
+    commits = []
+
+    def committed_false(_args):
+        commits.append("commit")
+        return '{"success": false}'
+
+    agent.tools["commit_once"] = {
+        "schema": {}, "risky": True, "side_effect": True,
+        "idempotent": False, "retryable": False, "timeout_seconds": 20,
+        "circuit_breaker": True, "description": "commit once",
+        "result_contract": {"mode": "boolean_field", "success_field": "success"},
+        "run": committed_false,
+    }
+    agent.run_tool("commit_once", {})
+    assert commits == ["commit"]
+    assert agent._last_tool_result_metadata["tool_business_success"] is False
+
+    (tmp_path / "denied").mkdir()
+    denied = build_agent(tmp_path / "denied", [], approval_policy="never")
+    denied.tools["commit_once"] = {**agent.tools["commit_once"], "run": committed_false}
+    denied.run_tool("commit_once", {})
+    assert commits == ["commit"]
+    assert denied._last_tool_result_metadata["tool_error_code"] == "approval_denied"
+
+
+def _activate_side_effect_run(agent, run_id="run-side-effect"):
+    state = TaskState.create(run_id=run_id, task_id="task-side-effect", user_request="commit once")
+    agent.current_task_state = state
+    agent.run_store.start_run(state)
+    return state
+
+
+def _register_commit_tool(agent, runner, contract=None):
+    agent.tools["logical_commit"] = {
+        "schema": {}, "risky": True, "side_effect": True,
+        "idempotent": False, "retryable": False, "timeout_seconds": 20,
+        "circuit_breaker": True, "description": "logical side-effect test tool",
+        "run": runner,
+        **({"result_contract": contract} if contract else {}),
+    }
+
+
+def test_side_effect_operation_key_blocks_replay_and_allows_distinct_operation(tmp_path):
+    agent = build_agent(tmp_path, [])
+    _activate_side_effect_run(agent)
+    commits = []
+    _register_commit_tool(agent, lambda args: commits.append(dict(args)) or "committed")
+
+    assert agent.run_tool("logical_commit", {"value": "same"}, operation_key="operation-x") == "committed"
+    replay = agent.run_tool("logical_commit", {"value": "same"}, operation_key="operation-x")
+    assert "already completed" in replay
+    assert commits == [{"value": "same"}]
+    assert agent._last_tool_result_metadata["side_effect_replay_blocked"] is True
+
+    agent.run_tool("logical_commit", {"value": "same"}, operation_key="operation-y")
+    assert commits == [{"value": "same"}, {"value": "same"}]
+
+
+def test_side_effect_operation_key_rejects_conflict_and_survives_resume(tmp_path):
+    agent = build_agent(tmp_path, [])
+    state = _activate_side_effect_run(agent, "run-resume-side-effect")
+    commits = []
+    _register_commit_tool(agent, lambda args: commits.append(dict(args)) or "committed")
+    agent.run_tool("logical_commit", {"value": "one"}, operation_key="operation-x")
+    checkpoint = agent.create_checkpoint(state, "commit once", trigger="side-effect-test")
+    assert "operation-x" in checkpoint["side_effect_operations"]
+    conflict = agent.run_tool("logical_commit", {"value": "two"}, operation_key="operation-x")
+    assert "conflicts" in conflict
+    assert commits == [{"value": "one"}]
+    assert agent._last_tool_result_metadata["idempotency_key_conflict"] is True
+
+    resumed = build_agent(tmp_path, [])
+    resumed.current_task_state = TaskState.from_dict(agent.run_store.load_task_state(state.run_id))
+    _register_commit_tool(resumed, lambda args: commits.append(dict(args)) or "committed")
+    replay = resumed.run_tool("logical_commit", {"value": "one"}, operation_key="operation-x")
+    assert "already completed" in replay
+    assert commits == [{"value": "one"}]
+
+
+def test_side_effect_uncertain_and_approval_denied_never_replay(tmp_path):
+    agent = build_agent(tmp_path, [])
+    _activate_side_effect_run(agent)
+    commits = []
+    _register_commit_tool(
+        agent,
+        lambda _args: commits.append("commit") or '{"success": false}',
+        {"mode": "boolean_field", "success_field": "success"},
+    )
+    agent.run_tool("logical_commit", {}, operation_key="uncertain-x")
+    replay = agent.run_tool("logical_commit", {}, operation_key="uncertain-x")
+    assert "uncertain" in replay
+    assert commits == ["commit"]
+    assert agent._last_tool_result_metadata["side_effect_outcome_uncertain"] is True
+
+    def response_lost(_args):
+        commits.append("started")
+        raise RuntimeError("response lost after external commit")
+
+    _register_commit_tool(agent, response_lost)
+    assert "failed" in agent.run_tool("logical_commit", {}, operation_key="lost-x")
+    replay = agent.run_tool("logical_commit", {}, operation_key="lost-x")
+    assert "uncertain" in replay
+    assert commits == ["commit", "started"]
+
+    denied_root = tmp_path / "denied-operation"
+    denied_root.mkdir()
+    denied = build_agent(denied_root, [], approval_policy="never")
+    denied_state = _activate_side_effect_run(denied, "run-denied-side-effect")
+    _register_commit_tool(denied, lambda _args: commits.append("denied") or "committed")
+    denied.run_tool("logical_commit", {}, operation_key="denied-x")
+    assert commits == ["commit", "started"]
+    assert denied_state.side_effect_operations == {}
+
+
+def test_side_effect_claim_is_thread_safe_and_read_only_tools_are_unchanged(tmp_path):
+    agent = build_agent(tmp_path, [])
+    _activate_side_effect_run(agent, "run-concurrent-side-effect")
+    commits = []
+    _register_commit_tool(agent, lambda _args: commits.append("commit") or "committed")
+    barrier = threading.Barrier(2)
+
+    def invoke():
+        barrier.wait()
+        agent.run_tool("logical_commit", {}, operation_key="concurrent-x")
+
+    first = threading.Thread(target=invoke)
+    second = threading.Thread(target=invoke)
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+    assert commits == ["commit"]
+
+    reads = []
+    agent.tools["read_twice"] = {
+        "schema": {}, "risky": False, "side_effect": False,
+        "idempotent": True, "retryable": True, "timeout_seconds": 20,
+        "circuit_breaker": True, "description": "read-only test tool",
+        "run": lambda _args: reads.append("read") or "read",
+    }
+    agent.run_tool("read_twice", {}, operation_key="same-read-key")
+    agent.run_tool("read_twice", {}, operation_key="same-read-key")
+    assert reads == ["read", "read"]

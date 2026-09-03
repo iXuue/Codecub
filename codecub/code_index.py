@@ -5,6 +5,9 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
+import shutil
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -49,16 +52,38 @@ class _Visitor(ast.NodeVisitor):
     def _add(self, node, kind):
         parent = ".".join(self.parents)
         qualified = ".".join([*self.parents, node.name]) if self.parents else node.name
-        self.symbols.append(Symbol(node.name, qualified, kind, self.path, node.lineno, getattr(node, "end_lineno", node.lineno), parent))
+        self.symbols.append(
+            Symbol(
+                node.name,
+                qualified,
+                kind,
+                self.path,
+                node.lineno,
+                getattr(node, "end_lineno", node.lineno),
+                parent,
+            )
+        )
 
     def visit_Import(self, node):
         for alias in node.names:
-            self.imports.append({"name": alias.asname or alias.name.split(".")[0], "module": alias.name, "line": node.lineno})
+            self.imports.append(
+                {
+                    "name": alias.asname or alias.name.split(".")[0],
+                    "module": alias.name,
+                    "line": node.lineno,
+                }
+            )
 
     def visit_ImportFrom(self, node):
         module = node.module or ""
         for alias in node.names:
-            self.imports.append({"name": alias.asname or alias.name, "module": module, "line": node.lineno})
+            self.imports.append(
+                {
+                    "name": alias.asname or alias.name,
+                    "module": module,
+                    "line": node.lineno,
+                }
+            )
 
     def visit_Call(self, node):
         name = _call_name(node.func)
@@ -95,10 +120,19 @@ class CodeIndex:
 
     def save(self):
         self.index_dir.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({"version": 1, "files": self.files}, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.path.write_text(
+            json.dumps(
+                {"version": 1, "files": self.files}, ensure_ascii=False, indent=2
+            ),
+            encoding="utf-8",
+        )
 
     def refresh(self, paths=None):
-        candidates = self._python_paths() if paths is None else [self._resolve_relative(path) for path in paths]
+        candidates = (
+            self._python_paths()
+            if paths is None
+            else [self._resolve_relative(path) for path in paths]
+        )
         seen, reindexed, reused, parse_errors = set(), [], [], []
         for path in candidates:
             if path is None:
@@ -117,9 +151,21 @@ class CodeIndex:
             try:
                 visitor = _Visitor(relative)
                 visitor.visit(ast.parse(text, filename=relative))
-                self.files[relative] = {"content_hash": digest, "symbols": [asdict(item) for item in visitor.symbols], "imports": visitor.imports, "calls": visitor.calls, "parse_error": ""}
+                self.files[relative] = {
+                    "content_hash": digest,
+                    "symbols": [asdict(item) for item in visitor.symbols],
+                    "imports": visitor.imports,
+                    "calls": visitor.calls,
+                    "parse_error": "",
+                }
             except SyntaxError as exc:
-                self.files[relative] = {"content_hash": digest, "symbols": [], "imports": [], "calls": [], "parse_error": str(exc)}
+                self.files[relative] = {
+                    "content_hash": digest,
+                    "symbols": [],
+                    "imports": [],
+                    "calls": [],
+                    "parse_error": str(exc),
+                }
                 parse_errors.append(relative)
             reindexed.append(relative)
         if paths is None:
@@ -127,28 +173,47 @@ class CodeIndex:
                 if relative not in seen:
                     del self.files[relative]
         self.save()
-        self.last_refresh = {"indexed_files": len(self.files), "reindexed_files": reindexed, "reused_files": reused, "parse_errors": parse_errors}
+        self.last_refresh = {
+            "indexed_files": len(self.files),
+            "reindexed_files": reindexed,
+            "reused_files": reused,
+            "parse_errors": parse_errors,
+        }
         return dict(self.last_refresh)
 
     def symbol_search(self, query, path=".", kind="", limit=20):
-        query, prefix, kind = str(query).strip().lower(), self._path_prefix(path), str(kind).strip().lower()
+        query, prefix, kind = (
+            str(query).strip().lower(),
+            self._path_prefix(path),
+            str(kind).strip().lower(),
+        )
         if not query:
             raise ValueError("query must not be empty")
         found = []
         for record in self.files.values():
             for raw in record.get("symbols", []):
                 symbol = Symbol(**raw)
-                if prefix and not (symbol.path == prefix.rstrip("/") or symbol.path.startswith(prefix)):
+                if prefix and not (
+                    symbol.path == prefix.rstrip("/") or symbol.path.startswith(prefix)
+                ):
                     continue
                 if kind and symbol.kind != kind:
                     continue
-                if query in symbol.name.lower() or query in symbol.qualified_name.lower():
+                if (
+                    query in symbol.name.lower()
+                    or query in symbol.qualified_name.lower()
+                ):
                     found.append(symbol)
-        return sorted(found, key=lambda item: (item.name.lower() != query, item.path, item.start_line))[:max(1, min(int(limit), 100))]
+        return sorted(
+            found,
+            key=lambda item: (item.name.lower() != query, item.path, item.start_line),
+        )[: max(1, min(int(limit), 100))]
 
     def file_outline(self, path):
         relative = self._relative_existing(path)
-        return [Symbol(**raw) for raw in self.files.get(relative, {}).get("symbols", [])]
+        return [
+            Symbol(**raw) for raw in self.files.get(relative, {}).get("symbols", [])
+        ]
 
     def find_references(self, symbol, path="."):
         name, prefix = str(symbol).strip().split(".")[-1], self._path_prefix(path)
@@ -156,13 +221,56 @@ class CodeIndex:
             raise ValueError("symbol must not be empty")
         result = []
         for relative, record in self.files.items():
-            if prefix and not (relative == prefix.rstrip("/") or relative.startswith(prefix)):
+            if prefix and not (
+                relative == prefix.rstrip("/") or relative.startswith(prefix)
+            ):
                 continue
-            result.extend((relative, int(call["line"])) for call in record.get("calls", []) if call.get("name") == name)
+            result.extend(
+                (relative, int(call["line"]))
+                for call in record.get("calls", [])
+                if call.get("name") == name
+            )
         return sorted(set(result))
 
     def _python_paths(self):
-        return [path for path in self.root.rglob("*.py") if not any(part in IGNORED_PATH_NAMES for part in path.relative_to(self.root).parts)]
+        if shutil.which("rg"):
+            result = subprocess.run(
+                [
+                    "rg",
+                    "--files",
+                    "-g",
+                    "*.py",
+                    "-g",
+                    "!**/.codecub/**",
+                    "-g",
+                    "!**/.workbuddy/**",
+                    "-g",
+                    "!**/.uv-cache/**",
+                    "-g",
+                    "!**/.venv/**",
+                    "-g",
+                    "!**/venv/**",
+                ],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            return [self.root / line for line in result.stdout.splitlines() if line]
+        paths = []
+        for directory, directory_names, file_names in os.walk(self.root):
+            directory_names[:] = [
+                name
+                for name in directory_names
+                if name not in IGNORED_PATH_NAMES
+                and name not in {".workbuddy", ".uv-cache", ".ruff_cache"}
+            ]
+            paths.extend(
+                Path(directory) / name for name in file_names if name.endswith(".py")
+            )
+        return paths
 
     def _resolve_relative(self, value):
         path = (self.root / str(value)).resolve()

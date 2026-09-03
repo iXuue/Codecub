@@ -79,3 +79,23 @@ def test_run_store_appends_and_loads_usage_jsonl(tmp_path):
         {"usage_id": "usage_2", "protocol": "anthropic_messages"},
     ]
     assert store.load_usage("missing_run") == []
+
+
+def test_run_store_persists_side_effect_claim_and_terminal_state(tmp_path):
+    store = RunStore(tmp_path / ".codecub" / "runs")
+    state = TaskState.create(run_id="run_effect", task_id="task_effect", user_request="Commit once.")
+    store.start_run(state)
+
+    claimed = store.claim_side_effect_operation(state, "operation-x", "write_file", "digest-a")
+    assert claimed["claimed"] is True
+    completed = store.update_side_effect_operation(
+        state, "operation-x", "completed", {"tool_business_success": True}
+    )
+    assert completed["state"] == "completed"
+
+    restored = TaskState.from_dict(store.load_task_state(state.run_id))
+    replay = store.claim_side_effect_operation(restored, "operation-x", "write_file", "digest-a")
+    assert replay["claimed"] is False
+    assert replay["prior_state"] == "completed"
+    conflict = store.claim_side_effect_operation(restored, "operation-x", "write_file", "digest-b")
+    assert conflict["conflict"] is True

@@ -9,6 +9,7 @@ SUPPORTED_COMMAND_TYPES = {
     "import_legacy_pico",
     "close",
 }
+SUPPORTED_BUSY_POLICIES = {"APPEND", "INJECT", "INTERRUPT"}
 
 SUPPORTED_EVENT_TYPES = {
     "session_started",
@@ -91,6 +92,11 @@ def parse_command_line(line):
         if not message:
             raise ValueError("send_message command requires a non-empty message")
         normalized["message"] = message
+        if command.get("busy_policy") is not None:
+            busy_policy = str(command["busy_policy"]).upper().strip()
+            if busy_policy not in SUPPORTED_BUSY_POLICIES:
+                raise ValueError("send_message command has invalid busy_policy")
+            normalized["busy_policy"] = busy_policy
         return normalized
 
     if command_type in {"approve_operation", "reject_operation"}:

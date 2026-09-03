@@ -4,9 +4,14 @@
 如何做参数校验，以及最终如何执行，都是在这里定义的。
 """
 
+import json
+import os
+import re
+import signal
 import shutil
 import subprocess
 import textwrap
+import time
 from functools import partial
 
 from .workspace import IGNORED_PATH_NAMES, clip
@@ -18,7 +23,7 @@ BASE_TOOL_SPECS = {
         "description": "List files in the workspace.",
     },
     "read_file": {
-        "schema": {"path": "str", "start": "int=1", "end": "int=200"},
+        "schema": {"path": "str", "start": "int=1", "end": "int=200", "force": "bool=False"},
         "risky": False,
         "description": "Read a UTF-8 file by line range.",
     },
@@ -47,10 +52,16 @@ BASE_TOOL_SPECS = {
         "risky": False,
         "description": "Find syntactic Python call candidates (not semantic LSP references).",
     },
+    "retrieve_code": {
+        "schema": {"query": "str", "limit": "int=5"},
+        "risky": False,
+        "description": "Hybrid lexical, AST, and optional semantic code retrieval.",
+    },
     "run_shell": {
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
         "description": "Run a shell command in the repo root.",
+        "result_contract": {"mode": "process_exit_code"},
     },
     "write_file": {
         "schema": {"path": "str", "content": "str"},
@@ -64,10 +75,51 @@ BASE_TOOL_SPECS = {
     },
 }
 
+# Metadata is policy input, not documentation only.  Side-effecting tools are
+# deliberately non-retryable: a timeout does not prove their first attempt did
+# not already change the workspace.
+for _name, _spec in BASE_TOOL_SPECS.items():
+    _read_only = _name in {
+        "list_files",
+        "read_file",
+        "search",
+        "symbol_search",
+        "file_outline",
+        "find_references",
+        "retrieve_code",
+    }
+    _spec.update(
+        {
+            "side_effect": not _read_only,
+            "idempotent": _read_only,
+            "retryable": _read_only,
+            "timeout_seconds": 20,
+            "circuit_breaker": True,
+        }
+    )
 DELEGATE_TOOL_SPEC = {
     "schema": {"task": "str", "max_steps": "int=3"},
     "risky": False,
     "description": "Ask a bounded read-only child agent to investigate.",
+}
+DELEGATE_TOOL_SPEC.update(
+    {
+        "side_effect": False,
+        "idempotent": True,
+        "retryable": False,
+        "timeout_seconds": 120,
+        "circuit_breaker": True,
+    }
+)
+DISPATCH_TOOL_SPEC = {
+    "schema": {"role": "str", "task": "str", "max_steps": "int=3"},
+    "risky": False,
+    "description": "Dispatch one bounded Research, Implement, or Review agent.",
+    "side_effect": False,
+    "idempotent": True,
+    "retryable": False,
+    "timeout_seconds": 120,
+    "circuit_breaker": True,
 }
 
 TOOL_EXAMPLES = {
@@ -77,10 +129,12 @@ TOOL_EXAMPLES = {
     "symbol_search": '<tool>{"name":"symbol_search","args":{"query":"binary_search","path":"."}}</tool>',
     "file_outline": '<tool>{"name":"file_outline","args":{"path":"codecub/runtime.py"}}</tool>',
     "find_references": '<tool>{"name":"find_references","args":{"symbol":"binary_search","path":"."}}</tool>',
+    "retrieve_code": '<tool>{"name":"retrieve_code","args":{"query":"where is tool validation","limit":5}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
+    "dispatch": '<tool>{"name":"dispatch","args":{"role":"research","task":"inspect README.md","max_steps":3}}</tool>',
 }
 
 
@@ -137,13 +191,50 @@ def build_tool_registry(agent):
     }
     # 子 agent 是刻意做成受限能力的：一旦深度耗尽，
     # 就连 delegate 这个工具都不再暴露给模型。
-    if agent.depth < agent.max_depth:
+    if agent.depth < agent.max_depth and agent.multi_agent_enabled():
         tools["delegate"] = {**DELEGATE_TOOL_SPEC, "run": partial(tool_delegate, agent)}
+        tools["dispatch"] = {**DISPATCH_TOOL_SPEC, "run": partial(tool_dispatch, agent)}
     return tools
 
 
 def tool_example(name):
     return TOOL_EXAMPLES.get(name, "")
+
+
+def validate_tool_result_contract(tool, result):
+    """Validate an explicitly declared business-result contract.
+
+    Unspecified tools intentionally retain historical "function returned" semantics.
+    The return value is ``(business_success, failure_reason)``.
+    """
+    contract = dict((tool or {}).get("result_contract") or {})
+    if not contract:
+        return True, ""
+    mode = str(contract.get("mode", "")).strip().lower()
+    text = str(result or "")
+    if mode == "process_exit_code":
+        match = re.search(r"exit_code:\s*(-?\d+)", text)
+        if match is None:
+            return False, "missing_exit_code"
+        return (int(match.group(1)) == 0, "" if int(match.group(1)) == 0 else "nonzero_exit_code")
+    if mode not in {"boolean_field", "required_fields", "structured_result"}:
+        return False, "unknown_result_contract"
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return False, "malformed_result"
+    if not isinstance(payload, dict):
+        return False, "malformed_result"
+    if mode == "boolean_field":
+        field = str(contract.get("success_field", "")).strip()
+        if not field or field not in payload or not isinstance(payload[field], bool):
+            return False, "malformed_result"
+        return (payload[field], "" if payload[field] else "business_flag_false")
+    required = [str(field) for field in contract.get("required_fields", []) if str(field)]
+    missing = [field for field in required if field not in payload or payload[field] is None]
+    if missing:
+        return False, "missing_postcondition"
+    return True, ""
 
 
 def validate_tool(agent, name, args):
@@ -191,6 +282,18 @@ def validate_tool(agent, name, args):
         if not str(args.get("symbol", "")).strip():
             raise ValueError("symbol must not be empty")
         agent.path(args.get("path", "."))
+        return
+
+    if name == "retrieve_code":
+        if not str(args.get("query", "")).strip():
+            raise ValueError("query must not be empty")
+        return
+
+    if name == "dispatch":
+        if str(args.get("role", "")) not in {"research", "implement", "review"}:
+            raise ValueError("role must be research, implement, or review")
+        if not str(args.get("task", "")).strip():
+            raise ValueError("task must not be empty")
         return
 
     if name == "run_shell":
@@ -345,6 +448,48 @@ def tool_find_references(agent, args):
     return "\n".join(lines) if references else "resolution: syntactic\n(no matches)"
 
 
+def tool_retrieve_code(agent, args):
+    result = agent.retriever.retrieve(args["query"], int(args.get("limit", 5)))
+    agent.last_retrieval_result = result
+    if getattr(agent, "working_state", None) is not None:
+        for hit in result.hits:
+            agent.working_state.add_relevant_symbol(
+                path=hit.path, name=hit.symbol, kind="retrieval"
+            )
+    lines = [f"strategy: {result.strategy}"]
+    for hit in result.hits:
+        lines.extend(
+            (
+                f"{hit.path}:{hit.start_line}-{hit.end_line} score={hit.score:.4f} sources={','.join(hit.sources)}",
+                hit.text,
+            )
+        )
+    if result.filtered_out:
+        lines.append(
+            "filtered_out: "
+            + ", ".join(
+                f"{item.get('path') or '<service>'}:{item['reason']}"
+                for item in result.filtered_out
+            )
+        )
+    return "\n".join(lines) if result.hits else "(no matches)"
+
+
+def tool_dispatch(agent, args):
+    result = agent.orchestrator.dispatch(
+        args["role"], args["task"], int(args.get("max_steps", 3))
+    )
+    return json.dumps({
+        "agent_id": result.agent_id,
+        "role": result.role,
+        "status": result.status,
+        "answer": result.answer,
+        "tool_steps": result.tool_steps,
+        "changed_files": result.changed_files,
+        "verification": result.verification,
+    }, ensure_ascii=False)
+
+
 def tool_run_shell(agent, args):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -352,27 +497,90 @@ def tool_run_shell(agent, args):
     timeout = int(args.get("timeout", 20))
     if timeout < 1 or timeout > 120:
         raise ValueError("timeout must be in [1, 120]")
-    result = subprocess.run(
-        command,
-        cwd=agent.root,
-        shell=True,
-        capture_output=True,
-        text=True,
-        errors="replace",
-        timeout=timeout,
+    popen_kwargs = {
+        "cwd": agent.root,
+        "shell": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "errors": "replace",
         # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
         # 目的是减少敏感信息被意外带进命令执行环境的风险。
-        env=agent.shell_env(),
-    )
+        "env": agent.shell_env(),
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(command, **popen_kwargs)
+    started = time.monotonic()
+    canceled = False
+    while True:
+        if getattr(agent, "cancellation_requested", lambda _state: False)(
+            getattr(agent, "current_task_state", None)
+        ):
+            canceled = True
+            _terminate_process_tree(process)
+            break
+        try:
+            stdout, stderr = process.communicate(timeout=0.1)
+            break
+        except subprocess.TimeoutExpired:
+            if time.monotonic() - started >= timeout:
+                _terminate_process_tree(process)
+                raise
+    if canceled:
+        raise RuntimeError("shell process cancelled")
     return textwrap.dedent(
         f"""\
-        exit_code: {result.returncode}
+        exit_code: {process.returncode}
         stdout:
-        {result.stdout.strip() or "(empty)"}
+        {stdout.strip() or "(empty)"}
         stderr:
-        {result.stderr.strip() or "(empty)"}
+        {stderr.strip() or "(empty)"}
         """
     ).strip()
+
+
+def _terminate_process_tree(process, grace_seconds=1.0):
+    """Stop a shell and its children without assuming one operating system."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            # ``taskkill /T`` may report success while a console child keeps
+            # running.  Use /F here so a cancelled coding run cannot mutate
+            # the workspace after its parent shell has exited.
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+        )
+        try:
+            process.wait(timeout=grace_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=grace_seconds)
+            return
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=grace_seconds)
 
 
 def tool_write_file(agent, args):
@@ -411,6 +619,7 @@ def tool_delegate(agent, args):
 
     child = Pico(
         model_client=agent.model_client,
+        model_gateway=agent.model_gateway,
         workspace=agent.workspace,
         session_store=agent.session_store,
         run_store=agent.run_store,
@@ -423,6 +632,11 @@ def tool_delegate(agent, args):
         secret_env_names=agent.secret_env_names,
         shell_env_allowlist=agent.shell_env_allowlist,
     )
+    parent_cancel_checker = getattr(agent, "cancel_checker", None)
+    if parent_cancel_checker is not None:
+        child.cancel_checker = lambda _runtime, _task_state: bool(
+            parent_cancel_checker(agent, agent.current_task_state)
+        )
     # 委派的目标是“调查”，不是“放权执行”。
     # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
     child.session["memory"]["task"] = task
@@ -437,6 +651,8 @@ _TOOL_RUNNERS = {
     "symbol_search": tool_symbol_search,
     "file_outline": tool_file_outline,
     "find_references": tool_find_references,
+    "retrieve_code": tool_retrieve_code,
+    "dispatch": tool_dispatch,
     "run_shell": tool_run_shell,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,

@@ -7,6 +7,7 @@ Recursive Compression / Native Tool Integrity / Condenser Failure），
 """
 
 import json
+import pytest
 
 
 from codecub.context_compiler import (
@@ -39,6 +40,37 @@ def err_metadata(code="tool_failed"):
         "workspace_changed": False,
         "affected_paths": [],
     }
+
+
+def test_working_state_renders_bounded_read_range_summary_and_invalidates_changes():
+    state = WorkingState()
+    state.update_from_tool_event(
+        "read_file",
+        {"path": "codecub/app_protocol.py", "start": 1, "end": 200},
+        {
+            **ok_metadata(),
+            "read_range_guard": {
+                "requested_range": [1, 200],
+                "action": "read",
+                "file_changed": False,
+            },
+        },
+        "# codecub/app_protocol.py\n1: source omitted",
+        7,
+    )
+
+    rendered = state.to_text()
+    assert "Read Evidence:" in rendered
+    assert "codecub/app_protocol.py L1-L200 @ step 7, unchanged" in rendered
+    assert "source omitted" not in rendered
+    state.update_from_tool_event(
+        "patch_file",
+        {"path": "codecub/app_protocol.py"},
+        ok_metadata(workspace_changed=True, affected_paths=["codecub/app_protocol.py"]),
+        "patched",
+        8,
+    )
+    assert state.read_ranges == []
 
 
 # ===========================================================================
@@ -1050,3 +1082,310 @@ def test_token_metrics_same_caliber_native_compressed():
     for message in out:
         if message.get("role") == "tool":
             assert message.get("tool_call_id") in call_ids, "orphan tool message"
+
+
+def test_native_group_estimator_counts_full_tool_result_not_preview():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=64000, max_new_tokens=1024),
+        recent_floor_groups=10,
+    )
+    messages = _native_pair("c1", "read_file", {"path": "a.py"}, "A" * 5000)
+    group = compiler._group_native_messages(messages)[0]
+
+    assert compiler._estimate_native_group_tokens(group) > compiler._count(
+        compiler._group_text(group)
+    ) * 5
+
+
+def test_native_final_provider_bound_budget_is_enforced_for_long_tool_history():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=64000, max_new_tokens=1024),
+        recent_floor_groups=10,
+    )
+    messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "task"}]
+    for index in range(24):
+        messages += _native_pair(
+            f"call-{index}",
+            "read_file",
+            {"path": f"file_{index}.py"},
+            "X" * 8000,
+        )
+
+    out, meta = compiler.compile_native("task", WorkingState(), messages)
+
+    assert meta["candidate_context_tokens"] > 190000
+    assert meta["provider_bound_prompt_tokens"] <= meta["usable_input_budget"]
+    assert meta["budget_enforcement_triggered"] is True
+    assert meta["budget_overflow_tokens"] == 0
+    assert compiler._estimate_native_tokens(out) == meta["provider_bound_prompt_tokens"]
+
+
+def test_native_short_context_keeps_structure_without_budget_enforcement():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=64000, max_new_tokens=1024)
+    )
+    messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "U" * 20000}]
+
+    out, meta = compiler.compile_native("task", WorkingState(), messages)
+
+    assert out == messages
+    assert meta["budget_enforcement_triggered"] is False
+    assert meta["provider_bound_prompt_tokens"] == meta["candidate_context_tokens"]
+
+
+def test_native_estimator_counts_structured_tool_payloads():
+    compiler = _compiler()
+    small = [{"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}]
+    large = [{"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "read_file", "arguments": "X" * 5000}}]}]
+
+    assert compiler._estimate_native_tokens(large) > compiler._estimate_native_tokens(small) + 4000
+
+
+def test_native_unavoidable_pinned_overflow_is_recorded_without_deleting_pinned():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=64000, max_new_tokens=1024)
+    )
+    messages = [{"role": "user", "content": "task"}]
+    for index in range(10):
+        messages += _native_pair(f"c{index}", "read_file", {"path": f"f{index}.py"}, "X" * 8000)
+
+    out, meta = compiler.compile_native(
+        "task", WorkingState(), messages, pinned_extra={"large-pinned": "P" * 70000}
+    )
+
+    assert any("P" * 100 in message.get("content", "") for message in out)
+    assert meta["budget_enforcement_triggered"] is True
+    assert meta["budget_overflow_tokens"] > 0
+    assert meta["provider_bound_prompt_tokens"] > meta["usable_input_budget"]
+
+
+@pytest.mark.parametrize(
+    ("role", "text", "expected"),
+    [
+        ("user", "Do not modify retrieval.py.", "Do not modify retrieval.py."),
+        ("assistant", "retrieval.py must remain unchanged.", "retrieval.py must remain unchanged."),
+        ("user", "Keep read_file backward compatible.", "Keep read_file backward compatible."),
+        ("assistant", "Use runtime.py rather than retrieval.py.", "Use runtime.py rather than retrieval.py."),
+        ("assistant", "The problem is not caused by memory.", "not caused by memory"),
+        ("user", "skip when A OR B is missing.", "A OR B"),
+        ("assistant", "both A AND B are required.", "A AND B"),
+        ("user", "exactly one result is allowed.", "exactly one"),
+    ],
+)
+def test_deterministic_condenser_preserves_high_signal_user_and_assistant_facts(
+    role, text, expected
+):
+    summary, _ = HistoryCondenser().condense([{"role": role, "content": text}])
+
+    assert expected in summary
+
+
+def test_deterministic_condenser_deduplicates_normalized_constraints():
+    summary, _ = HistoryCondenser().condense(
+        [
+            {"role": "user", "content": "Do not modify retrieval.py."},
+            {"role": "assistant", "content": " do not modify retrieval.py! "},
+        ]
+    )
+
+    assert summary.lower().count("do not modify retrieval.py") == 1
+
+
+def test_deterministic_condenser_keeps_tool_summary_without_tool_body_noise():
+    summary, _ = HistoryCondenser().condense(
+        [
+            {
+                "role": "tool",
+                "name": "read_file",
+                "args": {"path": "codecub/runtime.py"},
+                "content": "X" * 10000,
+            }
+        ]
+    )
+
+    assert "investigated codecub/runtime.py" in summary
+    assert "X" * 500 not in summary
+
+
+def test_deterministic_condenser_respects_output_budget_with_many_facts():
+    history = [
+        {"role": "user", "content": f"Do not modify module_{index}.py."}
+        for index in range(80)
+    ]
+    summary, _ = HistoryCondenser().condense(history, max_output_tokens=600)
+
+    assert len(summary) <= 600
+    assert "Do not modify module_0.py." in summary
+
+
+def test_deterministic_condenser_can_exclude_working_state_duplicate_fact():
+    summary, _ = HistoryCondenser().condense(
+        [{"role": "user", "content": "Do not modify retrieval.py."}],
+        excluded_facts={HistoryCondenser._normalize_fact("Do not modify retrieval.py.")},
+    )
+
+    assert "Do not modify retrieval.py." not in summary
+
+
+def test_native_compression_preserves_older_assistant_constraint():
+    compiler = ContextCompiler(
+        budget=ContextBudget.resolve(context_window=2600, max_new_tokens=100)
+    )
+    messages = [
+        {"role": "assistant", "content": "Do not modify codecub/retrieval.py."}
+    ]
+    for index in range(8):
+        messages += _native_pair(
+            f"c{index}", "read_file", {"path": f"module_{index}.py"}, "X" * 800
+        )
+
+    out, meta = compiler.compile_native("task", WorkingState(), messages)
+
+    assert meta["compression_count"] >= 1
+    assert any(
+        "Do not modify codecub/retrieval.py." in message.get("content", "")
+        for message in out
+    )
+
+
+def test_production_context_compiler_defaults_to_compression_only():
+    assert ContextCompiler().hybrid_context_enabled is False
+
+
+def test_runtime_hybrid_raw_evidence_is_explicit_opt_in(tmp_path):
+    default_root = tmp_path / "default"
+    opt_in_root = tmp_path / "opt-in"
+    default_root.mkdir()
+    opt_in_root.mkdir()
+    default_agent = build_agent(default_root, [])
+    opt_in_agent = build_agent(
+        opt_in_root, [], feature_flags={"hybrid_context_enabled": True}
+    )
+
+    assert default_agent.context_compiler.hybrid_context_enabled is False
+    assert opt_in_agent.context_compiler.hybrid_context_enabled is True
+
+
+# ===========================================================================
+# Hybrid Development Set — local compiler scenarios, deliberately disjoint
+# from the frozen Agent evaluation task names.
+# ===========================================================================
+
+
+def _hybrid_compiler(context_window=30000, enabled=True):
+    return ContextCompiler(
+        budget=ContextBudget.resolve(context_window=context_window, max_new_tokens=512),
+        hybrid_context_enabled=enabled,
+    )
+
+
+def _hybrid_native_history(target_path="src/engine.py", marker="RAW-EVIDENCE", count=14):
+    messages = []
+    for index in range(count):
+        path = target_path if index == 4 else f"docs/browse_{index}.txt"
+        content = marker + ("Z" * 2400) if index == 4 else "BROWSE-NOISE-" + ("N" * 2400)
+        messages += _native_pair(f"hybrid-{index}", "read_file", {"path": path}, content)
+    return messages
+
+
+def test_hybrid_development_short_context_is_unchanged():
+    history = [{"role": "tool", "name": "read_file", "args": {"path": "src/a.py"}, "content": "small"}]
+    state = WorkingState(goal="inspect src/a.py")
+    text_a, meta_a = _hybrid_compiler(enabled=False).compile_text("inspect src/a.py", state, history)
+    text_b, meta_b = _hybrid_compiler(enabled=True).compile_text("inspect src/a.py", state, history)
+    assert text_a == text_b
+    assert meta_a["raw_evidence_selected_count"] == meta_b["raw_evidence_selected_count"] == 0
+
+
+def test_hybrid_development_irrelevant_old_reads_are_not_reclaimed():
+    out, meta = _hybrid_compiler().compile_native(
+        "repair src/engine.py", WorkingState(),
+        _hybrid_native_history(target_path="docs/old_notes.txt"),
+    )
+    assert meta["raw_evidence_selected_count"] == 0
+    assert not any("RAW-EVIDENCE" in str(message) for message in out)
+
+
+def test_hybrid_development_current_fresh_read_is_raw_evidence():
+    state = WorkingState(goal="repair src/engine.py")
+    state.add_relevant_symbol(path="src/engine.py", name="", kind="file")
+    out, meta = _hybrid_compiler().compile_native("repair src/engine.py", state, _hybrid_native_history())
+    assert any("RAW-EVIDENCE" in str(message) for message in out)
+    assert "fresh_read_current_target" in meta["raw_evidence_selected"][0]["reasons"]
+
+
+def test_hybrid_development_failed_test_traceback_is_raw_evidence():
+    messages = _hybrid_native_history(marker="noise")
+    messages[4:4] = _native_pair(
+        "failed-test", "run_shell", {"command": "pytest tests/test_engine.py"},
+        "Traceback (most recent call last):\nAssertionError: expected parser state\nexit_code: 1" + "T" * 1600,
+    )
+    _, meta = _hybrid_compiler().compile_native("repair parser state", WorkingState(), messages)
+    assert any("recent_failed_test" in item["reasons"] for item in meta["raw_evidence_selected"])
+
+
+def test_hybrid_development_repeated_read_is_not_duplicated():
+    state = WorkingState(goal="repair src/engine.py")
+    state.add_relevant_symbol(path="src/engine.py", name="", kind="file")
+    messages = _hybrid_native_history()
+    messages[0:0] = _native_pair("duplicate", "read_file", {"path": "src/engine.py"}, "RAW-EVIDENCE" + "Z" * 2400)
+    _, meta = _hybrid_compiler().compile_native("repair src/engine.py", state, messages)
+    assert sum("fresh_read_current_target" in item["reasons"] for item in meta["raw_evidence_selected"]) == 1
+    assert any(item["reason"] == "duplicate" for item in meta["dropped_history_groups"])
+
+
+def test_hybrid_development_changed_file_makes_old_source_stale():
+    state = WorkingState(goal="repair src/engine.py")
+    state.add_changed_file("src/engine.py")
+    out, meta = _hybrid_compiler().compile_native("repair src/engine.py", state, _hybrid_native_history())
+    assert not any("RAW-EVIDENCE" in str(message) for message in out)
+    assert any(item["reason"] == "stale" for item in meta["dropped_history_groups"])
+
+
+def test_hybrid_development_native_raw_evidence_remains_atomic():
+    state = WorkingState(goal="repair src/engine.py")
+    state.add_relevant_symbol(path="src/engine.py", name="", kind="file")
+    out, _ = _hybrid_compiler().compile_native("repair src/engine.py", state, _hybrid_native_history())
+    calls = {call["id"] for message in out for call in message.get("tool_calls", [])}
+    assert all(message.get("tool_call_id") in calls for message in out if message.get("role") == "tool")
+
+
+def test_hybrid_development_reclaims_large_safe_slack_for_evidence():
+    state = WorkingState(goal="repair src/engine.py")
+    state.add_relevant_symbol(path="src/engine.py", name="", kind="file")
+    compiler = _hybrid_compiler(context_window=60000)
+    _, meta = compiler.compile_native(
+        "repair src/engine.py", state, _hybrid_native_history(count=28)
+    )
+    assert meta["raw_reclaim_tokens"] > 1500
+    assert meta["unused_context_budget"] > 15000
+
+
+def test_hybrid_development_does_not_fill_slack_with_browsing_noise():
+    _, meta = _hybrid_compiler(context_window=60000).compile_native(
+        "repair src/engine.py", WorkingState(),
+        _hybrid_native_history(target_path="docs/old_notes.txt", count=28),
+    )
+    assert meta["unused_context_budget"] > 15000
+    assert meta["raw_evidence_selected_count"] == 0
+
+
+def test_hybrid_development_provider_budget_invariant_holds():
+    state = WorkingState(goal="repair src/engine.py")
+    state.add_relevant_symbol(path="src/engine.py", name="", kind="file")
+    _, meta = _hybrid_compiler(context_window=12000).compile_native(
+        "repair src/engine.py", state, _hybrid_native_history()
+    )
+    assert meta["final_provider_bound_tokens"] <= meta["usable_input_budget"]
+
+
+def test_hybrid_development_working_state_fact_does_not_duplicate_raw_context():
+    state = WorkingState(goal="repair src/engine.py")
+    state.add_known_fact("engine module requires a parser reset", {"path": "src/engine.py"})
+    state.add_relevant_symbol(path="src/engine.py", name="", kind="file")
+    _, meta = _hybrid_compiler(context_window=10000).compile_text(
+        "repair src/engine.py", state,
+        [{"role": "tool", "name": "read_file", "args": {"path": "src/engine.py"}, "content": "engine module requires a parser reset" + "X" * 1000}] * 18,
+    )
+    assert meta["raw_evidence_selected_count"] <= 1
+    assert meta["raw_evidence_selected_count"] == len(meta["raw_evidence_selected"])

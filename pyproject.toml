@@ -13,6 +13,9 @@ dependencies = []
 tokenizers = [
   "tiktoken>=0.8.0",
 ]
+redis = [
+  "redis>=5",
+]
 
 [project.scripts]
 codecub = "codecub.cli:main"
@@ -35,3 +38,6 @@ markers = [
   "slow: long-running tests excluded from the default pytest run",
   "benchmark: benchmark and metrics tests excluded from the default pytest run",
 ]
+
+[tool.ruff]
+extend-exclude = [".workbuddy"]

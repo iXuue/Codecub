@@ -13,6 +13,8 @@ TOOL_FIELDS = {
     "write_file": "write_calls",
     "run_shell": "shell_calls",
     "delegate": "delegate_calls",
+    "dispatch": "dispatch_calls",
+    "retrieve_code": "retrieval_calls",
 }
 
 
@@ -103,6 +105,7 @@ def extract_metrics(report, trace):
     hysteresis = compiler.get("hysteresis") or {}
     result = {
         "attempts": (report or {}).get("attempts"),
+        "model_calls": (report or {}).get("attempts"),
         "tool_steps": (report or {}).get("tool_steps"),
         "runtime_mode": (report or {}).get("runtime_mode"),
         "effective_step_budget": (report or {}).get("effective_step_budget"),
@@ -158,6 +161,22 @@ def extract_metrics(report, trace):
         "fresh_fact_count": compiler.get("fresh_fact_count"),
         "stale_fact_count": compiler.get("stale_fact_count"),
         "read_calls": counts["read_file"],
+        "files_read": unique_reads,
+        "delegation_count": counts["delegate"] + counts["dispatch"],
+        "parallel_subagent_count": 0,
+        "retrieval_calls": counts["retrieve_code"],
+        "semantic_retrieval_count": sum(
+            bool(event.get("semantic_applied")) for event in trace
+        ),
+        "rerank_count": sum(bool(event.get("rerank_applied")) for event in trace),
+        "retrieval_fallback_count": sum(
+            event.get("retrieval_strategy") == "lexical_ast_rrf" for event in trace
+        ),
+        "retry_count": sum(event.get("event") == "model.retry" for event in trace),
+        "fallback_count": sum(event.get("event") == "model.fallback" for event in trace),
+        "circuit_break_count": sum(
+            event.get("tool_error_code") == "circuit_open" for event in trace
+        ),
         "unique_read_files": unique_reads,
         "repeated_read_calls": repeat_count,
         "repeated_search_calls": repeated_searches,

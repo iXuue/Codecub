@@ -2,6 +2,8 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -187,16 +189,9 @@ def test_run_shell_uses_allowlisted_environment_only(tmp_path):
 def test_bound_tool_methods_delegate_into_tools_module(tmp_path):
     agent = build_agent(tmp_path, [], approval_policy="auto")
 
-    with patch("codecub.tools.subprocess.run") as fake_run:
-        fake_run.return_value = type(
-            "Result",
-            (),
-            {"returncode": 0, "stdout": "toolkit-shell\n", "stderr": ""},
-        )()
-        shell_result = agent.tool_run_shell({"command": "echo bypass", "timeout": 20})
+    shell_result = agent.tool_run_shell({"command": "echo toolkit-shell", "timeout": 20})
 
     assert "toolkit-shell" in shell_result
-    fake_run.assert_called_once()
     assert agent.tool_run_shell.__func__.__module__ == "codecub.runtime"
 
     with patch("codecub.tools.tool_delegate", return_value="toolkit-delegate") as fake_delegate:
@@ -204,6 +199,49 @@ def test_bound_tool_methods_delegate_into_tools_module(tmp_path):
 
     assert delegate_result == "toolkit-delegate"
     fake_delegate.assert_called_once()
+
+
+def test_shell_tool_terminates_when_runtime_reports_cancellation(tmp_path):
+    agent = build_agent(tmp_path, [], approval_policy="auto")
+    cancelled = {"value": False}
+    agent.cancel_checker = lambda _runtime, _state: cancelled["value"]
+    script = "import time; time.sleep(30)"
+    command = subprocess.list2cmdline([sys.executable, "-c", script]) if os.name == "nt" else f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    def cancel_soon():
+        time.sleep(0.2)
+        cancelled["value"] = True
+
+    thread = threading.Thread(target=cancel_soon)
+    thread.start()
+    result = agent.run_tool("run_shell", {"command": command, "timeout": 20})
+    thread.join(timeout=1)
+    assert "shell process cancelled" in result
+
+
+def test_shell_cancellation_terminates_a_spawned_child_before_it_mutates(tmp_path):
+    agent = build_agent(tmp_path, [], approval_policy="auto")
+    cancelled = {"value": False}
+    agent.cancel_checker = lambda _runtime, _state: cancelled["value"]
+    marker = tmp_path / "child-should-not-write.txt"
+    child_script = f"import pathlib, time; time.sleep(1); pathlib.Path({str(marker)!r}).write_text('bad')"
+    parent_script = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}]); time.sleep(30)"
+    )
+    command = (
+        subprocess.list2cmdline([sys.executable, "-c", parent_script])
+        if os.name == "nt"
+        else f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_script)}"
+    )
+
+    thread = threading.Thread(target=lambda: (time.sleep(0.2), cancelled.__setitem__("value", True)))
+    thread.start()
+    result = agent.run_tool("run_shell", {"command": command, "timeout": 20})
+    thread.join(timeout=1)
+    time.sleep(1.2)
+    assert "shell process cancelled" in result
+    assert not marker.exists()
 
 
 def test_search_decodes_rg_output_as_utf8_with_replacement(tmp_path):
@@ -238,6 +276,7 @@ def test_delegate_child_is_read_only(tmp_path):
             "<final>child done</final>",
             "<final>parent done</final>",
         ],
+        execution_mode="multi_agent",
     )
 
     result = agent.ask("Delegate the work")
@@ -247,6 +286,16 @@ def test_delegate_child_is_read_only(tmp_path):
     tool_events = [item for item in agent.session["history"] if item["role"] == "tool"]
     assert tool_events[0]["name"] == "delegate"
     assert "delegate_result" in tool_events[0]["content"]
+
+
+def test_delegate_child_inherits_parent_cancellation(tmp_path):
+    agent = build_agent(tmp_path, [], depth=0, max_depth=1)
+    agent.current_task_state = TaskState.create("task", "delegate", run_id="parent-run")
+    agent.cancel_checker = lambda _runtime, _state: True
+
+    result = agent.tool_delegate({"task": "inspect README.md", "max_steps": 2})
+
+    assert "canceled by user" in result.lower()
 
 
 def test_configured_secret_env_names_are_redacted_in_trace_and_report(tmp_path):

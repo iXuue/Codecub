@@ -38,6 +38,12 @@ class TaskState:
     final_answer: str = ""
     checkpoint_id: str = ""
     resume_status: str = ""
+    # Run-scoped durable ledger for explicitly identified side effects.
+    side_effect_operations: dict = None
+
+    def __post_init__(self):
+        if self.side_effect_operations is None:
+            self.side_effect_operations = {}
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -59,6 +65,7 @@ class TaskState:
             final_answer=str(data.get("final_answer", "")),
             checkpoint_id=str(data.get("checkpoint_id", "")),
             resume_status=str(data.get("resume_status", "")),
+            side_effect_operations=dict(data.get("side_effect_operations", {}) or {}),
         )
 
     def record_attempt(self):
@@ -111,4 +118,5 @@ class TaskState:
             "final_answer": self.final_answer,
             "checkpoint_id": self.checkpoint_id,
             "resume_status": self.resume_status,
+            "side_effect_operations": dict(self.side_effect_operations or {}),
         }

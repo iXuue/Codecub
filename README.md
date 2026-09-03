@@ -1,92 +1,185 @@
-﻿# CodeCub
+# CodeCub
 
-`CodeCub` 是一个本地优先的 coding agent 后端。P0 阶段它先保留命令行和 JSONL app-mode 能力，作为后续 Electron 桌面端的后端执行层。
+Local-first Coding Agent Harness.
 
-当前迁移目标：
+CodeCub is a local coding-agent runtime for repository work: reading code, compiling context, calling tools with approval boundaries, preserving checkpoints, and optionally coordinating bounded sub-agents for complex tasks. It is designed to run against a local workspace, with runtime state kept under `.codecub/`.
 
-- 包名：`codecub`
-- CLI 命令：`codecub`
-- 模块入口：`python -m codecub`
-- 会话目录：`.codecub/sessions/`
-- 运行工件：`.codecub/runs/<run_id>/`
-- 长期记忆：`.codecub/memory/`
+## Overview
 
-旧版 `.pico/` 数据不会在 P0.2 自动导入；导入提示和复制流程属于 P0.4。
+CodeCub focuses on the parts of coding-agent systems that are easy to under-specify: context construction, tool safety, replay behavior, local run state, and predictable execution modes. The default path is a single agent. Multi-agent orchestration is available as an explicit opt-in for tasks that naturally split into research, implementation, and review.
 
-## 快速开始
+## Key Features
+
+- Agent Runtime and agent loop
+- Hybrid code retrieval with lexical, AST, optional semantic, and optional reranking signals
+- Context engineering with state-preserving compression
+- Single-agent default execution and explicit multi-agent mode
+- Tool validation, approval policy, and permission boundaries
+- Retry, fallback, and circuit breaker support
+- Checkpoint and resume support
+- Read range freshness guard
+- Side-effect replay protection for stable operation identities
+- Electron / React / TypeScript desktop shell
+
+## Architecture
+
+```mermaid
+flowchart TD
+  User[User] --> Runtime[Pico Runtime]
+  Runtime --> Compiler[Context Compiler]
+  Runtime --> Retrieval[Hybrid Retrieval]
+  Runtime --> Gateway[Model Gateway]
+  Gateway --> Loop[Agent Loop]
+  Loop --> Tools[Tool Policy and Tool Runner]
+  Tools --> Store[RunStore / Checkpoints / Usage]
+
+  Runtime --> Orchestrator[Optional Orchestrator]
+  Orchestrator --> Research[Research Agent]
+  Orchestrator --> Implement[Implement Agent]
+  Orchestrator --> Review[Review Agent]
+```
+
+## Retrieval
+
+`retrieve_code` combines:
+
+- lexical search through `rg`
+- AST-backed symbol lookup
+- optional semantic embeddings
+- optional reranker
+- fast fallback to lexical + AST when semantic services are unavailable
+
+Generated indexes and caches live under `.codecub/index/` and should not be committed.
+
+## Context Engineering
+
+Production defaults:
+
+- State-preserving compression: ON
+- Adaptive Hybrid Raw Evidence: OFF
+- Hard truncation: retained as fallback
+
+The context compiler keeps recent verbatim evidence, compressed history, working state, token-budget metadata, and freshness / coverage information. Hybrid raw evidence is experimental and requires explicit opt-in through `hybrid_context_enabled = true`.
+
+## Multi-Agent
+
+Single Agent is the default.
+
+Use Multi-Agent explicitly when a task naturally separates into:
+
+- Research
+- Implement
+- Review
+
+CLI:
+
+```bash
+uv run codecub "inspect the failing tests"
+uv run codecub "repair the failing tests" --multi-agent
+```
+
+Multi-agent mode exposes bounded sub-agent tools. Research and Review remain read-only; Implement is the role that may use modifying tools. Implement is not blindly parallelized.
+
+## Reliability
+
+The runtime keeps tool execution on the same safety path in single-agent and multi-agent modes:
+
+- schema validation
+- path safety checks
+- approval policy
+- result contract validation
+- retry and fallback controls
+- tool circuit breaker
+- checkpoint / resume
+- side-effect operation ledger
+
+Side-effect replay protection is scoped to the same run / durable resume path when a stable `operation_key` or native `tool_call_id` exists. It is not a global exactly-once system, does not guarantee cross-process exactly-once behavior, and legacy recovered text tool calls without a stable operation identity have limited replay guarantees.
+
+## Evaluation
+
+Frozen aggregate results from the final evaluation pass:
+
+| Area | Protocol | Result |
+| --- | --- | --- |
+| Retrieval | N=20 isolated holdout code-location tasks | Pure lexical Top-3 30%; hybrid Top-3 85% |
+| Context | N=10 fixed agent tasks | invalid repeated source reads 9 -> 0 |
+| Multi-Agent | N=15 serial / parallel comparisons | mean wall-clock 116.33s -> 85.57s (-26.4%); tokens +1.5%; merge failures 0 |
+| Reliability | N=10 untouched side-effect scenarios | 10/10 correctness; duplicate commits 0 |
+
+The multi-agent result is a wall-clock scheduling result. It does not claim that multi-agent execution improves task correctness.
+
+## Quick Start
 
 ```bash
 uv sync
-uv run codecub
-uv run codecub --cwd /path/to/repo
-uv run codecub "inspect the test failures and propose a fix"
-python -m codecub
+uv run codecub --help
+uv run codecub --cwd /path/to/repo "inspect the project"
 ```
 
-App-mode 后端入口：
+Desktop backend app-mode:
 
 ```bash
 uv run python -m codecub --app-mode --cwd /path/to/repo
 ```
 
-## 模型后端
+## Configuration
 
-Ollama：
+OpenAI-compatible provider:
 
 ```bash
-ollama serve
-ollama pull qwen3.5:4b
-uv run codecub --provider ollama --model qwen3.5:4b
+OPENAI_API_BASE=https://your-api.example/v1
+OPENAI_API_KEY=your_api_key_here
+OPENAI_MODEL=your_model_here
 ```
 
-OpenAI 兼容接口：
+Anthropic-compatible provider:
 
 ```bash
-export OPENAI_API_BASE="https://your-api.example/v1"
-export OPENAI_API_KEY="your-api-key"
-export OPENAI_MODEL="qwen-flash"
-uv run codecub --provider openai
+ANTHROPIC_API_BASE=https://your-api.example/v1
+ANTHROPIC_API_KEY=your_api_key_here
+ANTHROPIC_MODEL=your_model_here
 ```
 
-Anthropic 兼容接口：
+Execution mode:
 
 ```bash
-export ANTHROPIC_API_BASE="https://www.right.codes/claude/v1"
-export ANTHROPIC_API_KEY="your-api-key"
-export ANTHROPIC_MODEL="claude-sonnet-4-6"
-uv run codecub --provider anthropic
+uv run codecub "task"                 # single-agent default
+uv run codecub "task" --multi-agent   # explicit multi-agent mode
 ```
 
-## 常用交互命令
+Context flags are runtime feature flags. The production default keeps `context_compiler` enabled and `hybrid_context_enabled` disabled.
 
-- `/help`：查看内置命令
-- `/memory`：查看提炼后的工作记忆
-- `/memory recall <query>`：查看相关记忆召回说明
-- `/session`：查看当前会话文件路径
-- `/reset`：清空当前会话状态
-- `/exit` 或 `/quit`：退出 REPL
-
-## 安全与持久化
-
-CodeCub 不会默认放开所有高风险动作。shell 执行、文件写入等操作受审批模式控制：
+## Tests
 
 ```bash
---approval ask
---approval auto
---approval never
-```
-
-每次运行结束后，会在 `.codecub/runs/<run_id>/` 下写出：
-
-- `task_state.json`
-- `trace.jsonl`
-- `report.json`
-
-这些内容默认只保存在本地，不应随仓库提交。
-
-## 开发检查
-
-```bash
-uv run pytest tests/test_app_protocol.py tests/test_app_runner.py tests/test_pico.py tests/test_safety_invariants.py -q
+uv run pytest -q
 uv run ruff check .
+git diff --check
 ```
+
+Desktop:
+
+```bash
+cd desktop
+npm run typecheck
+npm run build
+```
+
+## Project Structure
+
+```text
+codecub/      Python runtime, tools, retrieval, context, memory, orchestration
+desktop/      Electron / React desktop shell
+tests/        Python tests
+scripts/      Evaluation and packaging scripts
+benchmarks/   Benchmark task definitions
+assets/       Static screenshots and desktop assets
+```
+
+## Limitations
+
+- Multi-agent execution does not guarantee higher correctness.
+- Side-effect replay protection is not global exactly-once.
+- Cross-process duplicate protection is not currently guaranteed.
+- Legacy recovered tool text without a stable operation identity has limited replay protection.
+- Generated runtime state under `.codecub/index/`, `.codecub/runs/`, `.codecub/sessions/`, `.codecub/cache/`, and `.codecub/usage/` should not be committed.
