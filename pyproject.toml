@@ -27,8 +27,8 @@ dev = [
   "ruff>=0.4.4",
 ]
 
-[tool.setuptools]
-packages = ["codecub"]
+[tool.setuptools.packages.find]
+include = ["codecub*"]
 
 [tool.pytest.ini_options]
 addopts = "-m 'not slow and not benchmark'"

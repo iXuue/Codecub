@@ -1,0 +1,27 @@
+{
+  "benchmark_version": "codecub-phase0-v1",
+  "deterministic_hybrid_retrieval": {
+    "command": [
+      "D:\\代码备份\\pico\\pico-main\\.venv\\Scripts\\python.exe",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/test_hybrid_retrieval.py"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": ".....................                                                    [100%]\n21 passed in 1.17s\n"
+  },
+  "git_commit": "5bf3789eb0b2aaafa66cba7eeddc16bea7410af0",
+  "git_dirty": true,
+  "model": "",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "provider": "",
+  "provider_backed_comparison": {
+    "reason": "no explicit embedding/reranker provider configuration",
+    "status": "not_run"
+  },
+  "python": "3.12.7 | packaged by Anaconda, Inc. | (main, Oct  4 2024, 13:17:27) [MSC v.1929 64 bit (AMD64)]",
+  "schema_version": 1,
+  "timestamp": "2026-08-27T04:29:02.267950+00:00"
+}

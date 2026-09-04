@@ -53,6 +53,22 @@ class Spine:
             lane = self._lanes.get(conversation_id)
         return lane.drain_injections() if lane else []
 
+    def cancel_run(self, run_id: str) -> bool:
+        """Request cancellation without bypassing lane ownership."""
+        with self._lock:
+            lanes = tuple(self._lanes.values())
+        return any(lane.cancel_run(run_id) for lane in lanes)
+
+    def active_run_ids(self) -> dict[str, str]:
+        """Return a stable conversation-to-run snapshot for control surfaces."""
+        with self._lock:
+            lanes = tuple(self._lanes.values())
+        return {
+            lane.conversation_id: lane.active_run_id
+            for lane in lanes
+            if lane.active_run_id
+        }
+
     def _dispatch(self, request, run, lane):
         request.runtime_extensions["injection_provider"] = lane.drain_injections
         context = TraceContext(request.trace_id, request.session_id, request.conversation_id, request.turn_id, run.run_id)

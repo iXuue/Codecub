@@ -4,12 +4,15 @@ import type { AppSettings } from "../../electron/ipcTypes";
 import { Toolbar } from "./Toolbar";
 
 type ApprovalPolicy = "ask" | "auto" | "never";
+type ExecutionMode = "single" | "multi_agent";
 
 type SettingsPageProps = {
   locale: Locale;
   setLocale: Dispatch<SetStateAction<Locale>>;
   approvalPolicy: ApprovalPolicy;
   setApprovalPolicy: Dispatch<SetStateAction<ApprovalPolicy>>;
+  executionMode: ExecutionMode;
+  setExecutionMode: Dispatch<SetStateAction<ExecutionMode>>;
   providerSettings: AppSettings["provider"] | null;
   setProviderSettings: Dispatch<SetStateAction<AppSettings["provider"] | null>>;
   appearanceSettings: AppSettings["appearance"];
@@ -127,6 +130,8 @@ export function SettingsPage({
   setLocale,
   approvalPolicy,
   setApprovalPolicy,
+  executionMode,
+  setExecutionMode,
   providerSettings,
   setProviderSettings,
   appearanceSettings,
@@ -169,6 +174,7 @@ export function SettingsPage({
       provider: savedProviderSettings,
       language: locale,
       approvalPolicy,
+      executionMode,
       appearance: appearanceSettings,
     });
     setLocale(saved.language);
@@ -303,6 +309,13 @@ export function SettingsPage({
               <option value="ask">ask</option>
               <option value="auto">auto</option>
               <option value="never">never</option>
+            </select>
+          </label>
+          <label>
+            {t("executionMode")}
+            <select value={executionMode} onChange={(event) => setExecutionMode(event.target.value as ExecutionMode)}>
+              <option value="single">{t("executionModeSingle")}</option>
+              <option value="multi_agent">{t("executionModeMultiAgent")}</option>
             </select>
           </label>
           <label>

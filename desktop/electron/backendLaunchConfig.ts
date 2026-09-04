@@ -54,6 +54,9 @@ export function buildBackendLaunchConfig(
   if (resumeSessionId.trim()) {
     args.push("--resume", resumeSessionId.trim());
   }
+  if (settings.executionMode === "multi_agent") {
+    args.push("--multi-agent");
+  }
 
   args.push("--provider", provider);
   args.push("--connection-profile-b64", encodeUtf8Base64(JSON.stringify({

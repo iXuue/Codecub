@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .task_policy import canonical_path, normalize_shell_command
+from .security import TrustBoundary
 
 # ---------------------------------------------------------------------------
 # 集中配置（阈值 / 预算比例统一在这里，避免 magic number 散落）
@@ -1732,6 +1733,12 @@ class ContextCompiler:
         if role == "tool":
             prefix = f"[tool:{name}] {json.dumps(item.get('args', {}), sort_keys=True, ensure_ascii=True)}"
             content = self.redact_fn(str(item.get("content", "")))
+            boundary = item.get("trust_boundary") or {}
+            if boundary.get("source") and boundary.get("nonce"):
+                content = TrustBoundary(
+                    source=str(boundary["source"]),
+                    nonce=str(boundary["nonce"]),
+                ).wrap(content)
             return f"{prefix}\n{content}"
         content = self.redact_fn(str(item.get("content", "")))
         return f"[{role}] {content}"

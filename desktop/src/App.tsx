@@ -12,6 +12,7 @@ import type { AppSettings, ProjectExtensions, ProjectSessionSummary } from "../e
 
 type View = "welcome" | "session" | "settings";
 type ApprovalPolicy = "ask" | "auto" | "never";
+type ExecutionMode = "single" | "multi_agent";
 const defaultAppearance: AppSettings["appearance"] = { themeMode: "dark", accentColor: "#38BDF8" };
 
 export function App() {
@@ -19,6 +20,7 @@ export function App() {
   const [view, setView] = useState<View>("welcome");
   const [projectPath, setProjectPath] = useState("");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("ask");
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>("single");
   const [providerSettings, setProviderSettings] = useState<AppSettings["provider"] | null>(null);
   const [appearanceSettings, setAppearanceSettings] = useState<AppSettings["appearance"]>(defaultAppearance);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
@@ -39,6 +41,7 @@ export function App() {
     window.codecub.loadSettings().then((settings) => {
       setLocale(settings.language);
       setApprovalPolicy(settings.approvalPolicy);
+      setExecutionMode(settings.executionMode ?? "single");
       setProviderSettings(settings.provider);
       setAppearanceSettings(settings.appearance ?? defaultAppearance);
     });
@@ -116,7 +119,7 @@ export function App() {
     setUsageState(createInitialUsageState());
     setView("session");
     try {
-      await window.codecub.startBackend(nextProjectPath, approvalPolicy, resumeSessionId);
+      await window.codecub.startBackend(nextProjectPath, approvalPolicy, executionMode, resumeSessionId);
       setRecentProjects(await window.codecub.loadRecentProjects());
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -243,6 +246,8 @@ export function App() {
         setLocale={setLocale}
         approvalPolicy={approvalPolicy}
         setApprovalPolicy={setApprovalPolicy}
+        executionMode={executionMode}
+        setExecutionMode={setExecutionMode}
         providerSettings={providerSettings}
         setProviderSettings={setProviderSettings}
         appearanceSettings={appearanceSettings}

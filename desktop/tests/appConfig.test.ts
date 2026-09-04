@@ -62,5 +62,6 @@ describe("app settings sanitization", () => {
       themeMode: "dark",
       accentColor: "#38BDF8",
     });
+    expect(defaultSettings.executionMode).toBe("single");
   });
 });

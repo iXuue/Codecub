@@ -1,6 +1,65 @@
 from .cli import build_agent, build_arg_parser, build_welcome, main
 from .models import AnthropicCompatibleModelClient, FakeModelClient, OllamaModelClient, OpenAICompatibleModelClient
+from .provider_config import ProviderConfig
+from .provider_contract import (
+    ErrorClassification,
+    ErrorKind,
+    ProviderCapabilities,
+    ProviderSpec,
+    classify_model_error,
+)
+from .provider_health import ProviderHealth, check_provider
+from .provider_registry import PROVIDER_REGISTRY, ProviderRegistry
+from .extensions import (
+    ExtensionConflict,
+    ExtensionContext,
+    ExtensionError,
+    ExtensionManifest,
+    ExtensionRegistry,
+)
+from .sandbox import SandboxDescriptor, WorkspaceBoundarySandbox
+from .security import (
+    TrustBoundary,
+    URLSecurityError,
+    URLTarget,
+    mark_untrusted_text,
+    new_trust_boundary,
+    validate_url,
+)
 from .context_validator import ContextValidationEvidence, ContextValidationResult, ContextValidator
+from .auth import (
+    AuthError,
+    AuthMiddleware,
+    CapabilityPolicy,
+    FakeAuthProvider,
+    HmacAuthProvider,
+    Identity,
+    ManagedPolicy,
+    SignedAuthToken,
+    StaticTokenAuthProvider,
+)
+from .gateway import GatewayRpcError, GatewayServer, MAX_RPC_FRAME_BYTES
+from .gateway_runtime import EmbeddedRuntimeGateway, RuntimeGatewayError
+from .mcp import (
+    MCP_MAX_FRAME_BYTES,
+    McpClient,
+    McpError,
+    McpManager,
+    McpPromptDefinition,
+    McpResourceDefinition,
+    McpServerConfig,
+    McpToolBridge,
+    McpToolDefinition,
+)
+from .automation import AutomationScheduler, CronJob, CronScheduleError, CronStore, cron_next
+from .channels import (
+    ChannelAdapter,
+    ChannelError,
+    ChannelRegistry,
+    InboundMessage,
+    LoopbackChannel,
+    OutboundMessage,
+)
 from .instruction_loader import (
     DEFAULT_INSTRUCTION_FILENAMES,
     DEFAULT_MAX_INSTRUCTION_FILE_BYTES,
@@ -42,6 +101,63 @@ __all__ = [
     "MiniAgent",
     "OllamaModelClient",
     "OpenAICompatibleModelClient",
+    "ErrorClassification",
+    "ErrorKind",
+    "ProviderCapabilities",
+    "ProviderConfig",
+    "ProviderHealth",
+    "ProviderRegistry",
+    "ProviderSpec",
+    "PROVIDER_REGISTRY",
+    "check_provider",
+    "classify_model_error",
+    "ExtensionConflict",
+    "ExtensionContext",
+    "ExtensionError",
+    "ExtensionManifest",
+    "ExtensionRegistry",
+    "SandboxDescriptor",
+    "TrustBoundary",
+    "URLSecurityError",
+    "URLTarget",
+    "WorkspaceBoundarySandbox",
+    "mark_untrusted_text",
+    "new_trust_boundary",
+    "validate_url",
+    "AuthError",
+    "AuthMiddleware",
+    "CapabilityPolicy",
+    "FakeAuthProvider",
+    "HmacAuthProvider",
+    "Identity",
+    "ManagedPolicy",
+    "SignedAuthToken",
+    "StaticTokenAuthProvider",
+    "EmbeddedRuntimeGateway",
+    "GatewayRpcError",
+    "GatewayServer",
+    "MAX_RPC_FRAME_BYTES",
+    "RuntimeGatewayError",
+    "MCP_MAX_FRAME_BYTES",
+    "McpClient",
+    "McpError",
+    "McpManager",
+    "McpPromptDefinition",
+    "McpResourceDefinition",
+    "McpServerConfig",
+    "McpToolBridge",
+    "McpToolDefinition",
+    "AutomationScheduler",
+    "CronJob",
+    "CronScheduleError",
+    "CronStore",
+    "cron_next",
+    "ChannelAdapter",
+    "ChannelError",
+    "ChannelRegistry",
+    "InboundMessage",
+    "LoopbackChannel",
+    "OutboundMessage",
     "SessionStore",
     "WorkspaceContext",
 ]

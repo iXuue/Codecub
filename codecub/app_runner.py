@@ -8,6 +8,7 @@ from datetime import datetime
 from .app_protocol import encode_event, make_event, parse_command_line
 from .legacy_import import detect_legacy_pico, import_legacy_pico_sessions
 from .spine import ApprovalBroker
+from .spine.delivery import CallbackOutlet, DeliveryHub, DeliveryMessage
 
 HEARTBEAT_INTERVAL_SECONDS = 10
 
@@ -62,7 +63,7 @@ def _tool_result_payload(payload):
     }
 
 
-def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
+def run_app_mode(args, stdin=None, stdout=None, agent_factory=None, delivery_hub=None):
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     if agent_factory is None:
@@ -71,6 +72,21 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
         agent_factory = build_agent
     agent = agent_factory(args)
     session_id = agent.session.get("id", "")
+
+    owns_delivery_hub = delivery_hub is None
+    if delivery_hub is None:
+        delivery_hub = DeliveryHub()
+
+        def write_delivery_message(message):
+            return _write_event(
+                stdout,
+                message.event_type,
+                session_id=message.session_id,
+                run_id=message.run_id,
+                payload=dict(message.payload),
+            )
+
+        delivery_hub.register("app", CallbackOutlet(write_delivery_message))
 
     output_lock = threading.Lock()
     pending_lock = threading.Lock()
@@ -95,7 +111,15 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
 
     def emit(event_type, run_id="", payload=None):
         with output_lock:
-            return _write_event(stdout, event_type, session_id=session_id, run_id=run_id, payload=payload or {})
+            return delivery_hub.publish(
+                DeliveryMessage(
+                    channel="app",
+                    event_type=event_type,
+                    session_id=session_id,
+                    run_id=run_id,
+                    payload=payload or {},
+                )
+            )
 
     def remember_run_status(run_id, payload):
         if run_id and run_id == active_run.get("run_id"):
@@ -431,6 +455,8 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
             if thread is not None:
                 thread.join(timeout=2)
             emit("session_closed")
+            if owns_delivery_hub:
+                delivery_hub.close()
             return 0
 
         if command_type == "cancel_run":
@@ -516,4 +542,6 @@ def run_app_mode(args, stdin=None, stdout=None, agent_factory=None):
     thread = active_run.get("thread")
     if thread is not None:
         thread.join(timeout=2)
+    if owns_delivery_hub:
+        delivery_hub.close()
     return 0

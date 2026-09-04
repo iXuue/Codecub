@@ -1,0 +1,44 @@
+{
+  "benchmark_version": "codecub-phase0-v1",
+  "baseline_type": "PRE_PHASE_0_5_SNAPSHOT",
+  "baseline_validity": "VERIFIED",
+  "historical_prechange_comparison": "AVAILABLE_FOR_DETERMINISTIC_SNAPSHOT_SUITE_ONLY",
+  "snapshot_provenance": {
+    "path": "E:\\codex_backup\\20260827_1214_codecub_phase0_5",
+    "file_count": 31,
+    "verification": [
+      "No codecub/spine directory or Spine contract identifiers are present.",
+      "The snapshot preserves pre-existing dirty files including run_queue.py, event_bus.py, worker.py, and orchestration.py rather than substituting clean Git HEAD.",
+      "Snapshot-to-current diffs show the Phase 0-5 integration delta in app_runner.py, runtime.py, tools.py, CLI, and tests."
+    ],
+    "runtime_sha256": "30460B4E59100BC473A7D5E7781DE0265098E36BC1723D0B06A052DE7AD4B245",
+    "app_runner_sha256": "DD9133CB996E4618E6EFBC0FE4D4760419B744E23E308AD7C6C04CD653F37FBF"
+  },
+  "deterministic_snapshot_measurement": {
+    "measurement_harness_version": "pytest 8.3.4 via current workspace .venv; read-only test harness",
+    "test_files": [
+      "tests/test_app_protocol.py",
+      "tests/test_app_runner.py",
+      "tests/test_run_store.py",
+      "tests/test_task_state.py"
+    ],
+    "before": {"passed": 38, "failed": 0, "duration_seconds": 1.54},
+    "after": {"passed": 38, "failed": 0, "duration_seconds": 1.47}
+  },
+  "commands": {
+    "pytest": 0,
+    "regression": 0,
+    "reliability": 0,
+    "retrieval": 0
+  },
+  "completed": true,
+  "failure_count": 0,
+  "git_commit": "5bf3789eb0b2aaafa66cba7eeddc16bea7410af0",
+  "git_dirty": true,
+  "model": "",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "provider": "",
+  "python": "3.12.7 | packaged by Anaconda, Inc. | (main, Oct  4 2024, 13:17:27) [MSC v.1929 64 bit (AMD64)]",
+  "schema_version": 1,
+  "timestamp": "2026-08-27T04:29:02.267950+00:00"
+}

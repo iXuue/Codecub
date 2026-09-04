@@ -34,6 +34,7 @@ export const defaultAppearanceSettings: AppearanceSettings = {
 export const defaultSettings: AppSettings = {
   language: "zh-CN",
   approvalPolicy: "ask",
+  executionMode: "single",
   provider: defaultProviderSettings,
   appearance: defaultAppearanceSettings,
 };
@@ -124,6 +125,7 @@ export function sanitizeSettingsForDisk(settings: AppSettings): AppSettings {
   return {
     language: settings.language,
     approvalPolicy: settings.approvalPolicy,
+    executionMode: settings.executionMode === "multi_agent" ? "multi_agent" : "single",
     appearance: {
       themeMode: appearance.themeMode === "light" ? "light" : "dark",
       accentColor: appearance.accentColor || defaultAppearanceSettings.accentColor,

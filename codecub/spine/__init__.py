@@ -18,6 +18,14 @@ from .interaction import ApprovalBroker, ConfirmationBroker, InteractionBroker, 
 from .control import ControlMessage, InMemoryControlBus, RedisStreamControlBus
 from .execution_broker import DurableExecutionBroker, EmbeddedExecutionBroker
 from .resource_pool import ResourcePools
+from .delivery import (
+    CallbackOutlet,
+    DeliveryBackpressure,
+    DeliveryError,
+    DeliveryHub,
+    DeliveryMessage,
+    DeliveryResult,
+)
 from .spine import Spine
 
 __all__ = [
@@ -28,4 +36,6 @@ __all__ = [
     "ApprovalBroker", "ConfirmationBroker", "InteractionBroker", "QuestionBroker",
     "ControlMessage", "InMemoryControlBus", "RedisStreamControlBus", "DurableExecutionBroker", "EmbeddedExecutionBroker",
     "ResourcePools",
+    "CallbackOutlet", "DeliveryBackpressure", "DeliveryError", "DeliveryHub",
+    "DeliveryMessage", "DeliveryResult",
 ]

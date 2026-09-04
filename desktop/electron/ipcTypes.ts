@@ -51,6 +51,7 @@ export type AppearanceSettings = {
 export type AppSettings = {
   language: "zh-CN" | "en-US";
   approvalPolicy: "ask" | "auto" | "never";
+  executionMode: "single" | "multi_agent";
   provider: ProviderSettings;
   appearance: AppearanceSettings;
 };
@@ -118,7 +119,7 @@ export type InstallProjectExtensionResult = {
 };
 
 export type BackendCommand =
-  | { type: "send_message"; message: string; run_id?: string }
+  | { type: "send_message"; message: string; run_id?: string; busy_policy?: "APPEND" | "INJECT" | "INTERRUPT" }
   | { type: "approve_operation"; run_id?: string; approval_id: string }
   | { type: "reject_operation"; run_id?: string; approval_id: string; reason?: string }
   | { type: "cancel_run"; run_id?: string }

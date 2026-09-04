@@ -96,9 +96,15 @@ ipcMain.handle("project:open", async () => {
 
 ipcMain.handle(
   "backend:start",
-  async (_event, projectPath: string, approvalPolicy: "ask" | "auto" | "never" = "ask", resumeSessionId = "") => {
+  async (
+    _event,
+    projectPath: string,
+    approvalPolicy: "ask" | "auto" | "never" = "ask",
+    executionMode: "single" | "multi_agent" = "single",
+    resumeSessionId = "",
+  ) => {
     const settings = await loadSettings();
-    const effectiveSettings = { ...settings, approvalPolicy };
+    const effectiveSettings = { ...settings, approvalPolicy, executionMode };
     const credentialId = effectiveSettings.provider.credentialId || effectiveSettings.provider.provider;
     const apiKey = await readApiKey(credentialId, effectiveSettings.provider.provider);
     backend.start(buildBackendLaunchConfig(projectPath, effectiveSettings, apiKey, process.env, resumeSessionId));

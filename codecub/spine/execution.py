@@ -21,6 +21,10 @@ class LegacyTurnRunner:
     def run(self, request: TurnRequest, run: Run) -> TurnOutcome:
         agent = self.agent_factory(request)
         agent.injection_provider = request.runtime_extensions.get("injection_provider")
+        if "identity" in request.runtime_extensions:
+            bind_identity = getattr(agent, "bind_identity", None)
+            if callable(bind_identity):
+                bind_identity(request.runtime_extensions.get("identity"))
         # The legacy runtime owns durable traces.  Pass the immutable Spine
         # correlation tuple explicitly; it must never be inferred from the
         # most recently active session or filesystem timestamps.

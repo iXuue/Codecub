@@ -22,6 +22,7 @@ describe("SettingsPage", () => {
     const savedSettings: AppSettings = {
       language: "en-US",
       approvalPolicy: "ask",
+      executionMode: "single",
       appearance,
       provider,
     };
@@ -39,6 +40,8 @@ describe("SettingsPage", () => {
         setLocale={vi.fn()}
         approvalPolicy="ask"
         setApprovalPolicy={vi.fn()}
+        executionMode="single"
+        setExecutionMode={vi.fn()}
         providerSettings={provider}
         setProviderSettings={vi.fn()}
         appearanceSettings={appearance}
@@ -66,6 +69,7 @@ describe("SettingsPage", () => {
     const savedSettings: AppSettings = {
       language: "en-US",
       approvalPolicy: "ask",
+      executionMode: "single",
       appearance: nextAppearance,
       provider,
     };
@@ -83,6 +87,8 @@ describe("SettingsPage", () => {
         setLocale={vi.fn()}
         approvalPolicy="ask"
         setApprovalPolicy={vi.fn()}
+        executionMode="single"
+        setExecutionMode={vi.fn()}
         providerSettings={provider}
         setProviderSettings={vi.fn()}
         appearanceSettings={nextAppearance}
@@ -113,6 +119,8 @@ describe("SettingsPage", () => {
         setLocale={vi.fn()}
         approvalPolicy="ask"
         setApprovalPolicy={vi.fn()}
+        executionMode="single"
+        setExecutionMode={vi.fn()}
         providerSettings={provider}
         setProviderSettings={setProviderSettings}
         appearanceSettings={appearance}
@@ -141,6 +149,7 @@ describe("SettingsPage", () => {
     const setProviderSettings = vi.fn();
     render(
       <SettingsPage locale="en-US" setLocale={vi.fn()} approvalPolicy="ask" setApprovalPolicy={vi.fn()}
+        executionMode="single" setExecutionMode={vi.fn()}
         providerSettings={provider} setProviderSettings={setProviderSettings} appearanceSettings={appearance}
         setAppearanceSettings={vi.fn()} t={(key) => t("en-US", key)} onBack={vi.fn()} />,
     );
@@ -156,6 +165,7 @@ describe("SettingsPage", () => {
       saveSettings: vi.fn(), saveProviderSettings: vi.fn(), clearProviderCredential: vi.fn(),
     };
     render(<SettingsPage locale="en-US" setLocale={vi.fn()} approvalPolicy="ask" setApprovalPolicy={vi.fn()}
+      executionMode="single" setExecutionMode={vi.fn()}
       providerSettings={{ ...provider, connectionType: "relay", endpointVerificationStatus: "verified", usageSchemaVerificationStatus: "unverified" }} setProviderSettings={vi.fn()} appearanceSettings={appearance}
       setAppearanceSettings={vi.fn()} t={(key) => t("en-US", key)} onBack={vi.fn()} />);
     expect(screen.getByText("Endpoint: Verified")).toBeTruthy();

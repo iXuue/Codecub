@@ -6,6 +6,7 @@ function settings(provider: AppSettings["provider"]["provider"]): AppSettings {
   return {
     language: "zh-CN",
     approvalPolicy: "ask",
+    executionMode: "single",
     appearance: { themeMode: "dark", accentColor: "#38BDF8" },
     provider: {
       provider,
@@ -103,5 +104,13 @@ describe("backend launch config", () => {
     const config = buildBackendLaunchConfig("D:/repo", settings("openai"), "", {}, "session-123");
     expect(config.args).toContain("--resume");
     expect(config.args).toContain("session-123");
+  });
+
+  it("passes multi-agent mode only when explicitly selected", () => {
+    const single = buildBackendLaunchConfig("D:/repo", settings("openai"), "", {});
+    const multi = buildBackendLaunchConfig("D:/repo", { ...settings("openai"), executionMode: "multi_agent" }, "", {});
+
+    expect(single.args).not.toContain("--multi-agent");
+    expect(multi.args).toContain("--multi-agent");
   });
 });

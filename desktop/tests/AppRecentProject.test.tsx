@@ -16,6 +16,7 @@ function installCodecubMock(overrides: Partial<Window["codecub"]> = {}) {
   const settings: AppSettings = {
     language: "en-US",
     approvalPolicy: "ask",
+    executionMode: "single",
     appearance: { themeMode: "dark", accentColor: "#38BDF8" },
     provider,
   };
@@ -68,7 +69,7 @@ describe("App recent project flow", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /repo/i }));
 
-    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenCalledWith("D:/repo", "ask", ""));
+    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenCalledWith("D:/repo", "ask", "single", ""));
     await waitFor(() => expect(screen.getAllByText("D:/repo").length).toBeGreaterThan(0));
     expect(await screen.findByText(/Bundled CodeCub backend executable is missing/)).toBeTruthy();
   });
@@ -89,7 +90,7 @@ describe("App recent project flow", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /Continue Latest Project/i }));
 
-    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenCalledWith("D:/repo", "ask", ""));
+    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenCalledWith("D:/repo", "ask", "single", ""));
     expect((await screen.findAllByText("repo")).length).toBeGreaterThan(0);
   });
 
@@ -119,7 +120,7 @@ describe("App recent project flow", () => {
     fireEvent.click(await screen.findByRole("button", { name: /previous answer/i }));
 
     await waitFor(() => expect(window.codecub.loadProjectSession).toHaveBeenCalledWith("D:/repo", "s1"));
-    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenLastCalledWith("D:/repo", "ask", "s1"));
+    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenLastCalledWith("D:/repo", "ask", "single", "s1"));
     expect((await screen.findAllByText("previous task")).length).toBeGreaterThan(0);
   });
 
@@ -131,7 +132,7 @@ describe("App recent project flow", () => {
     fireEvent.click(await screen.findByRole("button", { name: "New" }));
 
     await waitFor(() => expect(window.codecub.createProjectSession).toHaveBeenCalledWith("D:/repo"));
-    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenLastCalledWith("D:/repo", "ask", "manual-s1"));
+    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenLastCalledWith("D:/repo", "ask", "single", "manual-s1"));
   });
 
   it("deletes the active chat after confirmation and starts a clean session", async () => {
@@ -155,7 +156,7 @@ describe("App recent project flow", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Delete chat Delete me/i }));
 
     await waitFor(() => expect(window.codecub.deleteProjectSession).toHaveBeenCalledWith("D:/repo", "s1"));
-    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenLastCalledWith("D:/repo", "ask", ""));
+    await waitFor(() => expect(window.codecub.startBackend).toHaveBeenLastCalledWith("D:/repo", "ask", "single", ""));
     confirm.mockRestore();
   });
 

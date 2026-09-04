@@ -1,0 +1,20 @@
+{
+  "benchmark_version": "codecub-phase0-v1",
+  "git_commit": "5bf3789eb0b2aaafa66cba7eeddc16bea7410af0",
+  "git_dirty": true,
+  "model": "",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "provider": "",
+  "python": "3.12.7 | packaged by Anaconda, Inc. | (main, Oct  4 2024, 13:17:27) [MSC v.1929 64 bit (AMD64)]",
+  "regression": {
+    "command": [
+      "D:\\代码备份\\pico\\pico-main\\.venv\\Scripts\\python.exe",
+      "scripts/eval_regression.py"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "{\"total_tasks\": 12, \"passed\": 12, \"failed\": 0, \"pass_rate\": 1.0, \"within_budget\": 12, \"verifier_passes\": 12, \"within_budget_rate\": 1.0, \"verifier_pass_rate\": 1.0, \"failure_category_counts\": {}}\n"
+  },
+  "schema_version": 1,
+  "timestamp": "2026-08-27T04:29:02.267950+00:00"
+}

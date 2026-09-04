@@ -61,6 +61,27 @@ class ConversationLane:
         with self._lock:
             return self._active[1].run_id if self._active else ""
 
+    def cancel_run(self, run_id: str) -> bool:
+        """Request cooperative cancellation for the active run with ``run_id``.
+
+        The lane remains the sole owner of run state transitions.  Callers such
+        as a gateway may address a run by id, but they cannot complete its
+        future or mutate the agent directly.
+        """
+        with self._lock:
+            if not self._active or self._active[1].run_id != str(run_id):
+                return False
+            _request, run, _future, cancellation = self._active
+            if run.status.terminal:
+                return False
+            if run.status is RunStatus.RUNNING:
+                run.transition_to(RunStatus.CANCEL_REQUESTED)
+                cancellation.cancel()
+                run.transition_to(RunStatus.CANCELLING)
+            else:
+                cancellation.cancel()
+            return True
+
     def submit(self, request: TurnRequest, front: bool = False) -> Future:
         outcome = Future()
         with self._lock:
@@ -103,7 +124,8 @@ class ConversationLane:
         if self._active or not self._pending:
             return
         request, outcome = self._pending.popleft()
-        run = Run(new_id("run"), request.turn_id, request.conversation_id, request.session_id, request.trace_id)
+        run_id = str(request.runtime_extensions.get("run_id") or new_id("run"))
+        run = Run(run_id, request.turn_id, request.conversation_id, request.session_id, request.trace_id)
         cancellation = CancellationSource()
         request.runtime_extensions["cancellation_token"] = cancellation.token
         future = self._dispatch(request, run, self)

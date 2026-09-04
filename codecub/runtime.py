@@ -44,11 +44,13 @@ from . import tools as toolkit
 from . import task_policy
 from .watchdog import ProgressWatchdog
 from .resilience import ToolCircuitBreaker
+from .sandbox import WorkspaceBoundarySandbox
 from .retrieval import HybridRetriever
 from .event_bus import LocalEventBus
 from .cache import LocalJsonCache, file_summary_cache_key
 from .orchestration import Orchestrator
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from .auth import CapabilityPolicy
 
 # Public compatibility export; callers historically import this from runtime.
 SessionStore = _SessionStore
@@ -281,6 +283,8 @@ class _RuntimeToolValidation:
 
     def validate(self, name, args, _tool):
         toolkit.validate_tool(self, name, args)
+        if str(name).startswith("mcp_"):
+            toolkit.validate_json_tool_arguments(_tool, args)
 
     def example(self, name):
         return toolkit.tool_example(name)
@@ -882,11 +886,14 @@ class Pico:
         repository_instructions=(),
         agent_instructions=(),
         tool_instructions=(),
+        capability_policy=None,
+        runtime_identity=None,
     ):
         self.model_client = model_client
         self.model_gateway = model_gateway
         self.workspace = workspace
         self.root = Path(workspace.repo_root)
+        self.sandbox = WorkspaceBoundarySandbox(self.root)
         self.file_summary_cache = LocalJsonCache(
             self.root / ".codecub" / "cache" / "file_summaries.json"
         )
@@ -918,6 +925,8 @@ class Pico:
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
+        self.capability_policy = capability_policy or CapabilityPolicy()
+        self.runtime_identity = runtime_identity
         self.allowed_tools = None if allowed_tools is None else frozenset(allowed_tools)
         self.requires_workspace_change = bool(requires_workspace_change)
         self.agent_role = str(agent_role or "").strip()
@@ -1020,6 +1029,10 @@ class Pico:
             cancel_checker_ref=self._cancel_checker_ref,
         )
         self.tools = self.build_tools()
+        # MCP is opt-in and lazy: no network/process is opened during the
+        # normal Pico constructor, but discovered tools share this live
+        # registry and therefore the canonical ToolExecutor path.
+        self.mcp_manager = None
         self.hooks = HookComposite(runtime_hooks or ())
         self.tool_executor = ToolExecutor(
             ToolExecutionContext(
@@ -1057,6 +1070,7 @@ class Pico:
                     session=self.session,
                 ),
                 hook_subject=self.tool_subject,
+                authorization=self.capability_policy,
             ),
             self.hooks,
         )
@@ -1227,6 +1241,11 @@ class Pico:
         if hasattr(self, "_event_handler_ref"):
             self._event_handler_ref["value"] = handler
 
+    def bind_identity(self, identity):
+        """Bind the current authenticated identity to the execution gate."""
+        self.runtime_identity = identity
+        self.capability_policy.bind(identity)
+
     @property
     def current_task_state(self):
         if hasattr(self, "_tool_state_ref"):
@@ -1392,9 +1411,10 @@ class Pico:
         tools = toolkit.build_tool_registry(subject)
         if self.allowed_tools is None:
             return tools
-        return {
-            name: tool for name, tool in tools.items() if name in self.allowed_tools
-        }
+        # Keep the same live Registry seam for role-filtered agents.  The
+        # registry remains mapping-compatible, so existing prompt and test
+        # code does not need a special branch.
+        return tools.filtered(self.allowed_tools)
 
     def build_context_compiler(self):
         """Phase 2: 装配 Context Compiler。
@@ -2711,6 +2731,7 @@ class Pico:
                 "conflicts": list(self.last_memory_v2_conflicts),
             },
             "redacted_env": self.detected_secret_env_summary(),
+            "sandbox": self.sandbox.describe(),
         }
 
     def tool_example(self, name):
@@ -2722,6 +2743,45 @@ class Pico:
         if name == "delegate":
             if self.depth >= self.max_depth:
                 raise ValueError("delegate depth exceeded")
+
+    async def connect_mcp_servers(self, configs):
+        """Explicitly connect MCP servers and register tools on this runtime."""
+        from .mcp import McpManager
+
+        if self.mcp_manager is None:
+            self.mcp_manager = McpManager()
+        return await self.mcp_manager.connect_servers(configs, self.tools)
+
+    async def close_mcp_servers(self):
+        if self.mcp_manager is not None:
+            await self.mcp_manager.close()
+            self.mcp_manager = None
+
+    def mcp_snapshot(self):
+        return self.mcp_manager.snapshot() if self.mcp_manager is not None else {"servers": [], "errors": []}
+
+    def activate_extensions(self, names=None, *, granted_capabilities=()):
+        """Activate discovered extensions with an explicit capability grant."""
+        from .extensions import ExtensionContext
+
+        registry = getattr(self, "extension_registry", None)
+        if registry is None:
+            raise RuntimeError("extension registry has not been attached")
+        context = ExtensionContext(
+            runtime=self,
+            tool_registry=self.tools,
+            event_bus=self.event_bus,
+            granted_capabilities=frozenset(
+                str(item).strip() for item in (granted_capabilities or ()) if str(item).strip()
+            ),
+            metadata={"workspace": str(self.root)},
+        )
+        return registry.activate_all(names, context=context)
+
+    def deactivate_extensions(self):
+        registry = getattr(self, "extension_registry", None)
+        if registry is not None:
+            registry.deactivate_all()
 
     def tool_list_files(self, args):
         return toolkit.tool_list_files(self, args)
@@ -2802,19 +2862,25 @@ class Pico:
         tool = self.tools.get(name)
         if tool is None:
             return None, "unknown_tool"
-        declared = tool.get("schema", {})
-        if set(args) - set(declared):
-            return None, "schema_failure"
-        for key, value in args.items():
-            type_name = str(declared[key]).partition("=")[0]
-            valid = {
-                "str": isinstance(value, str),
-                "int": isinstance(value, int) and not isinstance(value, bool),
-                "float": isinstance(value, (int, float)) and not isinstance(value, bool),
-                "bool": isinstance(value, bool),
-            }.get(type_name, False)
-            if not valid:
+        if isinstance(tool.get("parameters"), dict):
+            try:
+                toolkit.validate_json_tool_arguments(tool, args)
+            except ValueError:
                 return None, "schema_failure"
+        else:
+            declared = tool.get("schema", {})
+            if set(args) - set(declared):
+                return None, "schema_failure"
+            for key, value in args.items():
+                type_name = str(declared[key]).partition("=")[0]
+                valid = {
+                    "str": isinstance(value, str),
+                    "int": isinstance(value, int) and not isinstance(value, bool),
+                    "float": isinstance(value, (int, float)) and not isinstance(value, bool),
+                    "bool": isinstance(value, bool),
+                }.get(type_name, False)
+                if not valid:
+                    return None, "schema_failure"
         try:
             self.validate_tool(name, args)
         except Exception:
@@ -2971,14 +3037,9 @@ class Pico:
         self.session_store.save(self.session)
 
     def path(self, raw_path):
-        path = Path(raw_path)
-        path = path if path.is_absolute() else self.root / path
-        resolved = path.resolve()
         # 所有文件类工具都被锚定在 workspace root 之下。
         # 这样既能防住 "../" 逃逸，也能防住符号链接解析后跳出仓库。
-        if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
-            raise ValueError(f"path escapes workspace: {raw_path}")
-        return resolved
+        return self.sandbox.resolve_path(raw_path)
 
 
 MiniAgent = Pico

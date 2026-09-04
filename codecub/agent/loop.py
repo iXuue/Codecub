@@ -8,6 +8,7 @@ import time
 from .. import task_policy
 from .. import tools as toolkit
 from ..models import ModelResponse
+from ..security import new_trust_boundary
 from ..workspace import clip, now
 
 from .runner import LoopOutcome
@@ -1250,7 +1251,15 @@ class AgentLoop:
                     if payload.get("tool_call_source") != "legacy_recovered"
                     else ""
                 )
-                result = self._tool_executor.execute(name, args, operation_key=operation_key)
+                result = self._tool_executor.execute(
+                    name,
+                    args,
+                    operation_key=operation_key,
+                    call_id=payload.get("tool_call_id", ""),
+                    session_id=session_id,
+                    turn_id=task_state.task_id,
+                    iteration=task_state.tool_steps,
+                )
                 tool_metadata = dict(self._tool_executor.last_metadata or {})
                 # A tool may observe cancellation while it is running.  Stop
                 # before recording evidence, working-state progress, history,
@@ -1280,6 +1289,9 @@ class AgentLoop:
                         "name": name,
                         "args": args,
                         "content": result,
+                        "trust_boundary": new_trust_boundary(
+                            source=f"tool:{name}"
+                        ).metadata(),
                         "created_at": now(),
                     }
                 )

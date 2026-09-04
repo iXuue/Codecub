@@ -21,8 +21,13 @@ import type {
 
 const api = {
   openProject: (): Promise<OpenProjectResult> => ipcRenderer.invoke("project:open"),
-  startBackend: (projectPath: string, approvalPolicy: AppSettings["approvalPolicy"], resumeSessionId = ""): Promise<void> =>
-    ipcRenderer.invoke("backend:start", projectPath, approvalPolicy, resumeSessionId),
+  startBackend: (
+    projectPath: string,
+    approvalPolicy: AppSettings["approvalPolicy"],
+    executionMode: AppSettings["executionMode"],
+    resumeSessionId = "",
+  ): Promise<void> =>
+    ipcRenderer.invoke("backend:start", projectPath, approvalPolicy, executionMode, resumeSessionId),
   sendBackendCommand: (command: BackendCommand): Promise<void> => ipcRenderer.invoke("backend:send", command),
   stopBackend: (): Promise<void> => ipcRenderer.invoke("backend:stop"),
   loadSettings: (): Promise<AppSettings> => ipcRenderer.invoke("settings:load"),

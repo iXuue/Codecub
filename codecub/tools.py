@@ -14,6 +14,7 @@ import textwrap
 import time
 from functools import partial
 
+from .tooling.registry import ToolRegistry
 from .workspace import IGNORED_PATH_NAMES, clip
 
 BASE_TOOL_SPECS = {
@@ -93,6 +94,16 @@ for _name, _spec in BASE_TOOL_SPECS.items():
             "side_effect": not _read_only,
             "idempotent": _read_only,
             "retryable": _read_only,
+            # Pico-inspired declarative effect metadata.  Approval and
+            # execution policy still use the existing ``risky`` field.
+            "effect": (
+                "read"
+                if _read_only
+                else "execute"
+                if _name == "run_shell"
+                else "write"
+            ),
+            "concurrency_safe": _read_only,
             "timeout_seconds": 20,
             "circuit_breaker": True,
         }
@@ -107,6 +118,8 @@ DELEGATE_TOOL_SPEC.update(
         "side_effect": False,
         "idempotent": True,
         "retryable": False,
+        "effect": "external",
+        "concurrency_safe": False,
         "timeout_seconds": 120,
         "circuit_breaker": True,
     }
@@ -118,6 +131,8 @@ DISPATCH_TOOL_SPEC = {
     "side_effect": False,
     "idempotent": True,
     "retryable": False,
+    "effect": "external",
+    "concurrency_safe": False,
     "timeout_seconds": 120,
     "circuit_breaker": True,
 }
@@ -153,29 +168,44 @@ def _native_parameter_schema(value):
     return schema
 
 
+def _native_parameters(tool):
+    """Render either the legacy declaration or a JSON-Schema parameters map."""
+
+    declared_parameters = tool.get("parameters")
+    if isinstance(declared_parameters, dict):
+        parameters = dict(declared_parameters)
+        parameters.setdefault("type", "object")
+        parameters.setdefault("properties", {})
+        parameters.setdefault("required", [])
+        parameters.setdefault("additionalProperties", False)
+        return parameters
+
+    declared_schema = tool.get("schema") or {}
+    properties = {
+        key: _native_parameter_schema(value)
+        for key, value in declared_schema.items()
+    }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": [
+            key for key, value in declared_schema.items() if "=" not in str(value)
+        ],
+        "additionalProperties": False,
+    }
+
+
 def native_tool_definitions(tools):
     """Render the canonical registry as OpenAI-compatible function schemas."""
     definitions = []
     for name, tool in tools.items():
-        properties = {
-            key: _native_parameter_schema(value)
-            for key, value in tool["schema"].items()
-        }
-        required = [
-            key for key, value in tool["schema"].items() if "=" not in str(value)
-        ]
         definitions.append(
             {
                 "type": "function",
                 "function": {
                     "name": name,
                     "description": tool["description"],
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                        "additionalProperties": False,
-                    },
+                    "parameters": _native_parameters(tool),
                 },
             }
         )
@@ -183,17 +213,20 @@ def native_tool_definitions(tools):
 
 
 def build_tool_registry(agent):
-    # 工具不是动态发现的，而是显式注册的。
-    # 这样模型看到的是一个有边界、可审计的动作集合。
-    tools = {
-        name: {**spec, "run": partial(_TOOL_RUNNERS[name], agent)}
-        for name, spec in BASE_TOOL_SPECS.items()
-    }
+    # 现有工具仍然是显式、可审计的；Registry 只替换容器，保留旧的
+    # dict-like 读写接口，便于逐步接入 MCP/Plugin 来源。
+    tools = ToolRegistry()
+    for name, spec in BASE_TOOL_SPECS.items():
+        tools.register(name, {**spec, "run": partial(_TOOL_RUNNERS[name], agent)})
     # 子 agent 是刻意做成受限能力的：一旦深度耗尽，
     # 就连 delegate 这个工具都不再暴露给模型。
     if agent.depth < agent.max_depth and agent.multi_agent_enabled():
-        tools["delegate"] = {**DELEGATE_TOOL_SPEC, "run": partial(tool_delegate, agent)}
-        tools["dispatch"] = {**DISPATCH_TOOL_SPEC, "run": partial(tool_dispatch, agent)}
+        tools.register(
+            "delegate", {**DELEGATE_TOOL_SPEC, "run": partial(tool_delegate, agent)}
+        )
+        tools.register(
+            "dispatch", {**DISPATCH_TOOL_SPEC, "run": partial(tool_dispatch, agent)}
+        )
     return tools
 
 
@@ -237,8 +270,68 @@ def validate_tool_result_contract(tool, result):
     return True, ""
 
 
+def validate_json_tool_arguments(tool, args):
+    """Validate an extension tool's JSON-Schema subset at the execution seam.
+
+    MCP schemas are intentionally kept as data on the registry spec.  This
+    small validator covers the interoperable object/property/required/type/
+    enum subset without adding a runtime dependency; provider-side schemas
+    remain available to callers for richer validation when needed.
+    """
+    schema = (tool or {}).get("parameters") if isinstance(tool, dict) else None
+    if not isinstance(schema, dict):
+        return
+    _validate_json_value(args or {}, schema, "arguments")
+
+
+def _validate_json_value(value, schema, path):
+    if not isinstance(schema, dict):
+        return
+    if "enum" in schema and value not in schema.get("enum", ()):
+        raise ValueError(f"{path} is not an allowed value")
+    declared_type = schema.get("type")
+    if declared_type == "object":
+        if not isinstance(value, dict):
+            raise ValueError(f"{path} must be an object")
+        properties = schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            raise ValueError(f"{path} has an invalid properties schema")
+        required = schema.get("required") or ()
+        missing = [str(name) for name in required if str(name) not in value]
+        if missing:
+            raise ValueError(f"{path} is missing required fields: {', '.join(missing)}")
+        if schema.get("additionalProperties") is False:
+            unknown = sorted(set(value) - set(properties))
+            if unknown:
+                raise ValueError(f"{path} has unknown fields: {', '.join(unknown)}")
+        for name, item in value.items():
+            if name in properties:
+                _validate_json_value(item, properties[name], f"{path}.{name}")
+        return
+    if declared_type == "array":
+        if not isinstance(value, list):
+            raise ValueError(f"{path} must be an array")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                _validate_json_value(item, item_schema, f"{path}[{index}]")
+        return
+    valid = {
+        "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "boolean": isinstance(value, bool),
+        "null": value is None,
+    }.get(str(declared_type), True)
+    if not valid:
+        raise ValueError(f"{path} has type {declared_type}")
+
+
 def validate_tool(agent, name, args):
     args = args or {}
+    tool = getattr(agent, "tools", {}).get(name) if hasattr(agent, "tools") else None
+    if isinstance(tool, dict) and name.startswith("mcp_"):
+        validate_json_tool_arguments(tool, args)
 
     if name == "list_files":
         path = agent.path(args.get("path", "."))

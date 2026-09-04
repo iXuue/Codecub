@@ -6,6 +6,7 @@
 """
 
 import argparse
+import asyncio
 import base64
 import json
 import os
@@ -21,7 +22,11 @@ from .models import (
     OllamaModelClient,
     OpenAICompatibleModelClient,
 )
-from .model_gateway import GatewayPolicy, ModelGateway
+from .model_gateway import ModelGateway
+from .provider_config import ProviderConfig
+from .provider_health import check_provider
+from .provider_registry import PROVIDER_REGISTRY
+from .extensions import ExtensionRegistry
 from .runtime import EXECUTION_MODE_MULTI_AGENT, EXECUTION_MODE_SINGLE, Pico, SessionStore
 from .spine import LegacyTurnRunner, Origin, Source, Spine, TurnRequest
 from .workspace import WorkspaceContext, middle
@@ -73,51 +78,32 @@ CLI_STATUS_LABELS = {
 }
 
 
-DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
-DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_OPENAI_MODEL = "gpt-5.4"
-DEFAULT_OPENAI_BASE_URL = "https://www.right.codes/codex/v1"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
-DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEFAULT_KIMI_MODEL = "moonshot-v1-8k"
-DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1"
-DEFAULT_MINIMAX_MODEL = "MiniMax-M3"
-DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io/v1"
-DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
-DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "CODECUB_SECRET_ENV_NAMES"
 PROVIDER_ENV_VAR = "CODECUB_PROVIDER"
-MODEL_PROVIDERS = ("ollama", "openai", "deepseek", "kimi", "minimax", "anthropic")
+MODEL_PROVIDERS = tuple(PROVIDER_REGISTRY)
+DEFAULT_OLLAMA_MODEL = PROVIDER_REGISTRY["ollama"].default_model
+DEFAULT_OLLAMA_HOST = PROVIDER_REGISTRY["ollama"].default_base_url
+DEFAULT_OPENAI_MODEL = PROVIDER_REGISTRY["openai"].default_model
+DEFAULT_OPENAI_BASE_URL = PROVIDER_REGISTRY["openai"].default_base_url
+DEFAULT_DEEPSEEK_MODEL = PROVIDER_REGISTRY["deepseek"].default_model
+DEFAULT_DEEPSEEK_BASE_URL = PROVIDER_REGISTRY["deepseek"].default_base_url
+DEFAULT_KIMI_MODEL = PROVIDER_REGISTRY["kimi"].default_model
+DEFAULT_KIMI_BASE_URL = PROVIDER_REGISTRY["kimi"].default_base_url
+DEFAULT_MINIMAX_MODEL = PROVIDER_REGISTRY["minimax"].default_model
+DEFAULT_MINIMAX_BASE_URL = PROVIDER_REGISTRY["minimax"].default_base_url
+DEFAULT_ANTHROPIC_MODEL = PROVIDER_REGISTRY["anthropic"].default_model
+DEFAULT_ANTHROPIC_BASE_URL = PROVIDER_REGISTRY["anthropic"].default_base_url
 OPENAI_COMPATIBLE_PROVIDER_CONFIG = {
-    "openai": {
-        "model_env": "OPENAI_MODEL",
-        "base_url_env": "OPENAI_API_BASE",
-        "api_key_env": "OPENAI_API_KEY",
-        "default_model": DEFAULT_OPENAI_MODEL,
-        "default_base_url": DEFAULT_OPENAI_BASE_URL,
-    },
-    "deepseek": {
-        "model_env": "DEEPSEEK_MODEL",
-        "base_url_env": "DEEPSEEK_API_BASE",
-        "api_key_env": "DEEPSEEK_API_KEY",
-        "default_model": DEFAULT_DEEPSEEK_MODEL,
-        "default_base_url": DEFAULT_DEEPSEEK_BASE_URL,
-    },
-    "kimi": {
-        "model_env": "MOONSHOT_MODEL",
-        "base_url_env": "MOONSHOT_API_BASE",
-        "api_key_env": "MOONSHOT_API_KEY",
-        "default_model": DEFAULT_KIMI_MODEL,
-        "default_base_url": DEFAULT_KIMI_BASE_URL,
-    },
-    "minimax": {
-        "model_env": "MINIMAX_MODEL",
-        "base_url_env": "MINIMAX_API_BASE",
-        "api_key_env": "MINIMAX_API_KEY",
-        "default_model": DEFAULT_MINIMAX_MODEL,
-        "default_base_url": DEFAULT_MINIMAX_BASE_URL,
-    },
+    spec.name: {
+        "model_env": spec.model_env[0],
+        "base_url_env": spec.base_url_env[0],
+        "api_key_env": spec.api_key_envs[0],
+        "default_model": spec.default_model,
+        "default_base_url": spec.default_base_url,
+    }
+    for spec in PROVIDER_REGISTRY.values()
+    if spec.client_kind == "openai"
 }
 _DOTENV_VALUES_LOADED_BY_CODECUB = {}
 
@@ -206,7 +192,7 @@ def load_env_file(repo_root):
 def _effective_provider(args):
     explicit_provider = getattr(args, "provider", None)
     if explicit_provider:
-        return explicit_provider
+        return PROVIDER_REGISTRY.get_spec(explicit_provider).name
     env_provider = os.environ.get(PROVIDER_ENV_VAR, "").strip().lower()
     if env_provider in MODEL_PROVIDERS:
         return env_provider
@@ -221,21 +207,12 @@ def _effective_model(args, provider):
     explicit_model = getattr(args, "model", None)
     if explicit_model:
         return explicit_model
-    if provider in OPENAI_COMPATIBLE_PROVIDER_CONFIG:
-        config = OPENAI_COMPATIBLE_PROVIDER_CONFIG[provider]
-        model = os.environ.get(config["model_env"])
+    spec = PROVIDER_REGISTRY.get_spec(provider)
+    for env_name in spec.model_env:
+        model = os.environ.get(env_name)
         if model:
             return model
-        return config["default_model"]
-    if provider == "anthropic":
-        model = os.environ.get("ANTHROPIC_MODEL")
-        if model:
-            return model
-        return DEFAULT_ANTHROPIC_MODEL
-    model = os.environ.get("OLLAMA_MODEL")
-    if model:
-        return model
-    return DEFAULT_OLLAMA_MODEL
+    return spec.default_model
 
 
 def _first_env(*names):
@@ -290,70 +267,53 @@ def _decode_connection_profile(value):
     }
 
 
-def _build_model_client(args):
-    provider = _effective_provider(args)
+def _annotate_model_client(client, spec):
+    client.provider_name = spec.name
+    client.provider_capabilities = spec.capabilities
+    return client
+
+
+def _build_model_client(args, model_override=None):
+    provider_config = ProviderConfig.from_args(args)
+    spec = PROVIDER_REGISTRY.get_spec(provider_config.provider)
+    model = model_override or provider_config.model
     supplied_profile = _decode_connection_profile(
         getattr(args, "connection_profile_b64", "")
     )
     # CLI 只负责把 provider 选择翻译成具体 client。
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
-    if provider in OPENAI_COMPATIBLE_PROVIDER_CONFIG:
-        config = OPENAI_COMPATIBLE_PROVIDER_CONFIG[provider]
-        model = _effective_model(args, provider)
-        base_url = (
-            getattr(args, "base_url", None)
-            or os.environ.get(config["base_url_env"])
-            or config["default_base_url"]
-        )
-        api_key = os.environ.get(config["api_key_env"], "")
-        return OpenAICompatibleModelClient(
+    if spec.client_kind == "openai":
+        client = OpenAICompatibleModelClient(
             model=model,
-            base_url=base_url,
-            api_key=api_key,
+            base_url=provider_config.base_url,
+            api_key=provider_config.api_key,
             temperature=args.temperature,
-            timeout=getattr(
-                args, "openai_timeout", getattr(args, "ollama_timeout", 300)
-            ),
+            timeout=provider_config.timeout,
             connection_profile=resolve_effective_connection_profile(
-                base_url, "openai-chat", supplied_profile
+                provider_config.base_url, "openai-chat", supplied_profile
             ),
         )
-    if provider == "anthropic":
-        model = _effective_model(args, provider)
-        base_url = (
-            getattr(args, "base_url", None)
-            or os.environ.get("ANTHROPIC_API_BASE")
-            or DEFAULT_ANTHROPIC_BASE_URL
-        )
-        api_key = _first_env(
-            "ANTHROPIC_API_KEY", "RIGHT_CODES_API_KEY", "OPENAI_API_KEY"
-        )
-        return AnthropicCompatibleModelClient(
+        return _annotate_model_client(client, spec)
+    if spec.client_kind == "anthropic":
+        client = AnthropicCompatibleModelClient(
             model=model,
-            base_url=base_url,
-            api_key=api_key,
+            base_url=provider_config.base_url,
+            api_key=provider_config.api_key,
             temperature=args.temperature,
-            timeout=getattr(
-                args, "openai_timeout", getattr(args, "ollama_timeout", 300)
-            ),
+            timeout=provider_config.timeout,
             connection_profile=resolve_effective_connection_profile(
-                base_url, "anthropic-messages", supplied_profile
+                provider_config.base_url, "anthropic-messages", supplied_profile
             ),
         )
-
-    model = _effective_model(args, provider)
-    host = (
-        getattr(args, "host", None)
-        or os.environ.get("OLLAMA_HOST")
-        or DEFAULT_OLLAMA_HOST
-    )
-    return OllamaModelClient(
+        return _annotate_model_client(client, spec)
+    client = OllamaModelClient(
         model=model,
-        host=host,
+        host=provider_config.host,
         temperature=args.temperature,
         top_p=args.top_p,
-        timeout=args.ollama_timeout,
+        timeout=provider_config.timeout,
     )
+    return _annotate_model_client(client, spec)
 
 
 def build_welcome(agent, model, host):
@@ -496,29 +456,17 @@ def build_agent(args):
     load_env_file(workspace.repo_root)
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.codecub/sessions")
+    provider_config = ProviderConfig.from_args(args)
     model = _build_model_client(args)
-    fallback_name = os.environ.get("CODECUB_FALLBACK_MODEL", "").strip()
-    fallback = None
-    if fallback_name:
-        original = args.model
-        args.model = fallback_name
-        try:
-            fallback = _build_model_client(args)
-        finally:
-            args.model = original
+    fallbacks = [
+        _build_model_client(args, model_override=fallback_name)
+        for fallback_name in provider_config.fallback_models
+        if fallback_name and fallback_name != provider_config.model
+    ]
     gateway = ModelGateway(
         model,
-        GatewayPolicy(
-            max_concurrency=int(os.environ.get("CODECUB_MODEL_MAX_CONCURRENCY", "2")),
-            min_interval_seconds=float(
-                os.environ.get("CODECUB_MODEL_MIN_INTERVAL_SECONDS", "0")
-            ),
-            max_retries=int(os.environ.get("CODECUB_MODEL_MAX_RETRIES", "2")),
-            retry_base_seconds=float(
-                os.environ.get("CODECUB_MODEL_RETRY_BASE_SECONDS", "1")
-            ),
-        ),
-        fallback=fallback,
+        provider_config.gateway_policy,
+        fallbacks=fallbacks,
     )
     execution_mode = (
         EXECUTION_MODE_MULTI_AGENT
@@ -529,7 +477,7 @@ def build_agent(args):
     if session_id == "latest":
         session_id = store.latest()
     if session_id:
-        return Pico.from_session(
+        agent = Pico.from_session(
             model_client=model,
             model_gateway=gateway,
             workspace=workspace,
@@ -541,17 +489,87 @@ def build_agent(args):
             execution_mode=execution_mode,
             secret_env_names=configured_secret_names,
         )
-    return Pico(
-        model_client=model,
-        model_gateway=gateway,
-        workspace=workspace,
-        session_store=store,
-        approval_policy=args.approval,
-        max_steps=args.max_steps,
-        max_new_tokens=args.max_new_tokens,
-        execution_mode=execution_mode,
-        secret_env_names=configured_secret_names,
+    else:
+        agent = Pico(
+            model_client=model,
+            model_gateway=gateway,
+            workspace=workspace,
+            session_store=store,
+            approval_policy=args.approval,
+            max_steps=args.max_steps,
+            max_new_tokens=args.max_new_tokens,
+            execution_mode=execution_mode,
+            secret_env_names=configured_secret_names,
+        )
+    agent.extension_registry = ExtensionRegistry().discover(
+        (
+            Path(workspace.repo_root) / ".codecub" / "plugins",
+            Path(workspace.repo_root) / ".codecub" / "skills",
+        )
     )
+    return agent
+
+
+def run_doctor(args):
+    """Run offline diagnostics; `--probe` is the only path that calls a model."""
+
+    cwd = decode_cwd_arg(args)
+    load_env_file(cwd)
+    config = ProviderConfig.from_args(args)
+    if not getattr(args, "probe", False):
+        result = check_provider(config)
+    else:
+        client = _build_model_client(args)
+        result = check_provider(
+            config,
+            probe=True,
+            probe_fn=lambda: client.complete("Reply with OK.", 1),
+            resolve_host=True,
+        )
+    print(json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True))
+    return 0 if result.healthy else 1
+
+
+def run_gateway(args):
+    """Start the transport-only Gateway around the existing Runtime path."""
+    from .gateway import GatewayServer
+    from .gateway_runtime import EmbeddedRuntimeGateway
+
+    token = str(
+        getattr(args, "gateway_token", None)
+        or os.environ.get("CODECUB_GATEWAY_TOKEN", "")
+    ).strip()
+    allow_unauthenticated = bool(getattr(args, "gateway_allow_unauthenticated", False))
+
+    def agent_factory(*, session_id=None, resume=False):
+        values = vars(args).copy()
+        values["app_mode"] = False
+        values["json_events"] = False
+        values["gateway"] = False
+        values["resume"] = session_id if resume else None
+        return build_agent(argparse.Namespace(**values))
+
+    runtime = EmbeddedRuntimeGateway(agent_factory)
+    server = GatewayServer(
+        runtime,
+        host=str(getattr(args, "gateway_host", None) or "127.0.0.1"),
+        port=int(getattr(args, "gateway_port", None) or 0),
+        auth_token=token or None,
+        allow_unauthenticated=allow_unauthenticated,
+    )
+
+    async def serve():
+        try:
+            host, port = await server.start()
+            print(json.dumps({"gateway": "ready", "host": host, "port": port}, sort_keys=True), flush=True)
+            await server.serve_forever()
+        finally:
+            await server.close()
+
+    try:
+        return asyncio.run(serve())
+    except KeyboardInterrupt:
+        return 0
 
 
 def build_arg_parser():
@@ -655,11 +673,53 @@ def build_arg_parser():
         action="store_true",
         help="Alias for --app-mode.",
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Validate provider configuration without making a network request.",
+    )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="With --doctor, make one explicit model request to verify the endpoint.",
+    )
+    parser.add_argument(
+        "--gateway",
+        action="store_true",
+        help="Run the bounded JSON-RPC Gateway around the existing Runtime.",
+    )
+    parser.add_argument(
+        "--gateway-host",
+        default="127.0.0.1",
+        help="Gateway bind host; loopback is the safe default.",
+    )
+    parser.add_argument(
+        "--gateway-port",
+        type=int,
+        default=0,
+        help="Gateway TCP port; 0 selects an ephemeral port.",
+    )
+    parser.add_argument(
+        "--gateway-token",
+        default=None,
+        help="Shared Gateway authentication token; CODECUB_GATEWAY_TOKEN is also accepted.",
+    )
+    parser.add_argument(
+        "--gateway-allow-unauthenticated",
+        action="store_true",
+        help="Explicitly disable the Gateway auth gate (for isolated local tests only).",
+    )
     return parser
 
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+    if getattr(args, "probe", False) and not getattr(args, "doctor", False):
+        raise SystemExit("--probe requires --doctor")
+    if getattr(args, "doctor", False):
+        return run_doctor(args)
+    if getattr(args, "gateway", False):
+        return run_gateway(args)
     if getattr(args, "app_mode", False):
         return run_app_mode(args)
 
