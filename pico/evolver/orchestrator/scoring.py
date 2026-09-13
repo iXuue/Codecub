@@ -26,6 +26,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 
 from pico.evolver.analysis.stability_bucket import TaskStability
+from pico.evolver.evaluation.registry import EvaluationRegistry, EvaluationSplit
 from pico.evolver.scheduler.anchor_selection import AnchorSelection
 
 if TYPE_CHECKING:
@@ -369,6 +370,40 @@ class EvalBackend:
     anchor: Callable[..., AnchorSelection]
     trajectories: Optional[TrajectorySource] = None
     precheck: Optional[PrecheckFn] = None
+    regression_task_ids: list[str] = field(default_factory=list)
+    registry: EvaluationRegistry | None = None
+
+    def __post_init__(self) -> None:
+        registry = self.registry or EvaluationRegistry.from_train_test(
+            self.train_task_ids,
+            self.test_task_ids,
+            regression_task_ids=self.regression_task_ids,
+        )
+        development = tuple(registry.task_ids(EvaluationSplit.DEVELOPMENT, consumer="optimizer"))
+        holdout = tuple(registry.task_ids(EvaluationSplit.HOLDOUT, consumer="sealed_evaluator"))
+        regression = tuple(registry.task_ids(EvaluationSplit.REGRESSION, consumer="regression_evaluator"))
+        if tuple(self.train_task_ids) != development:
+            raise ValueError("EvalBackend.train_task_ids must match the registry development split")
+        if tuple(self.test_task_ids) != holdout:
+            raise ValueError("EvalBackend.test_task_ids must match the registry holdout split")
+        if tuple(self.regression_task_ids) != regression:
+            raise ValueError("EvalBackend.regression_task_ids must match the registry regression split")
+        object.__setattr__(self, "registry", registry)
+
+    def task_ids_for(
+        self,
+        split: EvaluationSplit | str,
+        *,
+        consumer: str,
+    ) -> list[str]:
+        """Return IDs only after registry access policy has authorized the caller."""
+
+        return self.registry.task_ids(split, consumer=consumer)
+
+    def optimizer_task_ids(self) -> list[str]:
+        """The only task IDs allowed in diagnosis/proposal-generation context."""
+
+        return self.registry.task_ids(EvaluationSplit.DEVELOPMENT, consumer="optimizer")
 
 
 __all__ = [

@@ -79,12 +79,11 @@ LABEL_POLICIES: dict[CandidateLabel, LabelPolicy] = {
     CandidateLabel.skill: LabelPolicy(
         label=CandidateLabel.skill,
         patch_where=frozenset({PatchWhere.skill}),
-        mutable_paths=(),
-        fixture=None,
-        evaluator=None,
+        mutable_paths=("pico/memory_engine/skills/weather/SKILL.md",),
+        fixture="appworld_skill_v1",
+        evaluator="appworld_skill_focused_fisher_v1",
         activation_policy=ActivationPolicy.gated,
-        supported=False,
-        unsupported_reason="No deterministic Skill routing fixture and evaluator are wired",
+        supported=True,
     ),
     CandidateLabel.prompt: LabelPolicy(
         label=CandidateLabel.prompt,
@@ -94,12 +93,11 @@ LABEL_POLICIES: dict[CandidateLabel, LabelPolicy] = {
                 PatchWhere.task_wrapper_prompt,
             }
         ),
-        mutable_paths=(),
-        fixture=None,
-        evaluator=None,
+        mutable_paths=("benchmarks/appworld/agent_cli.py",),
+        fixture="appworld_prompt_v1",
+        evaluator="appworld_prompt_focused_fisher_v1",
         activation_policy=ActivationPolicy.gated,
-        supported=False,
-        unsupported_reason="No deterministic prompt rendering fixture and evaluator are wired",
+        supported=True,
     ),
     CandidateLabel.policy: LabelPolicy(
         label=CandidateLabel.policy,
@@ -110,12 +108,11 @@ LABEL_POLICIES: dict[CandidateLabel, LabelPolicy] = {
                 PatchWhere.hook_modify,
             }
         ),
-        mutable_paths=(),
-        fixture=None,
-        evaluator=None,
+        mutable_paths=("benchmarks/appworld/tool.py",),
+        fixture="appworld_tool_policy_v1",
+        evaluator="appworld_tool_policy_focused_fisher_v1",
         activation_policy=ActivationPolicy.human_review,
-        supported=False,
-        unsupported_reason="No deterministic policy evaluator is wired to the retained Runtime",
+        supported=True,
     ),
     CandidateLabel.runtime: LabelPolicy(
         label=CandidateLabel.runtime,
@@ -442,7 +439,9 @@ def evaluate_manifest_gate(
         reasons.append(f"candidate targets unsafe or immutable paths: {unsafe}")
     for target in patch_targets:
         if policy.mutable_paths and not any(_path_matches(target, pattern) for pattern in policy.mutable_paths):
-            reasons.append(f"target is outside the {manifest.label.value} mutable allowlist: {target}")
+            reasons.append(
+                f"target is outside the {manifest.label.value} mutable allowlist and has no evaluator binding: {target}"
+            )
         if policy.config_only and not _is_config_path(target):
             reasons.append(f"{manifest.label.value} candidates may modify configuration files only: {target}")
         if manifest.label in {CandidateLabel.model_profile, CandidateLabel.route} and _looks_like_weights(target):

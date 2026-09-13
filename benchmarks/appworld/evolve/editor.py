@@ -14,12 +14,14 @@ from __future__ import annotations
 import ast
 import json
 import re
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Callable, Optional
 
 from benchmarks.appworld.evolve.eval import Candidate, materialize_candidate_patch
 from benchmarks.appworld.evolve.sandbox import Sandbox
 from pico.evolver.orchestrator.config import Budget
+from pico.evolver.proposal import EvolutionProposal, EvolutionTargetLayer
 from pico.evolver.tree.node import HarnessNode
 
 # WHY 可修复性权重：分类本身将 W6/W7 标为能力上限或噪音，但它们通常又是最常见
@@ -31,15 +33,23 @@ WHY_FIX_WEIGHT = {
     "W1_empty_response_stall": 0.7,
 }
 
-_BASH_SYSTEM = """You improve an agent harness to fix a diagnosed failure mode. You are in a git \
-worktree of the repo (your cwd). The harness that runs the benchmark is \
-benchmarks/appworld/agent_cli.py (it builds the agent prompt APPWORLD_PROMPT and \
-runs one AppWorld task through a minimal AgentLoop). You MAY edit or \
-replace ONLY benchmarks/appworld/agent_cli.py and benchmarks/appworld/tool.py. \
-These two files are the supported Runtime Candidate Label surface. Any other edit \
-fails the pre-commit Manifest Gate. Work ONLY inside your cwd: this worktree holds \
-the exact code version you are patching. Never cd elsewhere or touch other checkouts \
-of this repo — they are different versions and out of bounds.
+EVOLVER_V2_WHITELIST = (
+    "benchmarks/appworld/agent_cli.py",
+    "benchmarks/appworld/tool.py",
+    "pico/memory_engine/skills/weather/SKILL.md",
+)
+
+
+_BASH_SYSTEM = """You improve an agent surface to fix a diagnosed failure mode. You are in a git \
+worktree of the repo (your cwd). The supported Evolver V2 surfaces are exactly: \
+benchmarks/appworld/agent_cli.py for Prompt changes, benchmarks/appworld/tool.py \
+for Tool/Policy changes, and the existing \
+pico/memory_engine/skills/weather/SKILL.md for Skill changes. You MAY edit or \
+replace only those files. Any other edit fails the pre-commit Manifest Gate. \
+Do not create a new Skill from this editor; a separate Proposal must prove a \
+stable repeated pattern before creation is considered. Work ONLY inside your cwd: \
+this worktree holds the exact code version you are patching. Never cd elsewhere or \
+touch other checkouts of this repo — they are different versions and out of bounds.
 
 Work in a loop, ONE JSON object per message, no prose, no code fences:
   inspect a real run:          {"action":"read_trajectory","task_id":"<id from the lists>"}
@@ -365,6 +375,57 @@ def _parse_trigger_spec(summary: str) -> Optional[dict]:
     return {"kind": "trajectory_regex", "pattern": pattern}
 
 
+def _proposal_for_paths(
+    paths: list[str],
+    *,
+    why: str,
+    summary: str,
+    focused_task_ids: list[str],
+    mined_proposals: Iterable[Mapping[str, object]] = (),
+) -> EvolutionProposal | None:
+    """Attach a Proposal only when one registered V2 layer owns all paths."""
+
+    normalized = tuple(sorted(set(path.replace("\\", "/") for path in paths)))
+    targets = {
+        ("benchmarks/appworld/agent_cli.py",): (EvolutionTargetLayer.PROMPT, "appworld.prompt"),
+        ("benchmarks/appworld/tool.py",): (EvolutionTargetLayer.TOOL_POLICY, "appworld.tool_policy"),
+        ("pico/memory_engine/skills/weather/SKILL.md",): (EvolutionTargetLayer.SKILL, "builtin.weather"),
+    }
+    target = targets.get(normalized)
+    if target is None:
+        return None
+    layer, target_id = target
+    for raw in mined_proposals:
+        try:
+            if str(raw.get("target_layer", "")).upper() != layer.value:
+                continue
+            if str(raw.get("target_id", "")) != target_id:
+                continue
+            return EvolutionProposal(
+                target_layer=raw["target_layer"],
+                action=raw["action"],
+                target_id=raw["target_id"],
+                root_cause=raw["root_cause"],
+                evidence=tuple(raw["evidence"]),
+                reason=raw["reason"],
+                repeated_pattern_count=int(raw.get("repeated_pattern_count", 0)),
+                metadata=raw.get("metadata") or {},
+            )
+        except (KeyError, TypeError, ValueError):
+            # The proposal is advisory context; the path-derived proposal below
+            # remains the fail-closed fallback for legacy driver output.
+            continue
+    return EvolutionProposal(
+        target_layer=layer,
+        action="MODIFY_EXISTING",
+        target_id=target_id,
+        root_cause=why,
+        evidence=tuple({"task_id": task_id} for task_id in focused_task_ids)
+        or ({"summary": summary[:240]},),
+        reason=summary or f"modify existing {layer.value} target for {why}",
+    )
+
+
 def bash_edit_candidate(
     call_fn: Callable[[list], str],
     sandbox: Sandbox,
@@ -570,6 +631,12 @@ def make_bash_editor_design_fn(
         rf = render_failed_of(parent) if render_failed_of else render_failed
         p_ids = passing_ids_of(parent) if passing_ids_of else []
         arch_text = archive_summary_of() if archive_summary_of else ""
+        v2_context = failure_map.get("_evolver_v2") if isinstance(failure_map, dict) else None
+        mined_proposals = (
+            v2_context.get("proposals", [])
+            if isinstance(v2_context, dict) and isinstance(v2_context.get("proposals", []), list)
+            else []
+        )
         formula = rerank_whys(failure_map, budget.max_why_per_round, history)
         why_reasons: dict[str, str] = {}
         if why_selection == "driver":
@@ -594,10 +661,11 @@ def make_bash_editor_design_fn(
             focused = why_all_tids(failure_map, why)
             for attempt in range(budget.candidates_per_why):
                 tag = f"r{round_index}-{why.split('_')[0]}-{attempt}"
-                sb = (
-                    Sandbox(repo_root, worktree_root / tag, base_sha, whitelist_prefixes=whitelist_prefixes)
-                    if whitelist_prefixes is not None
-                    else Sandbox(repo_root, worktree_root / tag, base_sha)
+                sb = Sandbox(
+                    repo_root,
+                    worktree_root / tag,
+                    base_sha,
+                    whitelist_prefixes=whitelist_prefixes or EVOLVER_V2_WHITELIST,
                 )
                 before_files: dict[str, bytes | None] = {}
                 try:
@@ -632,6 +700,13 @@ def make_bash_editor_design_fn(
                         deletions=deleted,
                         has_beacon=_has_beacon(changed),
                         activation_spec=_parse_trigger_spec(summary),
+                        proposal=_proposal_for_paths(
+                            list(set(changed) | set(deleted)),
+                            why=why,
+                            summary=summary,
+                            focused_task_ids=focused,
+                            mined_proposals=mined_proposals,
+                        ),
                     )
                     materialize_candidate_patch(candidate, before_files)
                     cands.append(candidate)

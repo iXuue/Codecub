@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run the opt-in Evolver Beta on a registered benchmark. Candidates require manual activation by default."
         ),
+        epilog="Legacy command set remains {run,check,status,finalize}; finalize-candidate is candidate-scoped.",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -48,6 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
     common(fin)
     fin.add_argument("--yes", action="store_true", help="confirm ending the run")
 
+    candidate_fin = sub.add_parser("finalize-candidate", help="approve or reject one PROMOTABLE candidate")
+    common(candidate_fin)
+    candidate_fin.add_argument("--candidate", required=True, help="candidate id from the promotion ledger")
+    candidate_fin.add_argument("--actor", required=True, help="human reviewer identity")
+    decision = candidate_fin.add_mutually_exclusive_group(required=True)
+    decision.add_argument("--approve", action="store_true", help="activate this candidate")
+    decision.add_argument("--reject", action="store_true", help="reject this candidate")
+
     return p
 
 
@@ -68,6 +77,14 @@ def main(argv: list[str] | None = None) -> int:
         return runner.cmd_status(args.config, smoke=args.smoke)
     if args.command == "finalize":
         return runner.cmd_finalize(args.config, smoke=args.smoke, yes=args.yes)
+    if args.command == "finalize-candidate":
+        return runner.cmd_finalize_candidate(
+            args.config,
+            candidate_id=args.candidate,
+            actor=args.actor,
+            approve=args.approve,
+            smoke=args.smoke,
+        )
     return 2
 
 

@@ -72,6 +72,7 @@ def build_appworld_orchestrator(
     worktree_root: str | Path,
     root_node_id: str = "C0",
     test_task_ids: list[str] = (),
+    regression_task_ids: list[str] = (),
     budget: Optional[Budget] = None,
     min_confirm_lift: float = 0.0,
     exp_of: Optional[Callable[[HarnessNode], str]] = None,
@@ -152,6 +153,7 @@ def build_appworld_orchestrator(
         vanilla_out_dir=vanilla_out_dir,
         train_task_ids=train_task_ids,
         test_task_ids=list(test_task_ids),
+        regression_task_ids=list(regression_task_ids),
         eval_fn=make_appworld_eval_fn(aw_cfg, repo_root),
         vanilla_node=HarnessNode(
             node_id=root_node_id,
@@ -202,7 +204,13 @@ def build_appworld_orchestrator(
                 None,
             )
         return (
-            make_appworld_diagnose_fn(driver_call_fn, trajectory_source, taxonomy=taxonomy),
+            make_appworld_diagnose_fn(
+                driver_call_fn,
+                trajectory_source,
+                taxonomy=taxonomy,
+                evaluation_registry=backend.registry,
+                max_proposals=config.budget.max_why_per_round * config.budget.candidates_per_why,
+            ),
             seed,
         )
 

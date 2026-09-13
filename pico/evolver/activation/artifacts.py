@@ -467,7 +467,9 @@ def _validate_manifest(
             raise ValueError(f"accepted evidence is forbidden for unsupported label {label!r}")
         for target in targets:
             if not any(_path_matches(target, pattern) for pattern in policy.mutable_paths):
-                raise ValueError(f"accepted target is outside the {label} mutable allowlist: {target}")
+                raise ValueError(
+                    f"accepted evidence is forbidden for target outside the {label} mutable allowlist: {target}"
+                )
     return manifest
 
 

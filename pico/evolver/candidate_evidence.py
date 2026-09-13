@@ -67,6 +67,9 @@ _TASK_EVAL_KEYS = frozenset(
         "failure",
     }
 )
+_SUPPORTED_V2_LABELS = frozenset(
+    {CandidateLabel.runtime, CandidateLabel.prompt, CandidateLabel.policy, CandidateLabel.skill}
+)
 
 
 @dataclass(frozen=True)
@@ -205,8 +208,10 @@ def _validated_runtime_measurements(
 ) -> tuple[dict[str, TaskEval], dict[str, TaskEval], GateResult, float]:
     if type(evidence.schema_version) is not int or evidence.schema_version != 1:
         raise CandidateEvidenceError("accepted runtime evidence has an unsupported schema")
-    if manifest.label is not CandidateLabel.runtime:
-        raise CandidateEvidenceError("accepted runtime evidence requires the Runtime Candidate Label")
+    if manifest.label not in _SUPPORTED_V2_LABELS:
+        raise CandidateEvidenceError(
+            "accepted evidence requires a supported Prompt, Tool/Policy, Skill or retained Runtime label"
+        )
     if not isinstance(evidence.evaluator, str) or evidence.evaluator != manifest.evaluator:
         raise CandidateEvidenceError("accepted runtime evidence evaluator does not match the manifest")
     task_ids = evidence.task_ids
@@ -291,17 +296,17 @@ def _runtime_fixture(
     before: Snapshot,
     after: Snapshot,
 ) -> None:
-    policy = LABEL_POLICIES[CandidateLabel.runtime]
+    policy = LABEL_POLICIES[manifest.label]
     targets = tuple(manifest.target_files)
     if not targets:
-        raise CandidateEvidenceError("runtime fixture requires at least one target")
+        raise CandidateEvidenceError(f"{manifest.label.value} fixture requires at least one target")
     if set(before) != set(targets) or set(after) != set(targets):
-        raise CandidateEvidenceError("runtime fixture snapshots do not cover manifest targets")
+        raise CandidateEvidenceError(f"{manifest.label.value} fixture snapshots do not cover manifest targets")
     outside = [path for path in targets if path not in policy.mutable_paths]
     if outside:
-        raise CandidateEvidenceError(f"runtime fixture targets are outside its mutable surface: {outside}")
+        raise CandidateEvidenceError(f"{manifest.label.value} fixture targets are outside its mutable surface: {outside}")
     if all(before[path] == after[path] for path in targets):
-        raise CandidateEvidenceError("runtime fixture contains no content change")
+        raise CandidateEvidenceError(f"{manifest.label.value} fixture contains no content change")
     before_sha256 = tuple(
         hashlib.sha256(before[path]).hexdigest() if before[path] is not None else None for path in targets
     )
@@ -309,7 +314,7 @@ def _runtime_fixture(
         hashlib.sha256(after[path]).hexdigest() if after[path] is not None else None for path in targets
     )
     if before_sha256 != manifest.before_sha256 or after_sha256 != manifest.after_sha256:
-        raise CandidateEvidenceError("runtime fixture snapshots do not match manifest content digests")
+        raise CandidateEvidenceError(f"{manifest.label.value} fixture snapshots do not match manifest content digests")
 
 
 def _validity_is_measured(validity: "MeasurementValidity") -> bool:
@@ -407,11 +412,35 @@ FIXTURE_BINDINGS: dict[str, FixtureBinding] = {
         name="appworld_runtime_v1",
         validate=_runtime_fixture,
     ),
+    "appworld_prompt_v1": FixtureBinding(
+        name="appworld_prompt_v1",
+        validate=_runtime_fixture,
+    ),
+    "appworld_tool_policy_v1": FixtureBinding(
+        name="appworld_tool_policy_v1",
+        validate=_runtime_fixture,
+    ),
+    "appworld_skill_v1": FixtureBinding(
+        name="appworld_skill_v1",
+        validate=_runtime_fixture,
+    ),
 }
 
 EVALUATOR_BINDINGS: dict[str, EvaluatorBinding] = {
     "appworld_focused_fisher_v1": EvaluatorBinding(
         name="appworld_focused_fisher_v1",
+        evaluate=_runtime_outcome,
+    ),
+    "appworld_prompt_focused_fisher_v1": EvaluatorBinding(
+        name="appworld_prompt_focused_fisher_v1",
+        evaluate=_runtime_outcome,
+    ),
+    "appworld_tool_policy_focused_fisher_v1": EvaluatorBinding(
+        name="appworld_tool_policy_focused_fisher_v1",
+        evaluate=_runtime_outcome,
+    ),
+    "appworld_skill_focused_fisher_v1": EvaluatorBinding(
+        name="appworld_skill_focused_fisher_v1",
         evaluate=_runtime_outcome,
     ),
 }

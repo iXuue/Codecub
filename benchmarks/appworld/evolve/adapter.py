@@ -46,6 +46,7 @@ from pico.evolver.analysis.stability_bucket import (
     TaskStability,
     _bucket_for,
 )
+from pico.evolver.evaluation.registry import EvaluationRegistry
 from pico.evolver.orchestrator.scoring import (
     EvalBackend,
     TaskEval,
@@ -330,6 +331,8 @@ def make_appworld_backend(
     vanilla_out_dir: str | Path,
     train_task_ids: list[str],
     test_task_ids: list[str] = (),
+    regression_task_ids: list[str] = (),
+    registry: EvaluationRegistry | None = None,
     activation_of: Optional[ActivationOf] = None,
     cull_sigma_mult: float = 1.5,
     trajectory_source=None,
@@ -382,11 +385,13 @@ def make_appworld_backend(
     return EvalBackend(
         train_task_ids=list(train_task_ids),
         test_task_ids=list(test_task_ids),
+        regression_task_ids=list(regression_task_ids),
         eval=wrapped_eval,
         cold_start=cold_start,
         anchor=anchor,
         trajectories=trajectory_source,
         precheck=precheck,
+        registry=registry,
     )
 
 

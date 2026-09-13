@@ -23,6 +23,7 @@ from pico.evolver.candidate_manifest import (
     manifest_for_patch,
 )
 from pico.evolver.judge.schema import PatchWhere, PatchWhy
+from pico.evolver.proposal import EvolutionProposal, EvolutionProposalValidator
 from pico.evolver.tree import git_ops
 from pico.evolver.tree.git_ops import GitOpError
 from pico.evolver.tree.node import AppliedPatch, PatchComponent
@@ -51,6 +52,7 @@ class Candidate:
     applied_patch: AppliedPatch | None = field(default=None, repr=False)
     manifest: CandidateManifest | None = None
     candidate_id: str = ""
+    proposal: EvolutionProposal | None = field(default=None, repr=False)
 
 
 def _patch_where(label: CandidateLabel, paths: list[str]) -> PatchWhere:
@@ -108,6 +110,16 @@ def materialize_candidate_patch(
     if not paths:
         raise ValueError("candidate has no target files")
     declared_label = getattr(candidate, "label", None)
+    proposal = getattr(candidate, "proposal", None)
+    if proposal is not None:
+        validation = EvolutionProposalValidator().validate(proposal)
+        if not validation.accepted:
+            raise ValueError(f"{validation.code}: {validation.reason}")
+        if tuple(sorted(paths)) != tuple(sorted(validation.target_paths)):
+            raise ValueError(
+                f"proposal target paths {validation.target_paths} do not match candidate paths {tuple(sorted(paths))}"
+            )
+        declared_label = validation.label
     label = CandidateLabel(declared_label) if declared_label is not None else _candidate_label(paths)
     where = _patch_where(label, paths)
     try:
@@ -154,6 +166,18 @@ def prepare_candidate_manifest(
         )
     paths = sorted(files | deletions)
     before_files: dict[str, bytes | None] = {}
+    proposal = getattr(candidate, "proposal", None)
+    if proposal is not None:
+        validation = EvolutionProposalValidator(repo_root=repo_root, treeish=parent_sha).validate(proposal)
+        if not validation.accepted:
+            candidate.candidate_id = candidate_id
+            raise ManifestGateError(f"G5 proposal gate failed: {validation.code}: {validation.reason}")
+        if tuple(paths) != tuple(sorted(validation.target_paths)):
+            candidate.candidate_id = candidate_id
+            raise ManifestGateError(
+                f"G5 proposal gate failed: proposal target paths {validation.target_paths} do not match {tuple(paths)}"
+            )
+        candidate.label = CandidateLabel(validation.label)
     for path in paths:
         try:
             before_files[path] = git_ops.read_file_at(repo_root, parent_sha, path)
@@ -195,6 +219,34 @@ def deletions_of(cand: Candidate) -> list[str]:
     return cand.deletions
 
 
+def candidate_from_proposal(
+    proposal: EvolutionProposal,
+    *,
+    files: dict[str, bytes],
+    why: str,
+    summary: str,
+    deletions: list[str] | None = None,
+) -> Candidate:
+    """Adapt a validated Proposal to the existing AppWorld Candidate shape."""
+
+    validation = EvolutionProposalValidator().validate(proposal)
+    if not validation.accepted:
+        raise ManifestGateError(f"proposal gate failed: {validation.code}: {validation.reason}")
+    paths = tuple(sorted(set(files) | set(deletions or [])))
+    if paths != tuple(sorted(validation.target_paths)):
+        raise ManifestGateError(
+            f"proposal target paths {validation.target_paths} do not match candidate paths {paths}"
+        )
+    return Candidate(
+        files=files,
+        why=why,
+        summary=summary,
+        deletions=list(deletions or []),
+        label=CandidateLabel(validation.label),
+        proposal=proposal,
+    )
+
+
 def make_appworld_eval_fn(aw: "aw_adapter.AppWorldConfig", repo_root: str | Path):
     """Eval a node by checking its commit out into a worktree and running
     ``batch.py`` there (``cwd=worktree``). No activation env, no live-repo writes.
@@ -215,6 +267,7 @@ def make_appworld_eval_fn(aw: "aw_adapter.AppWorldConfig", repo_root: str | Path
 
 __all__ = [
     "Candidate",
+    "candidate_from_proposal",
     "deletions_of",
     "files_of",
     "make_appworld_eval_fn",

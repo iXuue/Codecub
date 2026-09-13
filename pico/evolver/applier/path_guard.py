@@ -81,7 +81,11 @@ IMMUTABLE_PATTERNS: tuple[str, ...] = (
 
 
 # 不可变子树中仍应保持可变的路径例外。
-MUTABLE_OVERRIDES: tuple[str, ...] = ()
+#
+# ``pico/memory_engine`` 的 Python 实现仍是 Evolver immutable；只有其中
+# 的 Markdown Skill 内容属于本期 Skill candidate surface。这个例外不授权
+# 修改 Registry、Forge、Backend 或其他 Memory 2.0 code。
+MUTABLE_OVERRIDES: tuple[str, ...] = ("pico/memory_engine/skills/",)
 
 
 # ---------------------------------------------------------------------------

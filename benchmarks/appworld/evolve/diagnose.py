@@ -27,6 +27,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
+from pico.evolver.analysis.failure_miner import FailureMiner
+from pico.evolver.evaluation.registry import EvaluationRegistry
 from pico.evolver.orchestrator.nodes.taxonomy import (
     TaxonomySpec,
     classify_failures,
@@ -37,6 +39,7 @@ from pico.evolver.orchestrator.nodes.taxonomy import (
 from pico.evolver.orchestrator.nodes.taxonomy import (
     induce_taxonomy as _generic_induce_taxonomy,
 )
+from pico.evolver.proposal import ProposalGenerator
 from pico.evolver.tree.node import HarnessNode
 
 # 手工归纳的七类 AppWorld WHY（保持原文）及一个逃生类别。
@@ -161,12 +164,44 @@ def make_appworld_diagnose_fn(
     *,
     taxonomy: TaxonomySpec = DEFAULT_APPWORLD_TAXONOMY,
     max_workers: int = 8,
+    evaluation_registry: EvaluationRegistry | None = None,
+    failure_miner: FailureMiner | None = None,
+    proposal_generator: ProposalGenerator | None = None,
+    max_proposals: int | None = None,
 ) -> Callable[[int, HarnessNode], dict]:
-    """Bind the driver + a trajectory source into the loop's ``diagnose_fn``."""
+    """Bind diagnosis plus the V2 trace-mining/proposal boundary.
+
+    The legacy W1-W7 map remains intact for the existing editor.  V2 adds a
+    summary-only ``_evolver_v2`` field containing stable failure signatures and
+    validated proposals; no raw trajectory body is forwarded to proposal
+    generation.
+    """
+
+    miner = failure_miner or FailureMiner(evaluation_registry)
+    generator = proposal_generator or ProposalGenerator(evaluation_registry=evaluation_registry)
+
+    def _appworld_task_id(record) -> str:
+        if isinstance(record, (tuple, list)) and record:
+            return str(record[0])
+        return str(getattr(record, "task_id", record.get("task_id", ""))) if isinstance(record, dict) else str(
+            getattr(record, "task_id", "")
+        )
 
     def diagnose_fn(round_index: int, parent: HarnessNode) -> dict:
         trajs = trajectory_source(round_index, parent)
-        return diagnose_appworld(call_fn, trajs, taxonomy=taxonomy, max_workers=max_workers)
+        failure_map = diagnose_appworld(call_fn, trajs, taxonomy=taxonomy, max_workers=max_workers)
+        report = miner.mine(
+            trajs,
+            split="development",
+            consumer="optimizer",
+            task_id_resolver=_appworld_task_id,
+        )
+        proposals = generator.generate(report, max_proposals=max_proposals)
+        failure_map["_evolver_v2"] = {
+            "failure_report": report.optimization_context(),
+            "proposals": [proposal.to_dict() for proposal in proposals],
+        }
+        return failure_map
 
     return diagnose_fn
 

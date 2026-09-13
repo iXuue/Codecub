@@ -82,7 +82,11 @@ from pico.evolver.orchestrator.scoring import (
     flip_summary,
 )
 from pico.evolver.orchestrator.sealed.runner import assert_no_test_leak
-from pico.evolver.orchestrator.termination import TerminationTracker
+from pico.evolver.orchestrator.termination import (
+    CampaignBudgetExceeded,
+    CampaignBudgetTracker,
+    TerminationTracker,
+)
 from pico.evolver.scheduler.anchor_selection import AnchorSelection
 from pico.evolver.tree.node import AppliedPatch, HarnessNode, NodeStatus
 
@@ -197,7 +201,9 @@ class EvolutionOrchestrator:
         self._diagnose = diagnose_fn
         self._design = design_fn
         self._apply = apply_fn
-        self._eval = backend.eval
+        self._campaign_budget = CampaignBudgetTracker(config.campaign_budget)
+        self._raw_eval = backend.eval
+        self._eval = self._counted_eval
         self._preflight = preflight_fn or (lambda _patch, _parent: True)
         self._verdict = verdict_fn
         self._fired_source = fired_source
@@ -250,6 +256,24 @@ class EvolutionOrchestrator:
     def vanilla_train_mean(self) -> float:
         """The fixed vanilla train anchor (benches read it at unseal time)."""
         return self._vanilla_train_mean
+
+    @property
+    def campaign_usage(self):
+        """Current campaign accounting, suitable for status/reporting."""
+
+        return self._campaign_budget.usage
+
+    @property
+    def backend(self) -> EvalBackend:
+        """The injected scorer, exposed for post-run holdout/regression adapters."""
+
+        return self._backend
+
+    def _counted_eval(self, node, task_ids, k, job_name, *, split="train"):
+        self._campaign_budget.consume(
+            evaluations=max(1, int(k) * len(task_ids)),
+        )
+        return self._raw_eval(node, task_ids, k, job_name, split=split)
 
     def _sample_sentinels(self, n: int) -> list[str]:
         """Deterministic default sentinel set (used when no node id is at hand)."""
@@ -367,7 +391,17 @@ class EvolutionOrchestrator:
 
         while True:
             round_index += 1
-            round_result = self._run_round(round_index, parent_id, parent_score)
+            stopped, _ = self._campaign_budget.check()
+            if stopped:
+                result.stop_reason = "campaign_budget_exhausted"
+                result.final_parent_id = parent_id
+                break
+            try:
+                round_result = self._run_round(round_index, parent_id, parent_score)
+            except CampaignBudgetExceeded:
+                result.stop_reason = "campaign_budget_exhausted"
+                result.final_parent_id = parent_id
+                break
             result.rounds.append(round_result)
             if journal is not None:
                 journal.append(round_result)
@@ -496,6 +530,7 @@ class EvolutionOrchestrator:
             # 原因，然后继续（C）。
             elite_id = getattr(patch, "elite_node_id", None)
             try:
+                self._campaign_budget.consume(candidates=1)
                 node = self._apply(parent_id, patch, round_index)  # ④
             except ManifestGateError as exc:
                 if elite_id and self._archive is not None:
@@ -531,6 +566,10 @@ class EvolutionOrchestrator:
             self._node_registry[node.node_id] = node
             meta = describe_candidate(patch)
             if meta:
+                proposal = getattr(patch, "proposal", None)
+                proposal_to_dict = getattr(proposal, "to_dict", None)
+                if callable(proposal_to_dict):
+                    meta["proposal"] = proposal_to_dict()
                 self._cand_meta[node.node_id] = meta
             ctx = DecisionContext(
                 node=node,

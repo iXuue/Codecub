@@ -13,6 +13,7 @@ trial result file，resume 只补 missing trial；phase 2 round 的 proof 是
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -258,6 +259,7 @@ def _unseal_and_report(
         _say("no sealed test set configured; skipping unseal")
         if not meta.unsealed_at:
             meta.stamp_unsealed(reason=f"{reason} (no sealed test)")
+        _record_post_run_promotion(spec, bundle, orch, records, report=None)
         return True
     _say("unsealing: blind-scoring deliverables on the sealed test set …")
     try:
@@ -275,6 +277,7 @@ def _unseal_and_report(
         meta.stamp_unsealed(reason=reason)
     atomic_write_json(Path(spec.work_dir) / "retention.json", report)
     _say(f"retention report -> {Path(spec.work_dir) / 'retention.json'}")
+    _record_post_run_promotion(spec, bundle, orch, records, report=report)
     for key in (
         "best_round",
         "best_node_id",
@@ -288,6 +291,134 @@ def _unseal_and_report(
         if isinstance(report, dict) and key in report:
             _say(f"  {key}: {report[key]}")
     return True
+
+
+def _record_post_run_promotion(
+    spec: RunSpec,
+    bundle: BenchBundle,
+    orch,
+    records: list[dict],
+    *,
+    report: dict | None,
+) -> None:
+    """Materialize the candidate-level V2 gate after blind holdout is closed.
+
+    The normal evolution loop only sees development measurements.  This hook
+    runs after unseal, adds regression evidence, and writes a PROMOTABLE or
+    REJECTED lineage record.  It never writes ACTIVE; ``finalize-candidate``
+    remains the sole human transition.
+    """
+
+    if not records:
+        return
+    best_node_id = (report or {}).get("best_node_id") if report is not None else None
+    if not best_node_id:
+        best_node_id = next(
+            (rec.get("next_parent_id") for rec in reversed(records) if rec.get("next_parent_train") is not None),
+            None,
+        )
+    if not best_node_id or best_node_id == bundle.root_node_id:
+        _say("promotion ledger: no non-vanilla train-selected candidate")
+        return
+
+    node_path = Path(spec.work_dir) / "nodes" / f"{best_node_id}.json"
+    node_record = load_json_or(node_path, None)
+    if not isinstance(node_record, dict):
+        _say(f"promotion ledger: missing node lineage for {best_node_id}; fail-closed")
+        return
+    candidate_meta = node_record.get("candidate")
+    proposal = candidate_meta.get("proposal") if isinstance(candidate_meta, dict) else None
+    manifest_path = Path(spec.work_dir) / "activation" / str(best_node_id) / "candidate_manifest.json"
+    if not isinstance(proposal, dict) or not manifest_path.is_file():
+        _say(f"promotion ledger: candidate {best_node_id} lacks V2 proposal/manifest; fail-closed")
+        return
+
+    candidate_sha = str(node_record.get("git_commit_sha") or "")
+    parent_id = str(node_record.get("parent_id") or "")
+    parent_sha = str(spec.base_sha) if parent_id == bundle.root_node_id else ""
+    if not parent_sha:
+        parent_record = load_json_or(Path(spec.work_dir) / "nodes" / f"{parent_id}.json", None)
+        if isinstance(parent_record, dict):
+            parent_sha = str(parent_record.get("git_commit_sha") or "")
+    if not parent_id or len(candidate_sha) != 40 or len(parent_sha) != 40:
+        _say(f"promotion ledger: incomplete Git lineage for {best_node_id}; fail-closed")
+        return
+
+    from pico.evolver.evaluation import run_regression
+    from pico.evolver.promotion import GateEvidence, PromotionGate, PromotionLedger
+    from pico.evolver.tree.node import HarnessNode
+
+    def _node(node_id: str, sha: str) -> HarnessNode:
+        return HarnessNode(
+            node_id=node_id,
+            parent_id=None,
+            git_commit_sha=sha,
+            git_branch="post-run-verification",
+            created_at=HarnessNode.utc_now(),
+            created_at_iter=0,
+        )
+
+    holdout_configured = report is not None
+    holdout_passed = (
+        not holdout_configured
+        or (
+            report.get("best_node_id") == best_node_id
+            and report.get("verdict") == "accepted"
+            and report.get("best_test") is not None
+        )
+    )
+    development_passed = bool(
+        node_record.get("status") == "promoted_to_baseline"
+        and (report is None or (report.get("best_train", 0.0) > report.get("vanilla_train", 0.0)))
+    )
+    regression_passed = False
+    regression_reason = "regression evidence unavailable"
+    regression_ids = list(getattr(orch.backend, "regression_task_ids", ()))
+    if regression_ids:
+        try:
+            regression = run_regression(
+                orch.backend.eval,
+                _node(best_node_id, candidate_sha),
+                _node(bundle.root_node_id, parent_sha),
+                registry=orch.backend.registry,
+                k=spec.funnel.k_confirm,
+                job_name=f"{best_node_id}_regression",
+            )
+            regression_passed = regression.passed
+            regression_reason = regression.reason
+        except Exception as exc:  # noqa: BLE001 — regression failure is a rejected gate, not activation
+            regression_reason = f"regression evaluation failed: {exc}"
+
+    evidence = GateEvidence(
+        development_passed=development_passed,
+        holdout_passed=holdout_passed,
+        regression_passed=regression_passed,
+        measurement_valid=bool(report is None or report.get("best_test") is not None or not holdout_configured),
+        holdout_leak=False,
+    )
+    decision = PromotionGate().evaluate(
+        best_node_id,
+        evidence,
+        reason=("all V2 gates passed; human finalize required" if evidence.passed else regression_reason),
+    )
+    ledger = PromotionLedger(Path(spec.work_dir) / "promotion.json")
+    if ledger.get(best_node_id) is not None:
+        _say(f"promotion ledger: {best_node_id} already recorded")
+        return
+    try:
+        manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        ledger.record_gate(
+            parent_id=parent_id,
+            parent_sha=parent_sha,
+            candidate_sha=candidate_sha,
+            proposal=proposal,
+            manifest_digest=manifest_digest,
+            decision=decision,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        _say(f"promotion ledger: failed to persist {best_node_id}; fail-closed ({exc})")
+        return
+    _say(f"promotion ledger: {best_node_id} -> {decision.status.value} ({decision.reason})")
 
 
 def cmd_run(config_path: str, *, smoke: bool = False, force: bool = False) -> int:
@@ -566,4 +697,86 @@ def _cmd_finalize(spec: RunSpec, *, yes: bool) -> int:
     return 0 if ok else 1
 
 
-__all__ = ["cmd_run", "cmd_status", "cmd_check", "cmd_finalize"]
+def cmd_finalize_candidate(
+    config_path: str,
+    *,
+    candidate_id: str,
+    actor: str,
+    approve: bool,
+    smoke: bool = False,
+) -> int:
+    """Finalize exactly one candidate without changing run-level unseal state."""
+
+    spec = _load_spec(config_path, smoke)
+    try:
+        with file_lock(_evolution_lock_path(spec), blocking=False):
+            from pico.evolver.promotion import PromotionLedger
+
+            ledger = PromotionLedger(Path(spec.work_dir) / "promotion.json")
+            record = ledger.get(candidate_id)
+            if record is None:
+                print(f"unknown candidate lineage: {candidate_id!r}", file=sys.stderr)
+                return 2
+            activated_artifact = None
+            if approve:
+                from pico.evolver.activation import (
+                    ActivationState,
+                    set_activation_state,
+                    verify_activation_artifacts,
+                )
+
+                activated_artifact = Path(spec.work_dir) / "activation" / candidate_id
+                if not activated_artifact.is_dir():
+                    raise ValueError("candidate activation artifact is missing; refusing ACTIVE transition")
+                activation = verify_activation_artifacts(activated_artifact)
+                current = ActivationState(activation["state"])
+                if current is ActivationState.pending_human:
+                    set_activation_state(
+                        activated_artifact,
+                        ActivationState.ready,
+                        human_actor=actor,
+                        reason="candidate-level human finalize approval",
+                    )
+                    current = ActivationState.ready
+                if current is ActivationState.ready:
+                    set_activation_state(
+                        activated_artifact,
+                        ActivationState.activated,
+                        human_actor=actor,
+                        reason="candidate-level human finalize approval",
+                    )
+                elif current is not ActivationState.activated:
+                    raise ValueError(f"activation artifact is {current.value}; refusing ACTIVE transition")
+            try:
+                updated = ledger.finalize(candidate_id, actor=actor, approved=approve)
+            except Exception:
+                if activated_artifact is not None:
+                    try:
+                        from pico.evolver.activation import ActivationState, set_activation_state
+
+                        set_activation_state(
+                            activated_artifact,
+                            ActivationState.rolled_back,
+                            human_actor=actor,
+                            reason="promotion ledger finalize failed; compensating rollback",
+                        )
+                    except Exception:
+                        pass
+                raise
+            _say(
+                f"candidate {candidate_id}: {updated.decision.status.value} "
+                f"(actor={updated.human_actor})"
+            )
+            return 0
+    except LockTimeoutError:
+        print(
+            f"another mutating Evolution Run process already owns {spec.work_dir}",
+            file=sys.stderr,
+        )
+        return 2
+    except (KeyError, ValueError) as exc:
+        print(f"candidate finalize refused: {exc}", file=sys.stderr)
+        return 2
+
+
+__all__ = ["cmd_run", "cmd_status", "cmd_check", "cmd_finalize", "cmd_finalize_candidate"]

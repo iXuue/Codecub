@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pico.evolver.orchestrator.termination import CampaignBudget
+
 
 @dataclass(frozen=True)
 class AnchorParams:
@@ -83,6 +85,7 @@ class OrchestratorConfig:
     anchor: AnchorParams = field(default_factory=AnchorParams)
     budget: Budget = field(default_factory=Budget)
     termination: Termination = field(default_factory=Termination)
+    campaign_budget: CampaignBudget = field(default_factory=CampaignBudget)
 
     # 密封测试：由脚本评分并写入驱动器永不读取的目录，因此密封规则由隔离保证，而非依赖驱动器自律。
     sealed_test_split: str = "test"
@@ -117,10 +120,15 @@ class OrchestratorConfig:
     def journal_dir(self) -> Path:
         return self.work_dir / "journal"
 
+    @property
+    def promotion_path(self) -> Path:
+        return self.work_dir / "promotion.json"
+
 
 __all__ = [
     "AnchorParams",
     "Budget",
+    "CampaignBudget",
     "Termination",
     "OrchestratorConfig",
 ]

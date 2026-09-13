@@ -20,7 +20,115 @@ tracker 让 weak driver 也能运行 Loop；stop decision 属于 Harness，不�
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from typing import Callable
+
+
+class CampaignBudgetExceeded(RuntimeError):  # noqa: N818 — public compatibility name
+    """A campaign resource cap was reached; callers must stop fail-closed."""
+
+
+@dataclass(frozen=True)
+class CampaignBudget:
+    """Run-wide hard caps, independent of round patience."""
+
+    max_candidates: int | None = None
+    max_evaluations: int | None = None
+    max_llm_calls: int | None = None
+    max_driver_tokens: int | None = None
+    max_wall_time_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_candidates",
+            "max_evaluations",
+            "max_llm_calls",
+            "max_driver_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 1:
+                raise ValueError(f"{name} must be >= 1 when configured")
+        if self.max_wall_time_seconds is not None and self.max_wall_time_seconds <= 0:
+            raise ValueError("max_wall_time_seconds must be > 0 when configured")
+
+
+@dataclass(frozen=True)
+class CampaignUsage:
+    candidates: int = 0
+    evaluations: int = 0
+    llm_calls: int = 0
+    driver_tokens: int = 0
+    wall_time_seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            "candidates": self.candidates,
+            "evaluations": self.evaluations,
+            "llm_calls": self.llm_calls,
+            "driver_tokens": self.driver_tokens,
+            "wall_time_seconds": self.wall_time_seconds,
+        }
+
+
+class CampaignBudgetTracker:
+    """Atomically account for campaign resources and stop before an overrun."""
+
+    def __init__(self, budget: CampaignBudget, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self.budget = budget
+        self._clock = clock
+        self._started = clock()
+        self.usage = CampaignUsage()
+
+    def consume(
+        self,
+        *,
+        candidates: int = 0,
+        evaluations: int = 0,
+        llm_calls: int = 0,
+        driver_tokens: int = 0,
+    ) -> CampaignUsage:
+        amounts = {
+            "candidates": candidates,
+            "evaluations": evaluations,
+            "llm_calls": llm_calls,
+            "driver_tokens": driver_tokens,
+        }
+        if any(type(value) is not int or value < 0 for value in amounts.values()):
+            raise ValueError("campaign usage increments must be non-negative integers")
+        elapsed = max(0.0, self._clock() - self._started)
+        projected = CampaignUsage(
+            candidates=self.usage.candidates + candidates,
+            evaluations=self.usage.evaluations + evaluations,
+            llm_calls=self.usage.llm_calls + llm_calls,
+            driver_tokens=self.usage.driver_tokens + driver_tokens,
+            wall_time_seconds=elapsed,
+        )
+        reason = self._exceeded_reason(projected)
+        if reason is not None:
+            raise CampaignBudgetExceeded(reason)
+        self.usage = projected
+        return self.usage
+
+    def check(self) -> tuple[bool, str | None]:
+        elapsed = max(0.0, self._clock() - self._started)
+        current = CampaignUsage(**{**self.usage.to_dict(), "wall_time_seconds": elapsed})
+        reason = self._exceeded_reason(current)
+        return reason is not None, reason
+
+    def _exceeded_reason(self, usage: CampaignUsage) -> str | None:
+        caps = (
+            ("max_candidates", usage.candidates),
+            ("max_evaluations", usage.evaluations),
+            ("max_llm_calls", usage.llm_calls),
+            ("max_driver_tokens", usage.driver_tokens),
+            ("max_wall_time_seconds", usage.wall_time_seconds),
+        )
+        for name, value in caps:
+            limit = getattr(self.budget, name)
+            if limit is not None and value >= limit:
+                return f"campaign budget exhausted: {name}={value} limit={limit}"
+        return None
 
 
 @dataclass
@@ -78,4 +186,10 @@ class TerminationTracker:
         return False, None
 
 
-__all__ = ["TerminationTracker"]
+__all__ = [
+    "CampaignBudget",
+    "CampaignBudgetExceeded",
+    "CampaignBudgetTracker",
+    "CampaignUsage",
+    "TerminationTracker",
+]

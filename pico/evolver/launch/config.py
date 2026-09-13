@@ -48,6 +48,7 @@ from pico.evolver.orchestrator.config import (
     OrchestratorConfig,
     Termination,
 )
+from pico.evolver.orchestrator.termination import CampaignBudget
 
 SMOKE_BUILTIN: dict = {
     "funnel": {
@@ -130,7 +131,7 @@ class RunSpec:
 def _build_funnel(repo_root: Path, work_dir: Path, funnel: dict) -> OrchestratorConfig:
     if not isinstance(funnel, dict):
         raise RunSpecError(f"funnel: must be a mapping, got {type(funnel).__name__}")
-    known = {"k_screen", "k_confirm", "anchor", "budget", "termination", "sealed_test_split"}
+    known = {"k_screen", "k_confirm", "anchor", "budget", "termination", "campaign_budget", "sealed_test_split"}
     unknown = set(funnel) - known
     if unknown:
         raise RunSpecError(f"funnel: unknown keys {sorted(unknown)}")
@@ -144,6 +145,7 @@ def _build_funnel(repo_root: Path, work_dir: Path, funnel: dict) -> Orchestrator
             anchor=AnchorParams(**(funnel.get("anchor") or {})),
             budget=Budget(**(funnel.get("budget") or {})),
             termination=Termination(**(funnel.get("termination") or {})),
+            campaign_budget=CampaignBudget(**(funnel.get("campaign_budget") or {})),
             sealed_test_split=funnel.get("sealed_test_split", "test"),
             sealed_output_dir=work_dir / "sealed",
         )

@@ -43,6 +43,8 @@ _KNOWN_KEYS = {
     "train_task_ids",
     "test_task_file",
     "test_task_ids",
+    "regression_task_file",
+    "regression_task_ids",
     "n",
     "conc",
     "base_port",
@@ -204,16 +206,20 @@ def build(ctx: LaunchContext) -> BenchBundle:
     if conc <= 0:
         raise ValueError(f"bench_config.conc must be > 0, got {conc}")
     test_ids = _task_ids(bc, "test", spec.config_dir)
+    regression_ids = _task_ids(bc, "regression", spec.config_dir)
     if spec.smoke:
         train_ids = train_ids[:3]
         test_ids = test_ids[:1]
-    overlap = set(train_ids) & set(test_ids)
+        regression_ids = regression_ids[:1]
+    overlap = (set(train_ids) & set(test_ids)) | (set(train_ids) & set(regression_ids)) | (
+        set(test_ids) & set(regression_ids)
+    )
     if overlap:
-        raise ValueError(f"train/test task sets overlap: {sorted(overlap)[:5]} …")
+        raise ValueError(f"development/holdout/regression task sets overlap: {sorted(overlap)[:5]} …")
 
-    from benchmarks.appworld.evolve.sandbox import WHITELIST_PREFIXES
+    from benchmarks.appworld.evolve.editor import EVOLVER_V2_WHITELIST
 
-    whitelist = tuple(bc.get("whitelist") or WHITELIST_PREFIXES)
+    whitelist = tuple(bc.get("whitelist") or EVOLVER_V2_WHITELIST)
     validate_whitelist(spec.repo_root, spec.base_sha, whitelist)
 
     work = Path(spec.work_dir)
@@ -296,6 +302,7 @@ def build(ctx: LaunchContext) -> BenchBundle:
             vanilla_out_dir=vanilla_out_dir,
             train_task_ids=train_ids,
             test_task_ids=test_ids,
+            regression_task_ids=regression_ids,
             runs_root=runs_root,
             ws_root=ws_root,
             worktree_root=worktree_root,
