@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import time
 from uuid import uuid4
 
 from .instructions import Instruction, InstructionLayer
@@ -77,6 +78,10 @@ class AgentResult:
     changed_files: list
     verification: list
     model_calls: int = 0
+    # Measurement-only fields.  They expose data already collected by the
+    # child runtime without changing orchestration behavior.
+    elapsed_seconds: float = 0.0
+    usage_records: tuple = ()
 
 
 class Orchestrator:
@@ -123,6 +128,7 @@ class Orchestrator:
             raise ValueError("unknown role")
         from .runtime import Pico
 
+        started_at = time.monotonic()
         agent_id = uuid4().hex
         parent_run = getattr(self._state_ref.get("current"), "run_id", "")
         self._event_bus.emit(
@@ -178,14 +184,20 @@ class Orchestrator:
             payload={"role": role, "tool_steps": int(getattr(state, "tool_steps", 0))},
         )
         return AgentResult(
-            agent_id,
-            role,
-            status,
-            answer,
-            int(getattr(state, "tool_steps", 0)),
-            list(getattr(child.working_state, "changed_files", [])),
-            list(getattr(child.working_state, "verification", [])),
-            int(getattr(state, "attempts", 0)),
+            agent_id=agent_id,
+            role=role,
+            status=status,
+            answer=answer,
+            tool_steps=int(getattr(state, "tool_steps", 0)),
+            changed_files=list(getattr(child.working_state, "changed_files", [])),
+            verification=list(getattr(child.working_state, "verification", [])),
+            model_calls=int(getattr(state, "attempts", 0)),
+            elapsed_seconds=max(0.0, time.monotonic() - started_at),
+            usage_records=tuple(
+                dict(record)
+                for record in getattr(child, "current_run_usage", ())
+                if isinstance(record, dict)
+            ),
         )
 
     def dispatch_many(self, requests):
