@@ -863,8 +863,13 @@ class AgentLoop:
                 else ""
             )
             if native_mode and not getattr(raw, "tool_calls", ()):
+                recovery_identity = (
+                    f"assistant-attempt:{task_state.attempts}:"
+                    "recovered-ordinal:0"
+                )
                 recovered_call, rejection_reason = self._context.recover_native_text_tool_call(
-                    getattr(raw, "text", raw)
+                    getattr(raw, "text", raw),
+                    recovery_identity=recovery_identity,
                 )
                 if recovered_call is not None or rejection_reason is not None:
                     self._loop_state.planning["legacy_tool_recovery_attempts"] = (
@@ -895,6 +900,18 @@ class AgentLoop:
                         )
                         metadata = dict(getattr(raw, "raw_metadata", {}) or {})
                         metadata["tool_call_source"] = "legacy_recovered"
+                        legacy_identity = self._run_store.ensure_legacy_operation_identity(
+                            task_state,
+                            task_state.attempts,
+                            0,
+                            recovered_call.name,
+                        )
+                        metadata["legacy_recovery_identity"] = legacy_identity[
+                            "identity"
+                        ]
+                        metadata["legacy_operation_key"] = legacy_identity[
+                            "operation_key"
+                        ]
                         raw = ModelResponse(
                             text="",
                             tool_calls=(recovered_call,),
@@ -1189,6 +1206,16 @@ class AgentLoop:
                         kind, payload = "final", final_text
             else:
                 kind, payload = self._parse_model_response(raw)
+            if (
+                kind == "tool"
+                and isinstance(payload, dict)
+                and payload.get("tool_call_source") == "legacy_recovered"
+            ):
+                payload["legacy_operation_key"] = str(
+                    (getattr(raw, "raw_metadata", {}) or {}).get(
+                        "legacy_operation_key", ""
+                    )
+                )
             self._observer.emit(
                 task_state,
                 "model_parsed",
@@ -1247,9 +1274,9 @@ class AgentLoop:
                 if name == "read_file":
                     read_notice, read_classification = self._context.read_guard_notice(args)
                 operation_key = (
-                    payload.get("tool_call_id", "")
-                    if payload.get("tool_call_source") != "legacy_recovered"
-                    else ""
+                    payload.get("legacy_operation_key", "")
+                    if payload.get("tool_call_source") == "legacy_recovered"
+                    else payload.get("tool_call_id", "")
                 )
                 result = self._tool_executor.execute(
                     name,

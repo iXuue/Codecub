@@ -1157,6 +1157,9 @@ class LegacyContextAdapter:
             "summary": f"{trigger}: {clip(str(user_message), 120)}",
             "runtime_identity": self.current_runtime_identity(),
             "side_effect_operations": dict(task_state.side_effect_operations or {}),
+            "legacy_operation_identities": dict(
+                task_state.legacy_operation_identities or {}
+            ),
         }
         state["items"][checkpoint_id] = checkpoint
         state["current_id"] = checkpoint_id
@@ -1290,7 +1293,7 @@ class LegacyContextAdapter:
             text = text.replace(secret, "<redacted>")
         return text
 
-    def recover_native_text_tool_call(self, content):
+    def recover_native_text_tool_call(self, content, recovery_identity=""):
         text = str(content or "")
         opening_tags = text.count("<tool")
         closing_tags = text.count("</tool>")
@@ -1336,7 +1339,13 @@ class LegacyContextAdapter:
             self._tool_validation.validate(name, args, tool)
         except Exception:
             return None, "invalid_args"
-        return ToolCall(f"legacy-recovered-{uuid.uuid4().hex}", name, args), None
+        call_id = (
+            "legacy-recovered-"
+            + hashlib.sha256(str(recovery_identity).encode("utf-8")).hexdigest()[:32]
+            if recovery_identity
+            else f"legacy-recovered-{uuid.uuid4().hex}"
+        )
+        return ToolCall(call_id, name, args), None
 
 
 class LegacyModelInvoker:

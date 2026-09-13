@@ -40,10 +40,14 @@ class TaskState:
     resume_status: str = ""
     # Run-scoped durable ledger for explicitly identified side effects.
     side_effect_operations: dict = None
+    # Stable identities assigned to legacy/recovered assistant tool calls.
+    legacy_operation_identities: dict = None
 
     def __post_init__(self):
         if self.side_effect_operations is None:
             self.side_effect_operations = {}
+        if self.legacy_operation_identities is None:
+            self.legacy_operation_identities = {}
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -66,6 +70,9 @@ class TaskState:
             checkpoint_id=str(data.get("checkpoint_id", "")),
             resume_status=str(data.get("resume_status", "")),
             side_effect_operations=dict(data.get("side_effect_operations", {}) or {}),
+            legacy_operation_identities=dict(
+                data.get("legacy_operation_identities", {}) or {}
+            ),
         )
 
     def record_attempt(self):
@@ -119,4 +126,7 @@ class TaskState:
             "checkpoint_id": self.checkpoint_id,
             "resume_status": self.resume_status,
             "side_effect_operations": dict(self.side_effect_operations or {}),
+            "legacy_operation_identities": dict(
+                self.legacy_operation_identities or {}
+            ),
         }

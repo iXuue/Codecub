@@ -635,12 +635,19 @@ class _RuntimeTurnLifecycle:
         )
         state_path = self._run_store.task_state_path(task_run_id)
         if state_path.exists():
+            persisted = self._run_store.load_task_state(task_run_id)
             task_state.side_effect_operations = dict(
-                self._run_store.load_task_state(task_run_id).get("side_effect_operations", {}) or {}
+                persisted.get("side_effect_operations", {}) or {}
+            )
+            task_state.legacy_operation_identities = dict(
+                persisted.get("legacy_operation_identities", {}) or {}
             )
         elif pico.current_checkpoint():
             task_state.side_effect_operations = dict(
                 pico.current_checkpoint().get("side_effect_operations", {}) or {}
+            )
+            task_state.legacy_operation_identities = dict(
+                pico.current_checkpoint().get("legacy_operation_identities", {}) or {}
             )
         task_state.resume_status = pico.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         pico.current_task_state = task_state
@@ -2007,6 +2014,9 @@ class Pico:
             # Checkpoint resume remains in the same logical task scope, so the
             # durable side-effect ledger must not be discarded on resume.
             "side_effect_operations": dict(task_state.side_effect_operations or {}),
+            "legacy_operation_identities": dict(
+                task_state.legacy_operation_identities or {}
+            ),
         }
         state["items"][checkpoint_id] = checkpoint
         state["current_id"] = checkpoint_id
@@ -2821,7 +2831,7 @@ class Pico:
             return False
         return answer.strip().lower() in {"y", "yes"}
 
-    def _recover_native_text_tool_call(self, content):
+    def _recover_native_text_tool_call(self, content, recovery_identity=""):
         """Strictly recover one legacy JSON tool envelope for native providers.
 
         This is deliberately narrower than the legacy text protocol.  It only
@@ -2885,7 +2895,13 @@ class Pico:
             self.validate_tool(name, args)
         except Exception:
             return None, "invalid_args"
-        return ToolCall(f"legacy-recovered-{uuid.uuid4().hex}", name, args), None
+        call_id = (
+            "legacy-recovered-"
+            + hashlib.sha256(str(recovery_identity).encode("utf-8")).hexdigest()[:32]
+            if recovery_identity
+            else f"legacy-recovered-{uuid.uuid4().hex}"
+        )
+        return ToolCall(call_id, name, args), None
 
     @staticmethod
     def parse(raw):
